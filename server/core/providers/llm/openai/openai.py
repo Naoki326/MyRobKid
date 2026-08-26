@@ -16,6 +16,9 @@ THINKING_DISABLED_DOMAINS = {
     "bigmodel.cn": {"thinking": {"type": "disabled"}},
     "moonshot.cn": {"thinking": {"type": "disabled"}},
     "volces.com": {"thinking": {"type": "disabled"}},
+    # thirking newapi 网关：deepseek-v4-flash 等混合推理模型默认开思考，
+    # 会导致 TTFB 在 2~26s 间波动；实测 reasoning_effort=none 可稳定关闭（首包~1.3s）
+    "thirking.top": {"reasoning_effort": "none"},
 }
 
 

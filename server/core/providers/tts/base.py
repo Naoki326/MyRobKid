@@ -39,6 +39,9 @@ class TTSProviderBase(ABC):
         self.audio_file_type = "wav"
         self.output_file = config.get("output_dir", "tmp/")
         self.tts_timeout = float(config.get("tts_timeout", 15))
+        # 整段合成模式（split_sentences=false）：不按标点切句，LLM 输出完毕后
+        # 一次性把整段文本发给 TTS 服务，听感连贯但首包延迟随回复长度增长
+        self.split_sentences = bool(config.get("split_sentences", True))
         if not math.isfinite(self.tts_timeout) or self.tts_timeout <= 0:
             raise ValueError("tts_timeout must be a positive finite number")
         self.tts_text_queue = queue.Queue()
@@ -387,9 +390,10 @@ class TTSProviderBase(ABC):
                     self.tts_audio_first_sentence = True
                 elif ContentType.TEXT == message.content_type:
                     self.tts_text_buff.append(message.content_detail)
-                    segment_text = self._get_segment_text()
-                    if segment_text:
-                        self.to_tts_stream(segment_text, opus_handler=self.handle_opus)
+                    if self.split_sentences:
+                        segment_text = self._get_segment_text()
+                        if segment_text:
+                            self.to_tts_stream(segment_text, opus_handler=self.handle_opus)
                 elif ContentType.FILE == message.content_type:
                     self._process_remaining_text_stream(opus_handler=self.handle_opus)
                     tts_file = message.content_file
