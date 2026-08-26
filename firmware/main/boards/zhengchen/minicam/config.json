@@ -1,0 +1,16 @@
+{
+    "manufacturer": "zhengchen",
+    "type": "zhengchen-minicam",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "zhengchen-minicam",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_OTA_URL=\"http://chenMac-mini.local:8080/xiaozhi/ota/\"",
+                "CONFIG_EMOTE_DEF_BG_COLOR=0xC2B280",
+                "CONFIG_EMOTE_DEF_FONT_COLOR=0x000000"
+            ]
+        }
+    ]
+}

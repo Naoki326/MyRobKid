@@ -1,3 +1,22 @@
-# 本地大体积资料，暂不入库
+# ===== 本地资料与旧工程（不入库）=====
 资料包/
 handoff-wifi-provisioning.md
+.pi-glla/
+
+# ===== 固件：可重建产物 =====
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig.old
+firmware/.cache/
+
+# ===== 服务端：运行时状态与机密（绝不入库）=====
+server/data/
+server/models/
+server/music/
+server/tmp/
+server/config.yaml
+server/config_from_api.yaml
+server/mcp_server_settings.json
+__pycache__/
+*.pyc
+.venv/
