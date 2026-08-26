@@ -62,6 +62,27 @@ void McpServer::AddCommonTools() {
             codec->SetOutputVolume(properties["volume"].value<int>());
             return true;
         });
+
+    AddTool("self.audio_speaker.play_music",
+        "Play music or an internet radio station from an HTTP(S) URL. The URL must be a direct audio stream URL (an mp3 file/stream or an ogg/opus stream), not a web page. Typical sources are internet radio station stream addresses. Music keeps playing after the conversation ends until it is stopped or the user wakes the device up again. If the user asks for music but no stream URL is known, ask the user for a stream URL instead of guessing one.",
+        PropertyList({
+            Property("url", kPropertyTypeString)
+        }),
+        [&board](const PropertyList& properties) -> ReturnValue {
+            auto url = properties["url"].value<std::string>();
+            if (!Application::GetInstance().StartMusic(url)) {
+                throw std::runtime_error("Failed to start music playback (URL unreachable or not a decodable audio stream)");
+            }
+            return true;
+        });
+
+    AddTool("self.audio_speaker.stop_music",
+        "Stop the music or radio stream that is currently playing on the device.",
+        PropertyList(),
+        [&board](const PropertyList& properties) -> ReturnValue {
+            Application::GetInstance().StopMusic();
+            return true;
+        });
     
     auto backlight = board.GetBacklight();
     if (backlight) {

@@ -797,6 +797,19 @@ bool AudioService::IsPlaybackIdle() {
     return IsPlaybackDrainedLocked();
 }
 
+bool AudioService::TryPushPcmToPlaybackQueue(std::vector<int16_t>& pcm) {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (service_stopped_.load() || audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        return false;
+    }
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm = std::move(pcm);
+    audio_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
 void AudioService::ResetDecoder() {
     bool notify_drained = false;
     {

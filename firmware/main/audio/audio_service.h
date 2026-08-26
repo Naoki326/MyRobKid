@@ -148,6 +148,13 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    // Non-blocking variant for already-decoded PCM (e.g. the music player):
+    // returns false when the playback queue is full or the service stopped;
+    // the caller should retry shortly afterwards.
+    bool TryPushPcmToPlaybackQueue(std::vector<int16_t>& pcm);
+    // Sample rate the output codec expects; PCM fed into
+    // TryPushPcmToPlaybackQueue must already be converted to this rate.
+    int GetOutputSampleRate() const { return codec_ ? codec_->output_sample_rate() : 16000; }
     // Enqueue a batch of pre-buffered packets at once, bypassing the soft
     // decode queue limit. Returns the number of packets actually enqueued.
     size_t PushPacketsToDecodeQueue(std::deque<std::unique_ptr<AudioStreamPacket>>& packets);

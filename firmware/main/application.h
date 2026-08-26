@@ -20,6 +20,7 @@
 #include "device_state.h"
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
+#include "audio/music_player.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -118,6 +119,15 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+
+    /**
+     * Start streaming an MP3 URL on the speaker (thread-safe).
+     * Drops any in-flight conversation audio, blocks until the first frame
+     * decodes and returns false when the URL is not playable. The music
+     * keeps playing after the conversation ends; waking the device stops it.
+     */
+    bool StartMusic(const std::string& url);
+    void StopMusic();
     
     /**
      * Reset protocol resources (thread-safe)
@@ -141,6 +151,7 @@ private:
     std::string last_error_message_;
     AudioService audio_service_;
     NotifyPlayer notify_player_;
+    MusicPlayer music_player_;
     uint32_t notification_playback_id_ = 0;
     std::unique_ptr<Ota> ota_;
 
@@ -181,6 +192,7 @@ private:
     void StartListeningAudio();
     void ConfigureWakeWordForListening();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
+    void HandleMusicFinished(bool success);
     void StopNotification();
     void HandleNotificationFinished(uint32_t playback_id, bool success);
 

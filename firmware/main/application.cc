@@ -29,7 +29,7 @@ static constexpr bool kTtsPrebufferEnabled = true;
 static constexpr bool kTtsPrebufferEnabled = false;
 #endif
 
-Application::Application() : notify_player_(audio_service_) {
+Application::Application() : notify_player_(audio_service_), music_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
 
 #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
@@ -585,7 +585,11 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        // Music keeps streaming after the conversation ends: keep Wi-Fi at
+        // full performance while the music player is feeding the speaker.
+        if (!music_player_.IsBusy()) {
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        }
         ResetTtsBuffer();
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
@@ -874,6 +878,9 @@ void Application::HandleStartListeningEvent() {
         state = kDeviceStateIdle;
     }
 
+    // Music yields to conversations: stop it before connecting.
+    StopMusic();
+
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -1160,6 +1167,49 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     if (!started) {
         ESP_LOGE(TAG, "Failed to start notification playback");
         StopNotification();
+    }
+}
+
+bool Application::StartMusic(const std::string& url) {
+    // Notifications own the speaker exclusively; do not race them.
+    if (GetDeviceState() == kDeviceStateNotifying || notify_player_.IsBusy()) {
+        ESP_LOGW(TAG, "Ignoring music request while a notification is playing");
+        return false;
+    }
+
+    // Drop in-flight conversation audio (TTS) so the music starts clean;
+    // audio queued afterwards from the ongoing conversation is discarded
+    // by the bumped playback generation until the conversation ends.
+    audio_service_.ResetDecoder();
+
+    // Keep Wi-Fi at full performance while streaming (modem-sleep tears
+    // continuous audio into pieces).
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+
+    if (!music_player_.Start(url, [this](bool success) {
+            Schedule([this, success]() { HandleMusicFinished(success); });
+        })) {
+        ESP_LOGE(TAG, "Failed to start music: %s", url.c_str());
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        return false;
+    }
+    return true;
+}
+
+void Application::StopMusic() {
+    if (music_player_.IsBusy()) {
+        // Cancel is non-blocking: the main loop must not wait on an HTTP
+        // read. The finished callback restores the power save level once
+        // the worker has drained out.
+        music_player_.Cancel();
+        audio_service_.ResetDecoder();
+    }
+}
+
+void Application::HandleMusicFinished(bool success) {
+    ESP_LOGI(TAG, "Music playback %s", success ? "completed" : "aborted");
+    if (!music_player_.IsBusy()) {
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
     }
 }
 
