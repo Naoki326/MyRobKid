@@ -14,3 +14,4 @@ MyRobKid 服务端的 MLX TTS provider 支持 `ref_audio` / `ref_text` 条目字
 - `ref_audio` 必须写绝对路径：MLX 服务端 `os.path.exists()` 不展开 `~`。
 - 服务端存在**静默回退**：`ref_audio` 不存在时回退元宝音色，`ref_text` 缺省回退元宝文本（与音频不匹配会劣化克隆效果）。对策：切换 `selected_module.TTS` 前确认两字段就绪（provider 启动时对缺失文件打 warning，但不阻断）。
 - 样本未到位前 `MlxWanwanStreamTTS` 条目仅备位，`selected_module.TTS` 维持 `MlxStreamTTS`。
+- 教训（0828 音质事故）：参考音频提取必须保持高采样率直出 24kHz。首版参考误用转写用的 16kHz 文件，8kHz 以上高频全失，克隆合成发闷（8-12k 能量 0.04%）；从 B 站 44.1kHz 原始音轨重提后恢复至 1.98%（追平元宝标杆 2.03%）。`tools/transcribe_ref.py` 已固定输出 24kHz，勿再手抄 16k 中间产物。
