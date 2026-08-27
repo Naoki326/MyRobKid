@@ -30,6 +30,11 @@ from core.providers.tts.dto.dto import (
 TAG = __name__
 logger = setup_logging()
 
+# 会诱发 Qwen3-TTS 病态长生成的孤立拟声词（单字）：不送合成
+_PATHOLOGICAL_FILLERS = {
+    "嗯", "啊", "哦", "噢", "呀", "哈", "嘿", "嘻", "唉", "哎", "欸", "呜", "呃", "唔", "嘎", "咯",
+}
+
 
 class TTSProviderBase(ABC):
     def __init__(self, config, delete_audio_file):
@@ -136,6 +141,11 @@ class TTSProviderBase(ABC):
         # 过滤孤立标点/空白段（如切句残余的"）"）：合成无意义且会引发无效重试
         if not re.search(r"[\w\u4e00-\u9fff]", text):
             logger.bind(tag=TAG).debug(f"跳过无有效内容的文本段: {original_text!r}")
+            return None
+        # 过滤孤立拟声词（如"嗯""啊"）：极短拟声词会诱发 Qwen3-TTS 病态长生成
+        # （实测"嗯"单字生成 327.7s 音频/181.5s 推理，占死单线程服务诱发僵死）
+        if text.strip() in _PATHOLOGICAL_FILLERS:
+            logger.bind(tag=TAG).info(f"跳过孤立拟声词段（防病态长生成）: {original_text!r}")
             return None
         max_repeat_time = 2
         if self.delete_audio_file:

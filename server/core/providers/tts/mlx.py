@@ -8,12 +8,45 @@ mlx.py — 本机 MLX Qwen3-TTS 服务（Apple Silicon GPU 加速）
 不传则用服务端默认音色（ref_yuanbao，官方娃娃音）。
 """
 import os
+import time
+import subprocess
 import requests
 from core.providers.tts.base import TTSProviderBase
 from config.logger import setup_logging
 
 TAG = __name__
 logger = setup_logging()
+
+# 僵死自愈节流：最短拉起间隔，防止重启风暴
+_KICKSTART_MIN_INTERVAL = 300
+_last_kickstart = 0.0
+
+
+def _ensure_mlx_alive():
+    """请求失败后检查 MLX 健康；僵死则 kickstart 拉起（节流 5 分钟）。
+
+    MLX 服务是单线程 HTTPServer，推理偶发挂死时进程活着但不响应（/health 也超时），
+    launchd KeepAlive 只能处理进程退出，处理不了僵死，故在此主动拉起。
+    """
+    global _last_kickstart
+    try:
+        requests.get("http://127.0.0.1:9753/health", timeout=2)
+        return  # 健康
+    except Exception:
+        pass
+    now = time.time()
+    if now - _last_kickstart < _KICKSTART_MIN_INTERVAL:
+        return
+    _last_kickstart = now
+    try:
+        subprocess.Popen(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.yuanbao.mlxtts"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.bind(tag=TAG).warning("MLX TTS 僵死，已 kickstart 拉起（模型重载约 2~3 分钟）")
+    except Exception as e:
+        logger.bind(tag=TAG).error(f"kickstart MLX 失败: {e}")
 
 
 class TTSProvider(TTSProviderBase):
@@ -75,8 +108,10 @@ class TTSProvider(TTSProviderBase):
         except requests.Timeout:
             error_msg = f"MLX TTS请求超时: {self.url}"
             logger.bind(tag=TAG).error(error_msg)
+            _ensure_mlx_alive()  # 超时可能是僵死，探测并自愈
             raise Exception(error_msg)
         except requests.ConnectionError:
             error_msg = f"MLX TTS服务未启动: {self.url}"
             logger.bind(tag=TAG).error(error_msg)
+            _ensure_mlx_alive()  # 进程不在则拉起
             raise Exception(error_msg)
