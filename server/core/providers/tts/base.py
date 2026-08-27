@@ -133,6 +133,10 @@ class TTSProviderBase(ABC):
         # 使用正则一次性替换，避免重复遍历和部分匹配问题
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
+        # 过滤孤立标点/空白段（如切句残余的"）"）：合成无意义且会引发无效重试
+        if not re.search(r"[\w\u4e00-\u9fff]", text):
+            logger.bind(tag=TAG).debug(f"跳过无有效内容的文本段: {original_text!r}")
+            return None
         max_repeat_time = 2
         if self.delete_audio_file:
             # 需要删除文件的直接转为音频数据

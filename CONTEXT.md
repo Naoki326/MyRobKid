@@ -83,8 +83,12 @@ _Avoid_: 把旧工程名当作正式称呼
 _Avoid_: 元宝服务（它属于更大的 hermes 生态）、TTS 插件
 
 **整段合成**:
-一次把整句回复交给 TTS 合成再下发的方式，听感连贯但首包延迟随回复长度增长；与逐句合成相对。
-_Avoid_: 流式（本项目未实现真流式）
+一次把整句回复交给 TTS 合成再下发的方式（`MlxTTS`，split_sentences: false），听感连贯但首包延迟随回复长度增长；与逐句合成相对，两者经 selected_module.TTS 切换，见 ADR-0004/0005。
+_Avoid_: 流式（泛称）、MlxStreamTTS（那是逐句合成的条目名）
+
+**逐句合成**:
+LLM 流式输出后按标点逐句切分、逐句合成并边合成边下发的方式（`MlxStreamTTS`，split_sentences: true），首包不随回复长度增长；仍用 MLX 娃娃音。见 ADR-0005。
+_Avoid_: 官方流式（那是 chunk 级双向流式，本地 MLX 服务不支持）、真流式（同前）
 
 ### 运维与调试
 
