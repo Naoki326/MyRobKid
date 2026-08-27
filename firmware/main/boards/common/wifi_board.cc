@@ -17,7 +17,6 @@
 #include <wifi_manager.h>
 #include <wifi_station.h>
 #include <ssid_manager.h>
-#include <wifi_configuration_ap.h>
 #include <esp_wifi.h>
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
 #include "blufi.h"
@@ -210,11 +209,8 @@ void WifiBoard::StartWifiConfigMode() {
     if (!smartconfig_attempted_) {
         // 第一次进配网：先只跑 SmartConfig（不开 SoftAP，避免信道冲突），
         // 60 秒超时后自动转 SoftAP 网页配网兑底
-        // 注：StartSmartConfig 属于 WifiConfigurationAp（esp-wifi-connect 3.2.2），
-        // 构造函数仅初始化成员不开 AP，SmartConfig 阶段零副作用
         smartconfig_attempted_ = true;
-        static WifiConfigurationAp smartconfig_ap;
-        smartconfig_ap.StartSmartConfig();
+        wifi_manager.StartSmartConfig();
         if (smartconfig_timeout_timer_) {
             esp_timer_start_once(smartconfig_timeout_timer_, SMARTCONFIG_TIMEOUT_SEC * 1000000ULL);
         }
@@ -330,16 +326,17 @@ void WifiBoard::SetPowerSaveLevel(PowerSaveLevel level) {
     // 对话期间强制关闭 Wi-Fi 省电：实测对话中设备仍处于 modem-sleep 轮询
     // （ping RTT 呈 2500ms→几ms 锯齿），60ms/帧的音频流被逐包唤醒延迟
     // 撕裂成“一字一顿”。组件的 PERFORMANCE 档仍保留 MIN_MODEM 省电，
-    // 故在此直接 WIFI_PS_NONE；空闲档位（LOW_POWER/BALANCED）不受影响，
-    // 仍交给 WifiManager 原有省电逻辑。
+    // 故在此直接 WIFI_PS_NONE；空闲档位（LOW_POWER/BALANCED）仍走
+    // WifiManager 原有省电逻辑，待机功耗不受影响。
     if (level == PowerSaveLevel::PERFORMANCE) {
         esp_wifi_set_ps(WIFI_PS_NONE);
+    } else if (level == PowerSaveLevel::LOW_POWER) {
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     }
     WifiPowerSaveLevel wifi_level;
     switch (level) {
         case PowerSaveLevel::LOW_POWER:
             wifi_level = WifiPowerSaveLevel::LOW_POWER;
-            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
             break;
         case PowerSaveLevel::BALANCED:
             wifi_level = WifiPowerSaveLevel::BALANCED;

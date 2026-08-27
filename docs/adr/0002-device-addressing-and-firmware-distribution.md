@@ -12,3 +12,7 @@
 - 诊断口诀：**设备"变官方"，先查 `data/bin/` 有没有更高的版本文件**，再查固件的 OTA 地址。
 - 主仓 `sdkconfig` 的 OTA 地址是安全底线，改 venv/路径/重装环境后需确认 macOS 防火墙仍放行服务端 python（socketfilterfw 按可执行路径放行）。
 - 宿主机拓扑（不可见于代码）：服务端由 launchd `com.xiaozhi.server` 托管主仓 venv；nginx（8080，`/xiaozhi/` 反代 8002/8003）为备用入口与花生壳公网映射目标；MLX TTS 服务由 launchd `com.yuanbao.mlxtts` 托管（端口 9753）。
+
+## 2.4.8：固件构建统一在主仓
+
+旧工程（固件雏形）的本地组件修改不可丢：`managed_components/78__esp-wifi-connect`（配网增强）与 `txp666__otto-emoji-gif-component`（定制表情）均不入库，registry 拉取的纯净版会缺失。决定：**固件构建统一在主仓**，每次构建前从旧工程目录复制这两个组件（或任何后续本地修改过的组件），2.4.8 即按此方式集成音乐播放修复 + 省电补丁 + 正确寻址，USB 直刷 ota_0 生效。
