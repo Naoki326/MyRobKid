@@ -31,7 +31,7 @@ BRIDGE_TO_NAME = {v: k for k, v in NAME_TO_BRIDGE.items()}
 
 
 def _client():
-    return httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0))
+    return httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=3.0))  # bridge 同步飞书常态 6~8s
 
 
 BABY_CARE_RECORD_FUNCTION_DESC = {
@@ -92,7 +92,14 @@ async def baby_care_record(
         data = resp.json()
     except Exception as e:
         logger.bind(tag=TAG).error(f"baby_care_record 请求失败: {e}")
-        return ActionResponse(Action.REQLLM, "育儿记录服务暂时连不上，请稍后再试。", None)
+        # 超时≠失败：bridge 飞书同步慢时可能已落库，让用户可查询确认，不要断言失败
+        hint = "育儿记录服务响应很慢" if isinstance(e, httpx.TimeoutException) else "育儿记录服务暂时连不上"
+        return ActionResponse(
+            Action.REQLLM,
+            f"{hint}，刚才的记录可能已经记上了，不要直接说失败；"
+            f"建议用户稍后问一句'今天喂了几次'确认，或到网页端查看。",
+            None,
+        )
 
     logger.bind(tag=TAG).info(f"baby_care_record: {body} -> {data}")
 

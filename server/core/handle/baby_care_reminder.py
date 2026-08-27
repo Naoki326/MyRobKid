@@ -15,6 +15,10 @@ logger = setup_logging()
 
 BABY_CARE_BASE = "http://127.0.0.1:8000"
 
+# 播报去重：同一主体 30 分钟内最多播报一次，避免每次开机/唤醒都重复提醒
+ANNOUNCE_MIN_INTERVAL = 30 * 60
+_last_announced: dict = {}  # subject -> 上次挂载播报的时间戳
+
 
 def _fmt_gap(seconds: float) -> str:
     """秒数 → 'X小时Y分钟' 自然语言"""
@@ -49,7 +53,7 @@ async def fetch_baby_care_reminder(conn) -> None:
         if not next_due or not last_ts:
             continue
         overdue_sec = now - next_due
-        if overdue_sec > 0:
+        if overdue_sec > 0 and now - _last_announced.get(name, 0) >= ANNOUNCE_MIN_INTERVAL:
             overdue.append(
                 f"- {name}：距上次喂养已过 {_fmt_gap(now - last_ts)}，"
                 f"已超过喂养间隔 {_fmt_gap(overdue_sec)}，应尽快喂养"
@@ -64,4 +68,8 @@ async def fetch_baby_care_reminder(conn) -> None:
         + "\n".join(overdue)
         + "\n如果用户这句话正是在记录喂养（如'喂了'），则正常记录，不必再提醒。"
     )
+    for line in overdue:
+        # 挂载即视为已播报（下一次对话必然播报）；name 已是小名（咖啡/花生）
+        subject = line.split("：")[0].lstrip("- ")
+        _last_announced[subject] = now
     logger.bind(tag=TAG).info(f"唤醒提醒已挂载: {conn.pending_reminder[:120]}")
