@@ -42,7 +42,8 @@ async def fetch_baby_care_reminder(conn) -> None:
     now = time.time()
     overdue = []
     for s in data.get("subjects", []):
-        name = s.get("name", "")
+        # bridge 落库用"大宝/小宝"，播报统一用小名（哥哥咖啡、弟弟花生）
+        name = {"大宝": "咖啡", "小宝": "花生"}.get(s.get("name", ""), s.get("name", ""))
         next_due = s.get("next_due")
         last_ts = s.get("last_record_ts")
         if not next_due or not last_ts:

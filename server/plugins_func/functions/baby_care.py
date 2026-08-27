@@ -1,12 +1,15 @@
 """baby_care — 小智语音 ↔ baby-care-bridge 育儿记录联动。
 
 对着小智设备说：
-- "小宝喂了120毫升"     → baby_care_record(subject=小宝, note=120毫升)
+- "花生喂了120毫升"     → baby_care_record(subject=花生, note=120毫升)
 - "宝妈吸完奶了"         → baby_care_record(subject=宝妈)
-- "补记一下大宝半小时前喂过" → baby_care_record(subject=大宝, ts=过去时间)
+- "补记一下咖啡半小时前喂过" → baby_care_record(subject=咖啡, ts=过去时间)
 - "上次喂奶什么时候""今天喂了几次" → baby_care_get_state()
 
 baby-care-bridge 跑在本机 8000（回环直连，不经 nginx）。
+
+语音侧用宝宝小名（哥哥咖啡、弟弟花生）；bridge 落库仍用
+"大宝/小宝/宝妈"（历史数据与飞书群沿用），两侧经映射表双向转换。
 """
 import time
 
@@ -22,7 +25,9 @@ TAG = __name__
 logger = setup_logging()
 
 BABY_CARE_BASE = "http://127.0.0.1:8000"
-SUBJECTS = ("大宝", "小宝", "宝妈")  # 宝妈=吸奶记录（用吸奶间隔）
+SUBJECTS = ("咖啡", "花生", "宝妈")  # 语音交互用小名；宝妈=吸奶记录（用吸奶间隔）
+NAME_TO_BRIDGE = {"咖啡": "大宝", "花生": "小宝", "宝妈": "宝妈"}
+BRIDGE_TO_NAME = {v: k for k, v in NAME_TO_BRIDGE.items()}
 
 
 def _client():
@@ -44,7 +49,7 @@ BABY_CARE_RECORD_FUNCTION_DESC = {
                 "subject": {
                     "type": "string",
                     "enum": list(SUBJECTS),
-                    "description": "主体：大宝/小宝（喂奶）、宝妈（吸奶）",
+                    "description": "主体：咖啡（哥哥）、花生（弟弟）喂奶；宝妈吸奶",
                 },
                 "note": {
                     "type": "string",
@@ -73,7 +78,7 @@ async def baby_care_record(
     if subject not in SUBJECTS:
         return ActionResponse(Action.REQLLM, f"主体必须是 {'、'.join(SUBJECTS)} 之一，请向用户确认。", None)
 
-    body = {"subject": subject, "note": note or ""}
+    body = {"subject": NAME_TO_BRIDGE[subject], "note": note or ""}
     if ts and int(ts) > 0:
         body["ts"] = int(ts)
         body["mode"] = "backfill"
@@ -138,8 +143,11 @@ async def baby_care_get_state(conn: "ConnectionHandler", lang: str = "zh_CN"):
         return ActionResponse(Action.REQLLM, "育儿记录服务暂时连不上，请稍后再试。", None)
 
     logger.bind(tag=TAG).info(f"baby_care_get_state: {str(data)[:300]}")
+    state_text = str(data)
+    for bridge_name, display in BRIDGE_TO_NAME.items():
+        state_text = state_text.replace(bridge_name, display)
     report = (
         f"根据下列数据用{lang}回应用户的喂养状态查询（把时间转成自然语言，如'两小时前'）：\n\n"
-        f"{data}\n\n(根据用户具体问题聚焦回答，例如问'该喂了吗'就对比下次时间和现在)"
+        f"{state_text}\n\n(根据用户具体问题聚焦回答，例如问'该喂了吗'就对比下次时间和现在；宝宝小名：哥哥咖啡、弟弟花生)"
     )
     return ActionResponse(Action.REQLLM, report, None)
