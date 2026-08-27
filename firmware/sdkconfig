@@ -966,7 +966,7 @@ CONFIG_PARTITION_TABLE_MD5=y
 # Xiaozhi Assistant
 #
 # default:
-CONFIG_OTA_URL="https://api.tenclass.net/xiaozhi/ota/"
+CONFIG_OTA_URL="http://192.168.18.172:8003/xiaozhi/ota/"
 # default:
 # CONFIG_FLASH_NONE_ASSETS is not set
 # default:

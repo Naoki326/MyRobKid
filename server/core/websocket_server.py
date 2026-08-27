@@ -9,6 +9,9 @@ class SuppressInvalidHandshakeFilter(logging.Filter):
     """过滤掉无效握手错误日志（如HTTPS访问WS端口）"""
 
     def filter(self, record):
+        import os
+        if os.environ.get("WS_DEBUG_HANDSHAKE"):
+            return True  # 诊断模式：不吞任何握手日志
         msg = record.getMessage()
         suppress_keywords = [
             "opening handshake failed",
@@ -144,6 +147,19 @@ class WebSocketServer:
                 )
 
     async def _http_response(self, websocket, request_headers):
+        # 连接到达探针：任何到达 8002 的 TCP+HTTP 请求都在此留痕（含握手失败）。
+        # 历史教训：SuppressInvalidHandshakeFilter 会吞掉握手错误日志，导致
+        # "设备连不上但服务端零线索"；此探针是对冲，勿删。
+        try:
+            peer = websocket.remote_address
+            path = getattr(request_headers, "path", "?")
+            ua = request_headers.headers.get("user-agent", "")
+            device_id = request_headers.headers.get("device-id", "")
+            self.logger.bind(tag=TAG).info(
+                f"连接到达: {peer} path={path} device={device_id} ua={ua[:40]}"
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).info(f"连接到达(取信息失败): {e}")
         # 检查是否为 WebSocket 升级请求
         if request_headers.headers.get("connection", "").lower() == "upgrade":
             # 如果是 WebSocket 请求，返回 None 允许握手继续

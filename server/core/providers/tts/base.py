@@ -133,7 +133,7 @@ class TTSProviderBase(ABC):
         # 使用正则一次性替换，避免重复遍历和部分匹配问题
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
-        max_repeat_time = 5
+        max_repeat_time = 2
         if self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
             while max_repeat_time > 0:
@@ -202,7 +202,7 @@ class TTSProviderBase(ABC):
         text = MarkdownCleaner.clean_markdown(text)
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
-        max_repeat_time = 5
+        max_repeat_time = 2
         if self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
             while max_repeat_time > 0:
