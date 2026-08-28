@@ -116,7 +116,10 @@ async def transcode_stream(
         # B 站等 CDN 有 Referer 防盗链
         headers += f"Referer: {referer}\r\n"
     cmd += ["-headers", headers, "-i", src,
-            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "44100", "-b:a", "128k",
+            # 设备（zhengchen-minicam）codec 输出 24kHz：直出 24k 单声道，
+            # 免掉设备端 44.1k→24k 软件重采样（CPU 大头），解码量也减半；
+            # 24k 单声道 64kbps 已接近透明，还省一半网络吞吐。
+            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "24000", "-b:a", "64k",
             "-f", "mp3", "pipe:1"]
 
     proc = await asyncio.create_subprocess_exec(

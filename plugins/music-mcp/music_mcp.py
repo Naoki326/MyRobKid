@@ -190,7 +190,7 @@ async def search_song(keyword: str, quality: str = "M500") -> str:
     lines = [
         f"找到 {len(songs)} 首，推荐第 1 首：",
         f"歌曲: {best['name']} — {best['singer']}",
-        f"play_url: {best['url']}",
+        f"play_url: {_ensure_playable(best['url'])}",
     ]
     if len(songs) > 1:
         others = "、".join(f"{s['name']}—{s['singer']}" for s in songs[1:])
@@ -229,7 +229,7 @@ async def search_radio(keyword: str, limit: int = 3) -> str:
             info += f" ({s['country']})"
         lines.append(info)
     best = stations[0]
-    lines.append(f"play_url: {best['url_resolved']}")
+    lines.append(f"play_url: {_ensure_playable(best['url_resolved'])}")
     lines.append(_PLAY_HINT.get(CONSUMER, ""))
     return "\n".join(lines)
 
@@ -253,17 +253,17 @@ async def get_lyrics(keyword: str) -> str:
 
 # ═══ 播客（Apple iTunes Search API，官方免费免 key） ═════════════
 
-# 设备固件仅支持 mp3/ogg-opus 直链；其余格式（m4a/m4s/aac…）
-# 一律经 Mac 上的 ffmpeg 转码代理（nginx /music/stream → 8777）
+# 设备固件（2.4.8）的 HTTP 栈不跟随 302，且设备外网连通性不可靠；
+# 因此 play_url 一律经 Mac 上的 ffmpeg 转码代理（nginx /music/stream → 8777）
+# 下发：代理负责跟随重定向与格式转码，设备只连局域网 IP。
+# 其余格式（m4a/m4s/aac…）同样依赖该代理转码。
 PROXY_BASE = os.environ.get(
     "MUSIC_PROXY_BASE", "http://192.168.18.172:8080/music/stream"
 )
 
 
 def _ensure_playable(url: str, referer: str = None) -> str:
-    low = url.lower()
-    if not referer and (low.split("?")[0].endswith((".mp3", ".ogg")) or ".mp3?" in low or ".ogg?" in low):
-        return url
+    # 统一走局域网转码代理：即使 .mp3 结尾也可能是 302 跳转（如 wavpub 播客）。
     u = f"{PROXY_BASE}?src={urllib.parse.quote(url, safe='')}"
     if referer:
         u += "&referer=" + urllib.parse.quote(referer, safe='')
