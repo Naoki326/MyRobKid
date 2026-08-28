@@ -663,7 +663,12 @@ void Application::InitializeProtocol() {
                 FlushTtsBuffer();
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
+                        if (!pending_music_url_.empty()) {
+                            // The reply finished speaking: start the deferred
+                            // music now (and stay in idle — no listening while
+                            // the music plays).
+                            LaunchPendingMusic();
+                        } else if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
@@ -880,6 +885,8 @@ void Application::HandleStartListeningEvent() {
 
     // Music yields to conversations: stop it before connecting.
     StopMusic();
+    // A new conversation turn invalidates any deferred music URL.
+    Schedule([this]() { pending_music_url_.clear(); });
 
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -1177,6 +1184,23 @@ bool Application::StartMusic(const std::string& url) {
         return false;
     }
 
+    // While a conversation is active the LLM reply (TTS) has not been
+    // spoken yet: defer the stream until the reply finishes playing, so the
+    // robot says "coming right up" first and the music starts clean after
+    // it. Registration happens on the main loop, which also consumes it.
+    DeviceState state = GetDeviceState();
+    if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
+        state == kDeviceStateSpeaking) {
+        Schedule([this, url]() {
+            pending_music_url_ = url;
+            ESP_LOGI(TAG, "Music deferred until the reply finishes: %s", url.c_str());
+        });
+        return true;
+    }
+    return StartMusicNow(url);
+}
+
+bool Application::StartMusicNow(const std::string& url) {
     // Drop in-flight conversation audio (TTS) so the music starts clean;
     // audio queued afterwards from the ongoing conversation is discarded
     // by the bumped playback generation until the conversation ends.
@@ -1193,7 +1217,48 @@ bool Application::StartMusic(const std::string& url) {
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         return false;
     }
+    // While streaming, drop wake-word detection: the AFE feed saturates the
+    // input core and starves the low-priority TCP receive task (~7KB/s
+    // throughput, stuttering audio). The button still stops the music.
+    audio_service_.EnableWakeWordDetection(false);
     return true;
+}
+
+void Application::MusicStartTaskEntry(void* arg) {
+    auto* url = static_cast<std::string*>(arg);
+    bool ok = Application::GetInstance().StartMusicNow(*url);
+    delete url;
+    if (!ok) {
+        // Could not start: fall back to listening so the user is not left
+        // with a silent device.
+        Application::GetInstance().Schedule([]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateIdle) {
+                app.SetDeviceState(kDeviceStateListening);
+            }
+        });
+    }
+    vTaskDelete(nullptr);
+}
+
+void Application::LaunchPendingMusic() {
+    if (pending_music_url_.empty()) {
+        return;
+    }
+    std::string url = std::move(pending_music_url_);
+    pending_music_url_.clear();
+    // Music plays with the device in idle: no listening while it plays,
+    // wake word / button still stops it and reopens the conversation.
+    SetDeviceState(kDeviceStateIdle);
+    auto* url_copy = new std::string(std::move(url));
+    if (xTaskCreate(MusicStartTaskEntry, "music_start", 8192, url_copy, 5,
+                    nullptr) != pdPASS) {
+        delete url_copy;
+        ESP_LOGE(TAG, "Failed to create music start task");
+        if (GetDeviceState() == kDeviceStateIdle) {
+            SetDeviceState(kDeviceStateListening);
+        }
+    }
 }
 
 void Application::StopMusic() {
@@ -1210,6 +1275,17 @@ void Application::HandleMusicFinished(bool success) {
     ESP_LOGI(TAG, "Music playback %s", success ? "completed" : "aborted");
     if (!music_player_.IsBusy()) {
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        // Music over: bring wake-word detection back (it was paused while
+        // streaming to keep the TCP receive path responsive).
+        audio_service_.EnableWakeWordDetection(true);
+        // Music over: resume listening (only when a conversation could be
+        // continued, i.e. the audio channel is still open).
+        Schedule([this]() {
+            if (GetDeviceState() == kDeviceStateIdle &&
+                protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
+                SetDeviceState(kDeviceStateListening);
+            }
+        });
     }
 }
 
@@ -1245,6 +1321,9 @@ void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
     ResetTtsBuffer();
+    // Interrupting the reply also cancels any music deferred behind it:
+    // a leftover URL would otherwise surprise-launch on the next turn.
+    Schedule([this]() { pending_music_url_.clear(); });
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }

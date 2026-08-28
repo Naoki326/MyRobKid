@@ -491,9 +491,11 @@ private:
         config.pixel_format = PIXFORMAT_RGB565;
         config.frame_size   = FRAMESIZE_VGA;
         config.jpeg_quality = 12;
-        config.fb_count     = 2;
+        // 按需采集：仅当有空闲帧缓冲时驱动才采集（取走帧后驱动停住），
+        // 无人拍照时不占 CPU/内存带宽；拍照时驱动自动补帧（多等 1~2 帧，几十 ms）。
+        config.fb_count     = 1;
         config.fb_location  = CAMERA_FB_IN_PSRAM;
-        config.grab_mode    = CAMERA_GRAB_LATEST;
+        config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
         camera_ = new Esp32Camera(config);
 

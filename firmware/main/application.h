@@ -128,6 +128,20 @@ public:
      */
     bool StartMusic(const std::string& url);
     void StopMusic();
+
+    /*
+     * Starts the stream immediately (idle case). Must not be called while a
+     * conversation is active. Runs on any task; blocks up to 10 s waiting for
+     * the first decoded frame.
+     */
+    bool StartMusicNow(const std::string& url);
+
+    /*
+     * URL deferred until the current conversation reply finishes playing
+     * ("finish speaking before playing music"). Accessed only on the main
+     * loop (Schedule) context.
+     */
+    std::string pending_music_url_;
     
     /**
      * Reset protocol resources (thread-safe)
@@ -193,6 +207,8 @@ private:
     void ConfigureWakeWordForListening();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
     void HandleMusicFinished(bool success);
+    void LaunchPendingMusic();
+    static void MusicStartTaskEntry(void* arg);
     void StopNotification();
     void HandleNotificationFinished(uint32_t playback_id, bool success);
 
