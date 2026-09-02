@@ -27,13 +27,33 @@ def _ensure_mlx_alive():
 
     MLX 服务是单线程 HTTPServer，推理偶发挂死时进程活着但不响应（/health 也超时），
     launchd KeepAlive 只能处理进程退出，处理不了僵死，故在此主动拉起。
+
+    注意：单线程也意味着**正常合成期间 /health 同样被阻塞**（长句合成可达数十秒），
+    一次探测超时≠僵死。故超时场景需隔秒复核多次，全部失败才判定僵死；
+    而连接被拒（进程不在）则直接走拉起，无需复核。
     """
     global _last_kickstart
+    dead = False
     try:
-        requests.get("http://127.0.0.1:9753/health", timeout=2)
+        requests.get("http://127.0.0.1:9753/health", timeout=5)
         return  # 健康
+    except requests.ConnectionError:
+        dead = True  # 进程不在，无需复核
     except Exception:
-        pass
+        # 超时：可能只是正忙于合成，隔秒复核，连续失败才判僵死
+        for _ in range(3):
+            time.sleep(4)
+            try:
+                requests.get("http://127.0.0.1:9753/health", timeout=5)
+                return  # 复核通过：是忙，不是死
+            except requests.ConnectionError:
+                dead = True  # 复核期间进程退了
+                break
+            except Exception:
+                continue
+        dead = True
+    if not dead:
+        return
     now = time.time()
     if now - _last_kickstart < _KICKSTART_MIN_INTERVAL:
         return
