@@ -819,6 +819,14 @@ void Application::HandleToggleChatEvent() {
         state = kDeviceStateIdle;
     }
 
+    // Music yields to conversations: stop it before connecting, same as
+    // HandleStartListeningEvent(). Music plays with the device in idle, so
+    // the idle branch below would otherwise open a conversation on top of
+    // the still-running stream (podcast keeps playing while listening).
+    StopMusic();
+    // A new conversation turn invalidates any deferred music URL.
+    Schedule([this]() { pending_music_url_.clear(); });
+
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
