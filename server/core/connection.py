@@ -1249,6 +1249,9 @@ class ConnectionHandler:
         # 处理function call
         if tool_call_flag:
             bHasError = False
+            # 丢弃空壳占位条目：网关 index 不从 0 开始时补齐产生的空洞，
+            # 或流被截断的残缺调用；否则会被当作 name="" 的真工具去执行
+            tool_calls_list = [tc for tc in tool_calls_list if tc.get("name")]
             # 处理基于文本的工具调用格式
             if len(tool_calls_list) == 0 and content_arguments:
                 a = extract_json_from_string(content_arguments)
@@ -1840,22 +1843,27 @@ class ConnectionHandler:
             tools_call: 新的工具调用
         """
         for tool_call in tools_call:
+            fn = getattr(tool_call, "function", None)
             tool_index = getattr(tool_call, "index", None)
             if tool_index is None:
-                if tool_call.function.name:
+                if fn is not None and fn.name:
                     # 有 function_name，说明是新的工具调用
                     tool_index = len(tool_calls_list)
                 else:
                     tool_index = len(tool_calls_list) - 1 if tool_calls_list else 0
+            if tool_index < 0:
+                tool_index = 0
 
-            # 确保列表有足够的位置
-            if tool_index >= len(tool_calls_list):
+            # 确保列表有足够的位置。注意：部分网关（如 newapi 转发 deepseek）
+            # 下发的 index 不从 0 开始或不连续，必须逐位补齐空洞，
+            # 否则下方按 tool_index 索引会 IndexError（"list index out of range"）
+            while tool_index >= len(tool_calls_list):
                 tool_calls_list.append({"id": "", "name": "", "arguments": ""})
 
             # 更新工具调用信息
             if tool_call.id:
                 tool_calls_list[tool_index]["id"] = tool_call.id
-            if tool_call.function.name:
-                tool_calls_list[tool_index]["name"] = tool_call.function.name
-            if tool_call.function.arguments:
-                tool_calls_list[tool_index]["arguments"] += tool_call.function.arguments
+            if fn is not None and fn.name:
+                tool_calls_list[tool_index]["name"] = fn.name
+            if fn is not None and fn.arguments:
+                tool_calls_list[tool_index]["arguments"] += fn.arguments
