@@ -11,6 +11,8 @@ firmware/.cache/
 
 # ===== 服务端：运行时状态与机密（绝不入库）=====
 server/data/
+# 唤醒词响应缓存的运行时声纹音频（按声纹 hash 自动生成，可重建）
+server/config/assets/wakeup_words/
 server/models/
 server/music/
 server/tmp/
@@ -23,4 +25,7 @@ __pycache__/
 
 # 调试对照音频与隔离的坏固件不入库
 /*.wav
+/*.mp3
 /坏固件_*.bin
+/tmp/
+/音质对比/
