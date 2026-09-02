@@ -155,7 +155,10 @@ class ConfigHandler(BaseHandler):
 
     @staticmethod
     def _is_mask_placeholder(v):
-        return v == "********" or (isinstance(v, str) and v.endswith("****"))
+        # 掩码占位形态：整体打码 ********（短值/模板占位），
+        # 或保留首尾的 abcd****wxyz（_mask_value 的长值形态）。
+        # 仅 ≤12 字符且中间恰好 4 个 * 才命中，真实密钥不会误判。
+        return isinstance(v, str) and re.fullmatch(r".{0,4}\*{4}.{0,4}", v) is not None
 
     def _read_custom_yaml(self) -> dict:
         if not self.custom_path.exists():
@@ -269,8 +272,9 @@ class ConfigHandler(BaseHandler):
                     changes.update(collect_diff(src[k], v, path))
                     continue
                 sv = src.get(k)
-                # 掩码占位（读取时被掩码的敏感字段）：不算变化
-                if self._is_mask_placeholder(sv) or self._is_mask_placeholder(v):
+                # 只看 after 值：仍是掩码占位 → 敏感字段未被修改，跳过（防止掩码写回）；
+                # before 是掩码而 after 是新值 → 用户在页面换了密钥，必须正常写入
+                if self._is_mask_placeholder(v):
                     continue
                 if v != sv:
                     changes[path] = v

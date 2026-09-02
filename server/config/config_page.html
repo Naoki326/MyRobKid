@@ -185,7 +185,7 @@ function setPath(obj, path, val){
   cur[parts[parts.length-1]] = val;
 }
 const SENSITIVE_RE = /^(api_key|access_token|secret_key|secret_id|app_secret|token|password|authorization|auth_key|personal_access_token|api_secret|private_key)$|(_key|_secret|_token)$/i;
-function isMasked(val){ return typeof val==='string' && (val==='********' || val.endsWith('****')); }
+function isMasked(val){ return typeof val==='string' && /^.{0,4}\*{4}.{0,4}$/.test(val); }
 
 /* ---------- API ---------- */
 async function api(path, opts={}){
@@ -344,7 +344,8 @@ function collectDirty(base, cur, orig){
     if (cv && typeof cv==='object' && !Array.isArray(cv) && ov && typeof ov==='object' && !Array.isArray(ov)){
       collectDirty(path, cv, ov);
     } else {
-      if (isMasked(cv) || isMasked(ov)) continue;
+      // after 仍是掩码 → 未修改；掩码换成了新值 → 算变更（保存时后端只认 after）
+      if (isMasked(cv)) continue;
       if (!deepEqual(cv, ov)) dirtyPaths.add(path);
     }
   }
@@ -376,7 +377,7 @@ function fld(path, label, hint='', opts={}){
   } else if (typeof val === 'number'){
     ctrl = `<input type="number" data-path="${path}" value="${val}" ${opts.step?`step="${opts.step}"`:''}>`;
   } else if (isSens){
-    ctrl = `<input type="password" data-path="${path}" placeholder="（掩码·不修改）" value="" disabled class="masked" title="敏感字段已掩码，如需修改请直接编辑 .config.yaml">`;
+    ctrl = `<input type="password" data-path="${path}" data-sens="1" value="" autocomplete="new-password" placeholder="${masked ? '已配置（掩码）· 留空不变，输入新值覆盖' : '未设置 · 输入新值'}" title="敏感字段：留空保持原值，输入新值保存后覆盖">`;
   } else if (val === undefined || val === null || val === ''){
     ctrl = `<input type="text" data-path="${path}" value="" placeholder="（未设置）">`;
   } else if (typeof val === 'string' && String(val).length > 80 && !opts.nolarge){
@@ -619,6 +620,8 @@ function bindInputs(){
       if (el.type==='checkbox') val = el.checked;
       else if (el.type==='number') val = el.value==='' ? null : Number(el.value);
       else val = el.value;
+      // 敏感字段：清空 = 保持原值（还原为掩码/未设置），不产生变更
+      if (el.dataset.sens==='1' && val==='') val = getPath(CONFIG, path) ?? null;
       if (val === null) { const parts=path.split('.'); const p=getPath(state, parts.slice(0,-1)); delete p[parts.at(-1)]; }
       else setPath(state, path, val);
       markChanged();
