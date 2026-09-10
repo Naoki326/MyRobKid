@@ -321,6 +321,93 @@ class ConfigHandler(BaseHandler):
             return web.json_response({"ok": False, "error": f"写入后解析失败: {e}"}, status=500)
         return web.json_response({"ok": True, "changed": len(changes)})
 
+    # ==================== 引擎连通性测试 ====================
+
+    # 测试用提示词：短、无需工具，能暴露「思考吃光 max_tokens」的毛病
+    TEST_LLM_PROMPT = "你好，请用一句话介绍你自己。"
+
+    def _resolve_test_config(self, engine: str, page_config) -> dict:
+        """把页面传来的引擎参数与已保存配置合并（页面值优先）。
+
+        页面上 api_key 是掩码占位或空值时保留已保存的真实值，
+        因此除了密钥本身，页面上改了还没保存的参数也能即时测。
+        """
+        saved = self._merged_config().get("LLM", {}).get(engine, {})
+        merged = dict(saved) if isinstance(saved, dict) else {}
+        for key, value in (page_config or {}).items():
+            if key == "api_key" and (
+                value in (None, "") or self._is_mask_placeholder(value)
+            ):
+                continue
+            merged[key] = value
+        return merged
+
+    @staticmethod
+    def _probe_llm(cfg: dict) -> dict:
+        """同步跑一次真实请求并量耗时（在线程池中调用）。"""
+        from core.utils.llm import create_instance
+
+        provider = create_instance(cfg.get("type") or "openai", cfg)
+        dialogue = [{"role": "user", "content": ConfigHandler.TEST_LLM_PROMPT}]
+        return provider.probe_stream(dialogue)
+
+    async def handle_test_llm(self, request):
+        """测试 LLM 引擎能不能用、推理档位的实际代价（页面「测试」按钮）。
+
+        返回 200 + ok 标志：模型/网关的报错原样带回页面，
+        因为「哪一步断了」看那句报错就够了。
+        """
+        denied = self._require_session(request)
+        if denied:
+            return denied
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "请求格式错误"})
+
+        engine = str(body.get("engine") or "").strip()
+        if not engine:
+            return web.json_response({"ok": False, "error": "缺少引擎名"})
+
+        cfg = self._resolve_test_config(engine, body.get("config"))
+        if not cfg:
+            return web.json_response(
+                {"ok": False, "engine": engine, "error": f"未找到引擎配置: {engine}"}
+            )
+
+        llm_type = cfg.get("type") or "openai"
+        if llm_type != "openai":
+            return web.json_response({
+                "ok": False, "engine": engine,
+                "error": f"暂只支持 openai 类型引擎的测试（当前 type={llm_type}）",
+            })
+
+        import asyncio
+
+        timeout = 60.0
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, self._probe_llm, cfg),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            return web.json_response({
+                "ok": False, "engine": engine,
+                "error": f"请求超过 {int(timeout)} 秒无响应，网关可能不通或 max_tokens 过大",
+            })
+        except Exception as e:
+            return web.json_response({
+                "ok": False, "engine": engine,
+                "error": f"{type(e).__name__}: {str(e)[:500]}",
+            })
+
+        result.update({"ok": True, "engine": engine})
+        self.logger.bind(tag=TAG).info(
+            f"引擎测试 {engine}: {result.get('model')} "
+            f"首句 {result.get('first_content_ms')}ms 思考 {result.get('reasoning_chars')}字"
+        )
+        return web.json_response(result)
+
     async def handle_restart(self, request):
         """重启服务使配置生效（launchctl kickstart，后台执行立即返回）。"""
         denied = self._require_session(request)

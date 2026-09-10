@@ -93,6 +93,14 @@ select option{background:var(--panel2)}
 /* JSON 查看器 */
 .jsonbox{background:#0a0e18;border:1px solid var(--line);border-radius:12px;padding:16px;font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#7dd3fc;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto;line-height:1.6}
 
+/* 测试结果 */
+.testresult{margin-top:6px;font-size:12.5px;line-height:1.7;color:var(--dim)}
+.testresult .kv{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.testresult .kv span{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:4px 10px}
+.testresult .reply{margin-top:10px;padding:10px 12px;background:#0a0e18;border:1px solid var(--line);border-radius:10px;color:var(--text);white-space:pre-wrap}
+.testresult .warn{color:var(--warn);margin-top:10px}
+.testresult .err{color:var(--err);word-break:break-all}
+
 /* 折叠面板 */
 details{border:1px solid var(--line);border-radius:10px;margin-top:10px;overflow:hidden}
 details summary{cursor:pointer;color:var(--dim);font-size:12px;padding:10px 14px;background:var(--panel2);list-style:none;display:flex;align-items:center;gap:8px;transition:all .2s}
@@ -187,6 +195,35 @@ function setPath(obj, path, val){
 const SENSITIVE_RE = /^(api_key|access_token|secret_key|secret_id|app_secret|token|password|authorization|auth_key|personal_access_token|api_secret|private_key)$|(_key|_secret|_token)$/i;
 function isMasked(val){ return typeof val==='string' && /^.{0,4}\*{4}.{0,4}$/.test(val); }
 
+/* 字段元信息：给自动渲染的引擎参数配上中文标签、说明与可选项 */
+const FIELD_META = {
+  reasoning_effort: {
+    label: '推理级别',
+    hint: '默认中：档位越高思考越久，首句语音出声越晚（实测各档位差异不大）。思考 token 计入 max_tokens，档位高时建议把 max_tokens 调大，否则可能只思考不回答。选「关闭」= 不指定档位，平台不支持真关闭时仍会思考。',
+    options: [
+      { value: 'low',    label: '低 · low（最快出声）' },
+      { value: 'medium', label: '中 · medium（默认）' },
+      { value: 'high',   label: '高 · high' },
+      { value: 'xhigh',  label: '极高 · xhigh' },
+      { value: 'max',    label: '最高 · max' },
+      { value: 'none',   label: '关闭 · none（不指定档位，能关则关）' },
+    ],
+  },
+};
+
+/* 引擎默认值：openai 类型的 LLM 未配推理级别时补 medium（页面上可见可改）。 */
+function applyLlmDefaults(cfg){
+  const llm = cfg && cfg.LLM;
+  if (llm && typeof llm === 'object'){
+    for (const eng of Object.values(llm)){
+      if (eng && typeof eng === 'object' && eng.type === 'openai' && !eng.reasoning_effort){
+        eng.reasoning_effort = 'medium';
+      }
+    }
+  }
+  return cfg;
+}
+
 /* ---------- API ---------- */
 async function api(path, opts={}){
   const r = await fetch(path, {
@@ -204,7 +241,7 @@ async function init(){
     $('svcStatus').textContent = '服务运行中';
     const meta = await api('/xiaozhi/config/api/meta');
     const d = await api('/xiaozhi/config/api/full');
-    CONFIG = d.config; state = deepClone(CONFIG);
+    CONFIG = applyLlmDefaults(d.config); state = deepClone(CONFIG);
     buildNav(); buildGroups(); markChanged();
   } catch(e){
     $('svcStatus').textContent = '服务异常: ' + e.message;
@@ -326,6 +363,44 @@ async function deleteFirmware(filename){
   }
 }
 
+/* ---------- 引擎连通性测试 ---------- */
+async function testLLM(){
+  const eng = state.selected_module?.LLM;
+  const cfg = getPath(state, 'LLM.'+eng) || {};
+  const btn = $('llmTestBtn'), box = $('llmTestResult');
+  if (!btn || !box) return;
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ 测试中…';
+  box.innerHTML = '<span>已发出请求，最长等 60 秒…</span>';
+  try {
+    const r = await api('/xiaozhi/config/api/test-llm', {
+      method:'POST', body: JSON.stringify({engine: eng, config: cfg}),
+    });
+    if (!r.ok){
+      box.innerHTML = `<div class="err">❌ 未接通：${esc(r.error || '测试失败')}</div>`;
+      return;
+    }
+    const ms = v => (v === null || v === undefined) ? '—' : v + ' ms';
+    const empty = r.reply ? '' :
+      `<div class="warn">⚠ 只思考、没正文：思考 token 计入 max_tokens，当前上限 ${r.max_tokens ?? '未设置'}，请调大 max_tokens 或降低推理级别。</div>`;
+    box.innerHTML = `
+      <div class="kv">
+        <span>✅ 已接通</span>
+        <span>模型 ${esc(r.model || '-')}</span>
+        <span>推理 ${esc(r.reasoning_effort || '-')}</span>
+        <span>首字节 ${ms(r.first_chunk_ms)}</span>
+        <span>首句 ${ms(r.first_content_ms)}</span>
+        <span>总耗时 ${ms(r.total_ms)}</span>
+        <span>思考 ${r.reasoning_chars || 0} 字</span>
+      </div>
+      ${r.reply ? `<div class="reply">${esc(r.reply)}</div>` : ''}${empty}`;
+  } catch(e){
+    box.innerHTML = `<div class="err">❌ 请求失败：${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
 /* ---------- 变更跟踪 ---------- */
 function markChanged(){
   dirtyPaths = new Set();
@@ -367,12 +442,21 @@ function buildGroups(){
 
 /* 简单值字段 */
 function fld(path, label, hint='', opts={}){
+  const meta = FIELD_META[path.split('.').pop()] || {};
+  if (meta.label) label = meta.label;
+  if (meta.hint) hint = meta.hint;
   const val = getPath(state, path);
   const orig = getPath(CONFIG, path);
   const masked = isMasked(orig);
   const isSens = SENSITIVE_RE.test(path.split('.').pop()) || masked;
   let ctrl;
-  if (typeof val === 'boolean'){
+  if (meta.options){
+    const cur = val === undefined || val === null || val === '' ? '' : String(val);
+    const known = meta.options.some(o => o.value === cur);
+    const opts = meta.options.map(o=>`<option value="${esc(o.value)}" ${o.value===cur?'selected':''}>${esc(o.label)}</option>`).join('')
+      + (known ? '' : `<option value="${esc(cur)}" selected>${esc(cur || '（未设置）')}</option>`);
+    ctrl = `<select data-path="${path}">${opts}</select>`;
+  } else if (typeof val === 'boolean'){
     ctrl = `<label class="switch-row"><span class="switch"><input type="checkbox" data-path="${path}" ${val?'checked':''}><span class="sl"></span></span><span class="sw-label">${val?'开启':'关闭'}</span></label>`;
   } else if (typeof val === 'number'){
     ctrl = `<input type="number" data-path="${path}" value="${val}" ${opts.step?`step="${opts.step}"`:''}>`;
@@ -495,7 +579,16 @@ function buildGroupBody(gid){
       </div>
       <div class="group"><h2>🎤 VAD 参数（${esc(sm.VAD)}）</h2>${engFields(S.VAD?.[sm.VAD], 'VAD.'+sm.VAD)}</div>
       <div class="group"><h2>👂 ASR 参数（${esc(sm.ASR)}）</h2>${engFields(S.ASR?.[sm.ASR], 'ASR.'+sm.ASR)}</div>
-      <div class="group"><h2>🧠 LLM 参数（${esc(sm.LLM)}）</h2>${engFields(S.LLM?.[sm.LLM], 'LLM.'+sm.LLM)}</div>
+      <div class="group"><h2>🧠 LLM 参数（${esc(sm.LLM)}）</h2>
+        ${engFields(S.LLM?.[sm.LLM], 'LLM.'+sm.LLM)}
+        <div class="row">
+          <div class="meta"><div class="label">连通性测试</div><div class="hint">用当前页面上的参数（含未保存的改动）真发一次请求，量出首句延迟——设备听到第一句话大致就是这个量级。</div></div>
+          <div class="ctrl">
+            <button class="btn primary" id="llmTestBtn" onclick="testLLM()">🧪 测试这个模型</button>
+            <div id="llmTestResult" class="testresult"></div>
+          </div>
+        </div>
+      </div>
       <div class="group"><h2>👁 VLLM 参数（${esc(sm.VLLM)}）</h2>${engFields(S.VLLM?.[sm.VLLM], 'VLLM.'+sm.VLLM)}</div>
       <div class="group"><h2>🔊 TTS 参数（${esc(sm.TTS)}）</h2>${engFields(S.TTS?.[sm.TTS], 'TTS.'+sm.TTS)}</div>
       <div class="group"><h2>🧠 记忆模块（${esc(sm.Memory)}）</h2>${engFields(S.Memory?.[sm.Memory]||{}, 'Memory.'+sm.Memory)}</div>
@@ -620,6 +713,10 @@ function bindInputs(){
       if (el.type==='checkbox') val = el.checked;
       else if (el.type==='number') val = el.value==='' ? null : Number(el.value);
       else val = el.value;
+      if (el.type==='checkbox'){
+        const lb = el.closest('.switch-row')?.querySelector('.sw-label');
+        if (lb) lb.textContent = val ? '开启' : '关闭';
+      }
       // 敏感字段：清空 = 保持原值（还原为掩码/未设置），不产生变更
       if (el.dataset.sens==='1' && val==='') val = getPath(CONFIG, path) ?? null;
       if (val === null) { const parts=path.split('.'); const p=getPath(state, parts.slice(0,-1)); delete p[parts.at(-1)]; }
@@ -679,7 +776,7 @@ async function saveAll(){
     const r = await api('/xiaozhi/config/api/save', {method:'POST', body:JSON.stringify({before:CONFIG, after:state})});
     toast(`已保存 ${r.changed||0} 处修改`, 'ok');
     const d = await api('/xiaozhi/config/api/full');
-    CONFIG = d.config; state = deepClone(CONFIG);
+    CONFIG = applyLlmDefaults(d.config); state = deepClone(CONFIG);
     markChanged();
     rebuildGroup(currentGroup());
     if ($('jsonView')) $('jsonView').textContent = JSON.stringify(state, null, 2);

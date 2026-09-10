@@ -110,6 +110,10 @@ class SimpleHttpServer:
                             self.config_handler.handle_save,
                         ),
                         web.post(
+                            "/xiaozhi/config/api/test-llm",
+                            self.config_handler.handle_test_llm,
+                        ),
+                        web.post(
                             "/xiaozhi/config/api/restart",
                             self.config_handler.handle_restart,
                         ),
