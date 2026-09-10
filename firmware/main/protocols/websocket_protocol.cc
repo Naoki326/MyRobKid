@@ -12,9 +12,130 @@
 
 #define TAG "WS"
 
-WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
+namespace {
 
-WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
+// 走备用时每隔多久探一次内网主地址。
+constexpr int kPrimaryProbeIntervalMs = 30 * 1000;
+constexpr int kPrimaryProbeTaskStack = 4096;
+constexpr int kPrimaryProbeTaskPriority = 2;
+
+// 从 ws://host:port/path 解出 host 与 port（wss/https 缺省 443，其余 80）。
+// 与 web_socket.cc 的 Uri 解析保持一致，特别是 https 不算 TLS —— 那边只认 wss。
+bool ParseHostPort(const std::string& url, std::string& host, int& port) {
+    auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) {
+        return false;
+    }
+    std::string scheme = url.substr(0, scheme_end);
+    size_t begin = scheme_end + 3;
+    size_t slash = url.find('/', begin);
+    size_t end = (slash == std::string::npos) ? url.size() : slash;
+    size_t colon = url.find(':', begin);
+
+    if (colon != std::string::npos && colon < end) {
+        host = url.substr(begin, colon - begin);
+        port = 0;
+        for (size_t i = colon + 1; i < end; ++i) {
+            if (url[i] < '0' || url[i] > '9') {
+                return false;
+            }
+            port = port * 10 + (url[i] - '0');
+        }
+    } else {
+        host = url.substr(begin, end - begin);
+        port = (scheme == "wss" || scheme == "https") ? 443 : 80;
+    }
+    return !host.empty() && port > 0;
+}
+
+}  // namespace
+
+WebsocketProtocol::WebsocketProtocol()
+    : probe_state_(std::make_shared<ProbeState>()) {
+    event_group_handle_ = xEventGroupCreate();
+}
+
+WebsocketProtocol::~WebsocketProtocol() {
+    // 让后台探测任务自己退出。任务不碰 event group，也无须在这里等它——
+    // ProbeState 由任务侧 shared_ptr 持有，协议对象先走不会悬垂访问。
+    probe_state_->prefer_backup = false;
+    vEventGroupDelete(event_group_handle_);
+}
+
+bool WebsocketProtocol::ConnectTo(const std::string& url) {
+    ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
+    if (websocket_->Connect(url.c_str())) {
+        return true;
+    }
+    ESP_LOGE(TAG, "Failed to connect to websocket server %s, code=%d", url.c_str(),
+             websocket_->GetLastError());
+    return false;
+}
+
+void WebsocketProtocol::StartPrimaryProbe(const std::shared_ptr<ProbeState>& state) {
+    if (state->probe_running.exchange(true)) {
+        return;  // 已有探测任务，它下一轮会读到新目标
+    }
+    auto* arg = new std::shared_ptr<ProbeState>(state);
+    if (xTaskCreate(PrimaryProbeTask, "ws_probe", kPrimaryProbeTaskStack, arg,
+                    kPrimaryProbeTaskPriority, nullptr) != pdPASS) {
+        delete arg;
+        state->probe_running = false;
+        ESP_LOGW(TAG, "Failed to start primary probe task");
+    }
+}
+
+void WebsocketProtocol::NoteBackupInUse(const std::string& primary_url) {
+    probe_state_->prefer_backup = true;
+    {
+        std::lock_guard<std::mutex> lock(probe_state_->mutex);
+        probe_state_->primary_url = primary_url;
+    }
+    StartPrimaryProbe(probe_state_);
+}
+
+void WebsocketProtocol::PrimaryProbeTask(void* arg) {
+    std::unique_ptr<std::shared_ptr<ProbeState>> holder(
+        static_cast<std::shared_ptr<ProbeState>*>(arg));
+    auto state = *holder;
+
+    while (state->prefer_backup) {
+        vTaskDelay(pdMS_TO_TICKS(kPrimaryProbeIntervalMs));
+        if (!state->prefer_backup) {
+            break;
+        }
+        std::string url;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            url = state->primary_url;
+        }
+        std::string host;
+        int port = 0;
+        if (!ParseHostPort(url, host, port)) {
+            break;
+        }
+        auto network = Board::GetInstance().GetNetwork();
+        auto tcp = network != nullptr ? network->CreateTcp(-1) : nullptr;
+        if (tcp == nullptr) {
+            continue;
+        }
+        if (tcp->Connect(host, port)) {
+            tcp->Disconnect();
+            state->prefer_backup = false;
+            ESP_LOGI(TAG, "Primary websocket %s is reachable again", url.c_str());
+            break;
+        }
+        ESP_LOGD(TAG, "Primary websocket %s still unreachable, keep using backup", url.c_str());
+    }
+
+    state->probe_running = false;
+    if (state->prefer_backup) {
+        // 与 StartPrimaryProbe 的 exchange 存在竞态窗口：这里补起一个，
+        // 否则“备用已切换但探测任务已退出”会让内网恢复探测永久缺失。
+        StartPrimaryProbe(state);
+    }
+    vTaskDelete(nullptr);
+}
 
 bool WebsocketProtocol::Start() {
     // Only connect to server when audio channel is needed
@@ -166,26 +287,41 @@ bool WebsocketProtocol::OpenAudioChannel() {
         }
     });
 
-    ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
-    if (!websocket_->Connect(url.c_str())) {
-        ESP_LOGE(TAG, "Failed to connect to websocket server %s, code=%d", url.c_str(), websocket_->GetLastError());
-        // 主地址（局域网 IP）连接失败，尝试备用地址（域名）
-        if (!backup_url.empty() && backup_url != url) {
-            ESP_LOGW(TAG, "Primary websocket %s failed, trying backup: %s", url.c_str(), backup_url.c_str());
-            websocket_->Close();
-            if (!websocket_->Connect(backup_url.c_str())) {
-                ESP_LOGE(TAG, "Failed to connect to backup websocket server, code=%d", websocket_->GetLastError());
-                SetError(Lang::Strings::SERVER_NOT_CONNECTED);
-                return false;
-            }
-            // 保存备用地址，下次直接用它
-            Settings ws_settings("websocket", true);
-            ws_settings.SetString("url", backup_url);
-            ESP_LOGI(TAG, "Switched to backup websocket: %s", backup_url.c_str());
+    const bool has_backup = !backup_url.empty() && backup_url != url;
+    bool connected = false;
+
+    if (has_backup && probe_state_->prefer_backup) {
+        // 上次主地址不通：本轮直接走备用。内网一旦恢复，后台探测会清掉这个偏好。
+        connected = ConnectTo(backup_url);
+        if (connected) {
+            ESP_LOGW(TAG, "Using backup websocket: %s", backup_url.c_str());
         } else {
-            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
-            return false;
+            websocket_->Close();
+            connected = ConnectTo(url);
+            if (connected) {
+                // 备用不通、主地址反而通了：立刻把首选改回内网
+                probe_state_->prefer_backup = false;
+            }
         }
+    } else {
+        // 内网主地址永远是首选；备用只在主地址摸不到时接管本次连接
+        connected = ConnectTo(url);
+        if (connected) {
+            probe_state_->prefer_backup = false;
+        } else if (has_backup) {
+            websocket_->Close();
+            if (ConnectTo(backup_url)) {
+                connected = true;
+                ESP_LOGW(TAG, "Primary websocket %s failed, using backup: %s", url.c_str(),
+                         backup_url.c_str());
+                NoteBackupInUse(url);
+            }
+        }
+    }
+
+    if (!connected) {
+        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        return false;
     }
 
     // Send hello message to describe the client
