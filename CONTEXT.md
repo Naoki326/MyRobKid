@@ -69,7 +69,7 @@ _Avoid_: 成功（未验证的）、返回 true
 _Avoid_: 灵异、被劫持、回滚 bug
 
 **寻址三件套**:
-机器人找到 MyRobKid 服务端依赖的三处配置：固件内 OTA 地址（sdkconfig）、OTA 响应下发的 WebSocket 地址（服务端 config）、固件分发目录（data/bin）。三处必须一致且入库，临时改而不存档会复现 2.4.5 事故。
+机器人找到 MyRobKid 服务端依赖的三处配置：固件内 OTA 地址（sdkconfig）、OTA 响应下发的 WebSocket 地址（服务端 config）、固件分发目录（data/bin）。三处必须一致且入库，临时改而不存档会复现 2.4.5 事故。另有**第四处地址**——音乐代理主机（`plugins/music-mcp/music_mcp.py` 的 `PROXY_HOST`，派生所有 play_url 与授权页提示），同属这条纪律：写 mDNS 名不写 IP，且全文件只此一处，见 ADR-0002。
 _Avoid_: 服务器地址（单指一处，不概括）
 
 ### 服务端
@@ -107,6 +107,10 @@ _Avoid_: 测试脚本（泛称）、压测
 **管线遥测**:
 固件 MusicPlayer 每 2 秒打印的 `pipe:` 行（ring 水位/in_buf/下载字节/推帧与失败计数），音乐卡顿定位的第一证据源；配套 USB 串口（115200）抓设备日志。
 _Avoid_: 音乐日志（泛称）、debug 日志
+
+**音乐地址自检**:
+主仓 tools/music_url_check.py：跑「搜索 → play_url → 真取流」，确认设备拿到的地址能播。被测启动命令取自 `data/.mcp_server_settings.json`。判据不看日志——设备侧 play_music 是假成功，地址错了照样报成功；判据只看 URL 能不能取到音频。
+_Avoid_: 音乐测试（泛称）
 
 **省电锯齿**:
 WiFi 省电模式下设备网络往返时间呈周期性锯齿（峰值可达数秒），会撕裂 60ms/帧的音频流形成一字一顿；对话期须全速。

@@ -13,13 +13,14 @@
   - QQ 音乐搜索 / 播放 URL 解析（仅返回设备可播的 .mp3 直链）
   - radio-browser 电台搜索（仅 MP3 流）
 
-登录入口统一为授权页：http://<mac>:8080/apps/qqmusic/（nginx /apps/qqmusic/）
+对外地址全部从 PROXY_HOST 派生（见下方「音乐代理地址」），本文件只写一处主机名。
 """
 
 import asyncio
 import json
 import os
 import subprocess
+import sys
 import urllib.parse
 import urllib.request
 
@@ -27,9 +28,47 @@ from mcp.server.fastmcp import FastMCP
 from qqmusic_api import Client, Credential
 
 CONSUMER = os.environ.get("MUSIC_MCP_CONSUMER", "mac")
+
+
+# ═══ 音乐代理地址：单一事实源 ═══════════════════════════════════
+# 设备侧所有音乐/播客/电台 URL（play_url）与授权页提示都从 PROXY_HOST 派生，
+# 全文件只此一处写主机名——改这一行，整个音乐链路跟着变。
+#
+# 为什么用 mDNS 名而不是 IP：宿主机 Mac 走 DHCP（12h 租约），IP 会漂。
+# 2026-09-11「搜完歌说开始播放、机器人就不动了」就是地址漂移所致：设备拿到
+# 写死的 192.168.18.172（此时已不属于本机，ARP incomplete）连不上，而固件
+# play_music 是「假成功」——先返回 true 再去连流，日志看着成功却无声。
+# 这与 ADR-0002「地址一律用 mDNS 名」是同一条纪律，音乐代理是第四处地址。
+#
+# 需要临时改地址（如 Mac 改名）时用环境变量覆盖，不必动代码：
+#   MUSIC_PROXY_BASE=http://别的名字:8080/music/stream
+PROXY_HOST = "chenMac-mini.local:8080"          # ← 只改这一行
+DEFAULT_PROXY_BASE = f"http://{PROXY_HOST}/music/stream"
+PROXY_BASE = os.environ.get("MUSIC_PROXY_BASE", DEFAULT_PROXY_BASE)
 AUTH_PAGE_HINT = (
-    "请在任意设备打开 QQ 音乐授权页扫码：http://<Mac的IP>:8080/apps/qqmusic/"
+    f"请在任意设备打开 QQ 音乐授权页扫码：http://{PROXY_HOST}/apps/qqmusic/"
 )
+
+
+def _resolve_host_of(base: str) -> str:
+    return urllib.parse.urlsplit(base).hostname or ""
+
+
+def _looks_like_ip(host: str) -> bool:
+    return bool(host) and all(ch.isdigit() or ch == "." for ch in host)
+
+
+# 启动即把生效地址打到 stderr（launchd 收进 /tmp/xiaozhi_server_launchd.log）：
+# 地址错了是一句日志就能看出来的事，不必再靠串口取证。
+_host = _resolve_host_of(PROXY_BASE)
+if _looks_like_ip(_host):
+    print(
+        f"[music-mcp] ⚠ 音乐代理地址是 IP 字面量（{_host}）：Mac 走 DHCP，"
+        f"IP 漂移后设备会连不上且固件不报错，表现为「说开始播放却没声音」。"
+        f"建议改用 mDNS 名 {PROXY_HOST.split(':')[0]}。",
+        file=sys.stderr,
+    )
+print(f"[music-mcp] 音乐代理地址：{PROXY_BASE}", file=sys.stderr)
 
 mcp = FastMCP("QQMusic" if CONSUMER == "mac" else "XiaoZhiMusic")
 
@@ -255,11 +294,9 @@ async def get_lyrics(keyword: str) -> str:
 
 # 设备固件（2.4.8）的 HTTP 栈不跟随 302，且设备外网连通性不可靠；
 # 因此 play_url 一律经 Mac 上的 ffmpeg 转码代理（nginx /music/stream → 8777）
-# 下发：代理负责跟随重定向与格式转码，设备只连局域网 IP。
+# 下发：代理负责跟随重定向与格式转码，设备只连局域网。
 # 其余格式（m4a/m4s/aac…）同样依赖该代理转码。
-PROXY_BASE = os.environ.get(
-    "MUSIC_PROXY_BASE", "http://192.168.18.172:8080/music/stream"
-)
+# 地址（含为什么用 mDNS 名）见文件头部「音乐代理地址：单一事实源」。
 
 
 def _ensure_playable(url: str, referer: str = None) -> str:

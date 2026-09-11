@@ -13,9 +13,20 @@
 
 旧工程（固件雏形）的本地组件修改不可丢：`managed_components/78__esp-wifi-connect`（配网增强）与 `txp666__otto-emoji-gif-component`（定制表情）均不入库，registry 拉取的纯净版会缺失。决定：**固件构建统一在主仓**，每次构建前从旧工程目录复制这两个组件（或任何后续本地修改过的组件），2.4.8 即按此方式集成音乐播放修复 + 省电补丁 + 正确寻址，USB 直刷 ota_0 生效。
 
-## 地址改用 mDNS 名（2026-09-10）
+## 地址改用 mDNS 名（2026-09-10，2026-09-11 补第四处）
 
 宿主机 Mac 的 DHCP 租约会漂移（`192.168.18.172` → `192.168.18.166`），写死 IP 的寻址三件套在每次 IP 变更后全链路失联。决定：OTA 地址与 WS 地址一律写成 mDNS 名 `chenMac-mini.local`（`scutil --get LocalHostName` 的值；mDNS 比较大小写不敏感，配置里写成 `chenmac-mini.local` 同样有效），不再随 IP 走。
+
+**2026-09-11 补漏：音乐代理是第四处地址，09-10 那次迁移漏了它。** 音乐/播客/电台的 `play_url` 由 `plugins/music-mcp/music_mcp.py` 的 `PROXY_BASE` 拼出，默认值写死了 `192.168.18.172`；10 日改完寻址三件套后设备照连服务端不误，唯独音乐在 9 月 3 日之后彻底无声——设备拿到已不属于本机的地址（ARP `incomplete`），而固件 `play_music` 是**假成功**（先返回 true 再去连流），日志仍显示成功。用户看到的是「搜完音乐、说开始播放，机器人就不动了」。
+
+同一纪律落到音乐链路上：
+
+- `PROXY_HOST = "chenMac-mini.local:8080"` 是**全文件唯一写主机名的地方**，`PROXY_BASE`、授权页提示等全部由它派生；改地址只改这一行（需临时覆盖可用环境变量 `MUSIC_PROXY_BASE`）。地址值入库在仓库里，不靠「记得改现场」。
+- 启动即把生效地址打到 stderr（launchd 收进 `/tmp/xiaozhi_server_launchd.log`）；地址是 IP 字面量时额外告警——这个故障本该一句日志就能看出来，不必再走串口取证。
+- 回归判据：`server/.venv/bin/python tools/music_url_check.py`（跑「搜索 → play_url → 真取流」，地址退回 IP 或主机不可达即变红；被测启动命令直接读 `data/.mcp_server_settings.json`，不另存一份路径知识）。
+- 脚本实体只留仓库一份：`~/xiaozhi-music-mcp/{music_mcp,qqmusic_auth_server}.py` 与 `~/.hermes/bin/qqmusic_mcp.py` 均为指向 `plugins/music-mcp/` 的符号链接（相对路径），改一次仓库文件三个入口同时生效。
+
+**残留风险**：固件 `MusicPlayer` 等首帧的上限是 `kStartWaitTimeoutMs = 10000`，而 mDNS 解析失败时 lwIP 要走完 `DNS_MAX_RETRIES=4` 的退避（约 7 秒）。正常一次查询是毫秒级，但若某次查询丢包后又赶上解析退避，首播可能踩到 10 秒上限。音乐偶发「起不来」时，先看是不是这条。
 
 - 固件侧能力已具备：`CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=y` + 板卡 `mdns_init()`，WebSocket 走的 `EspTcp::gethostbyname` 为 IPv4，`.local` 可解析。
 - 两个来源必须同时改：`firmware/main/boards/zhengchen/minicam/config.json` 的 `sdkconfig_append`（`scripts/build.py` 构建时生成 sdkconfig 的真相源）与入库的 `firmware/sdkconfig`（`idf.py build` 直接使用的那个）。
