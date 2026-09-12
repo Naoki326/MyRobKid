@@ -146,6 +146,7 @@ _Avoid_: 测试脚本（泛称）、压测
 
 **管线遥测**:
 固件 MusicPlayer 每 2 秒打印的 `pipe:` 行（ring 水位/in_buf/下载字节/推帧与失败计数/位点 pos（整秒）/暂停标记 PAUSED_CONV|PAUSED_USER），音乐卡顿定位与位点核验的第一证据源；配套 USB 串口（115200）抓设备日志，`tools/serial_telemetry.py --assert` 可对位点做断言（不超墙钟、不低于起点、live 无数字位点、暂停期间位点冻结、续播接缝在 ±0.5s 内、用户暂停绝不自动续）。另有 `Music pause:` / `Music resume: mode=continue|restart` / `Music auto-resume:` 三条行为锚点行，位点带一位小数（spec 的 ±0.5s 验收缝；`pipe:` 周期行仍整秒）。
+收场反馈另有两条（issue #7）：`Music ended: reason=<completed|interrupted|resume_failed|stopped|replaced|start_failed> played=0|1 pos=…` 是播放器自报的收场真相，`Music feedback: reason=… sound=<success|alert|none> screen=<ended|interrupted|stopped|none> wake_word=on|off interactive=<scheduled|already|wake_word_only|none>` 是应用侧对真相的处置（换歌的旧会话打 `skipped=new_session`）。三者（音/屏/因果）同一条锚点行里对齐，串口断言据此核「自然播完与链路中断的音不同」「用户主动停止绝不报故障音」，不靠耳朵。
 _Avoid_: 音乐日志（泛称）、debug 日志
 
 **音乐地址自检**:

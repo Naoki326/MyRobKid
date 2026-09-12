@@ -95,12 +95,16 @@ bool MusicPlayer::Start(std::string url, FinishedCallback finished_callback) {
         return false;
     }
 
+    bool replacing = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (worker_running_.load()) {
-            // Already playing: replace the current stream.
-            cancelled_ = true;
-        }
+        replacing = worker_running_.load();
+    }
+    if (replacing) {
+        // Already playing: replace the current stream. 收场分类要区分「换歌」
+        // 与「用户按停」——旧会话的收场归新会话，不出声（kReplaced）。
+        // 注：不能在持 mutex_ 时调 CancelWith（它自己取那把锁）。
+        CancelWith(CancelCause::kReplace);
     }
     // Let the previous worker drain out before reusing the player.
     while (worker_running_.load()) {
@@ -116,7 +120,7 @@ bool MusicPlayer::Start(std::string url, FinishedCallback finished_callback) {
         std::lock_guard<std::mutex> lock(mutex_);
         url_ = std::move(url);
         finished_callback_ = std::move(finished_callback);
-        cancelled_ = false;
+        cancel_cause_.store(CancelCause::kNone);
         // 新会话：上一首的暂停态与待恢复标记一并清掉（换歌是替换语义，
         // 不是恢复语义——被暂停的旧会话没有资格再被接回来）。
         paused_ = false;
@@ -149,17 +153,21 @@ bool MusicPlayer::Start(std::string url, FinishedCallback finished_callback) {
     }
     if (!ok) {
         ESP_LOGE(TAG, "Music stream did not start in time: %s", url_.c_str());
+        // 自我拆掉（从未出声）：收场分类因此是 start_failed，不是
+        // 「用户停」也不是「链路中断」——起播那一刻已经报过错，不再出声。
+        CancelWith(CancelCause::kStartAbort);
         Stop();
         return false;
     }
     return true;
 }
 
-void MusicPlayer::Cancel() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        cancelled_ = true;
-    }
+void MusicPlayer::CancelWith(CancelCause cause) {
+    // 先到者胜（无锁 CAS）：先换歌、后来了个停止指令时，收场原因应当是那个
+    // 先发生的真原因，而不是后到的噪声（旧会话本来就在为换歌退场）。用 CAS
+    // 而不是取 mutex_：取消可能发生在持有 mutex_ 的路径里，取锁会自锁。
+    CancelCause expected = CancelCause::kNone;
+    cancel_cause_.compare_exchange_strong(expected, cause);
     {
         // Wake Start() up if it is still waiting on the first frame.
         std::lock_guard<std::mutex> start_lock(start_mutex_);
@@ -167,6 +175,8 @@ void MusicPlayer::Cancel() {
         start_cv_.notify_all();
     }
 }
+
+void MusicPlayer::Cancel() { CancelWith(CancelCause::kUserStop); }
 
 void MusicPlayer::Stop() {
     Cancel();
@@ -335,7 +345,7 @@ MusicPlayer::SessionOutcome MusicPlayer::WorkerTask() {
         if (end != StreamEnd::kRestart) {
             break;
         }
-        if (cancelled_.load()) {
+        if (Cancelled()) {
             // 取消优先于恢复：用户要的是停止，不是换个连接接着放。
             end = StreamEnd::kCancelled;
             break;
@@ -365,11 +375,6 @@ MusicPlayer::SessionOutcome MusicPlayer::WorkerTask() {
         attempted_restart = true;
     }
 
-    // 「续播失败」不是「用户停止」也不是「自然播完」：这次会话是对已暂停
-    // 音乐的恢复，重起流没能接上。收尾方（Application）据此给用户一个可辨
-    // 反馈，别让音乐悄悄消失。
-    const bool resume_failed = attempted_restart && end == StreamEnd::kFailed;
-
     if (!first_frame_decoded_) {
         {
             std::lock_guard<std::mutex> start_lock(start_mutex_);
@@ -377,26 +382,71 @@ MusicPlayer::SessionOutcome MusicPlayer::WorkerTask() {
             start_cv_.notify_all();
         }
     }
+    bool played = false;
     {
         std::lock_guard<std::mutex> start_lock(start_mutex_);
+        played = first_frame_decoded_;
         // Make sure a concurrent Start() is not stuck waiting either.
         start_failed_ = true;
         start_cv_.notify_all();
     }
-    if (end == StreamEnd::kFailed) {
-        ESP_LOGE(TAG, "Music worker finished (failed%s): %s",
-                 resume_failed ? ", resume failed" : "", url.c_str());
-    } else {
-        ESP_LOGI(TAG, "Music worker finished (%s): %s",
-                 end == StreamEnd::kDrained ? "completed" : "aborted", url.c_str());
+
+    // ── 收场分类（issue #7）─────────────────────────────────────
+    // 在这里、会话状态被下一次 Start() 覆盖**之前**把五个事实位读齐：
+    //   played —— 本次会话是否真出过声（start_mutex_ 保护）。这是「中断」
+    //             与「起流失败」的分水岭：没听见声音就不存在「断了」。
+    //   drained —— 缓冲真播空了（EOF 且队列排干）。
+    //   cancelled/replaced —— 为什么被停（cancel_cause_，先到者胜）。
+    //   attempted_restart —— 走过续播重连。
+    // 「用户停」与「链路中断」从前都是 success=false，分不开；现在由原因
+    // 驱动，用户按下停止键不会再听见警报音。
+    MusicEndingFacts facts;
+    facts.played = played;
+    facts.drained = (end == StreamEnd::kDrained);
+    const CancelCause cancel_cause = cancel_cause_.load();
+    facts.cancelled = cancel_cause != CancelCause::kNone;
+    facts.replaced = cancel_cause == CancelCause::kReplace;
+    facts.attempted_restart = attempted_restart;
+    const MusicEnding ending = DeriveMusicEnding(facts);
+
+    // 收场时点与内容形态：位点仍由本次会话记账（worker_running_ 要到
+    // WorkerEntry 才清），直播流不报数字位点。
+    MusicContentMeta meta;
+    int start_s = 0;
+    uint64_t pushed = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        meta = meta_;
+        start_s = start_s_;
+        pushed = pushed_samples_.load(std::memory_order_relaxed);
     }
+    const double position_s =
+        meta.live ? 0.0
+                  : PositionSecondsF(start_s, pushed,
+                                     audio_service_.GetOutputSampleRate());
+
+    // 收场锚点（串口断言用，取代旧的 Music worker finished）：原因 + 是否出过声
+    // + 位点。真故障用 LOGE，用户主动停止/换歌/自然播完用 LOGI——「安静地正常
+    // 结束」与「出了事」在日志里也不该长得一样。
+    char pos_field[32];
+    // 一位小数：与 pause/resume 锚点同口径，收场断在哪里要比整秒清楚。
+    WritePositionField(position_s, meta.live, pos_field, sizeof(pos_field));
+    if (MusicEndingIsFailure(ending)) {
+        ESP_LOGE(TAG, "Music ended: reason=%s played=%d pos=%s url=%s",
+                 MusicEndingName(ending), facts.played ? 1 : 0, pos_field, url.c_str());
+    } else {
+        ESP_LOGI(TAG, "Music ended: reason=%s played=%d pos=%s url=%s",
+                 MusicEndingName(ending), facts.played ? 1 : 0, pos_field, url.c_str());
+    }
+
     // 结果与回调一起交给 WorkerEntry（它清完 worker_running_ 再发出）：调用方
     // 在回调里问「播放器还在忙吗」才是准的（省电归还、唤醒词恢复都按这个判断走）。
     // 结果不走共享成员——快速失败的新会话可能已经把共享结果覆盖了。
     SessionOutcome outcome;
     outcome.callback = std::move(finished_callback);
-    outcome.result.success = (end == StreamEnd::kDrained);
-    outcome.result.resume_failed = resume_failed;
+    outcome.result.ending = ending;
+    outcome.result.position_s = position_s;
+    outcome.result.live = meta.live;
     return outcome;
 }
 
@@ -595,7 +645,7 @@ MusicPlayer::StreamEnd MusicPlayer::StreamOnce() {
             return true;
         };
 
-        while (!cancelled_.load() && !decode_error) {
+        while (!Cancelled() && !decode_error) {
             // 1) 暂停判定必须在 HTTP 填充循环**之外**（在循环里判＝暂停期间
             // 仍把 in_buf 填满），此处先卡住整个一轮。
             if (wait_while_paused()) {
@@ -891,7 +941,7 @@ MusicPlayer::StreamEnd MusicPlayer::StreamOnce() {
             result = StreamEnd::kRestart;
         } else if (stream_drained) {
             result = StreamEnd::kDrained;
-        } else if (cancelled_.load()) {
+        } else if (Cancelled()) {
             result = StreamEnd::kCancelled;
         } else {
             result = StreamEnd::kFailed;

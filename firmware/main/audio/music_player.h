@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "audio_service.h"
+#include "music_ending.h"
 #include "music_url.h"
 
 /*
@@ -85,17 +86,22 @@ class MusicPlayer {
 public:
     /*
      * 会话结束回调，在 worker 任务里调用（调用方负责转到自己的线程）。
-     * 两个 bool 是两件不同的事：success = 正常播完（EOF 且缓冲播空）；
-     * resume_failed = 这次结束发生在「恢复已暂停的音乐」的路上——重起流
-     * 也没接上。后者要给用户可辨反馈（issue #12），不能与「自然播完」混作
-     * 一谈，否则断线会被听成「歌放完了」。
      *
-     * 两者与回调**同一条线程**产出（WorkerTask 一次返回），不落任何共享
+     * 从前只报两个 bool（success / resume_failed），装不下「用户自己停的」
+     * ——它与「链路中断」都是 success=false 且 resume_failed=false，用户那边
+     * 却是一个不用管、一个要检查网络（issue #7）。现在报的是**收场分类**
+     * （music_ending.h）+ 收场时的位点，判定与反馈不再靠猜。
+     *
+     * 各字段与回调**同一条线程**产出（WorkerTask 一次返回），不落任何共享
      * 成员：换歌时旧 worker 的结果绝不能喂给新会话的回调，反之亦然。
      */
     struct FinishedResult {
-        bool success = false;
-        bool resume_failed = false;
+        // 自然播完 / 链路中断 / 续播失败 / 用户主动停止 / 换歌被替换 / 起流失败
+        MusicEnding ending = MusicEnding::kStartFailed;
+        // 收场那一刻的绝对位点（一位小数口径，与锚点行同一折算）；直播流为
+        // 0 且 live=true。用户停止与链路中断都靠它报出「断在哪」。
+        double position_s = 0.0;
+        bool live = false;
     };
     using FinishedCallback = std::function<void(const FinishedResult& result)>;
 
@@ -109,6 +115,7 @@ public:
     // Ask the worker to stop without waiting for it (safe from the main
     // loop: the worker may be blocked inside an HTTP read for a while).
     // This is a *stop*: the session ends and the position is dropped.
+    // 收场分类是 kStopped（不是故障）——用户自己停的不该听见警报音。
     void Cancel();
     // Cancel() + wait until the worker has fully drained out.
     void Stop();
@@ -168,6 +175,20 @@ private:
      */
     enum class StreamEnd { kDrained, kCancelled, kRestart, kFailed };
 
+    /*
+     * 会话为什么被要求停止（issue #7）。取消从前只是一个 bool，于是
+     * 「用户按停」与「换歌」在收场处彻底分不开——两者都得出「不是自然播完」，
+     * 但一个要报「已停止」、一个不该吭声。停止**原因**是收场分类的输入，
+     * 所以它得跟着取消一起记。kStartAbort 是起流失败后的自我拆掉
+     * （从未出声，收场仍是 start_failed）。
+     */
+    enum class CancelCause { kNone, kUserStop, kReplace, kStartAbort };
+
+    // 记下停止原因：先到者胜（已经是别的原因就保留先到的）。不取 mutex_
+    // ——取消会从已持锁的路径上调用（见 .cc 的注释）。
+    void CancelWith(CancelCause cause);
+    bool Cancelled() const { return cancel_cause_.load() != CancelCause::kNone; }
+
     static void WorkerEntry(void* arg);
     // Returns this session's callback **and its result** (both snapshotted at
     // session start / produced at its end) so that WorkerEntry can fire them
@@ -203,7 +224,9 @@ private:
     std::string url_;
     FinishedCallback finished_callback_;
     TaskHandle_t task_handle_ = nullptr;
-    std::atomic<bool> cancelled_{false};
+    // 取消**原因**（不是 bool）：收场分类要它才能把「用户停」「换歌」与
+    // 「链路中断」分开（issue #7）。kNone = 没被取消过。
+    std::atomic<CancelCause> cancel_cause_{CancelCause::kNone};
     // True while the worker task is alive; Start() waits for it to clear
     // before reusing the player. Cleared *before* the finished callback runs
     // so that "IsBusy() == false" inside that callback means what it says.

@@ -84,8 +84,11 @@ class ParsePipeLine(unittest.TestCase):
     def test_non_pipe_line_returns_none(self):
         self.assertIsNone(serial_telemetry.parse_pipe_line("I (1) Wifi: connected"))
         self.assertIsNone(serial_telemetry.parse_pipe_line(""))
+        # 收场/反馈锚点含 "Music" 但不是周期遥测：不能被当成 pipe: 行。
         self.assertIsNone(serial_telemetry.parse_pipe_line(
-            "I (1) MusicPlayer: Music worker finished (completed): http://x"))
+            ending_line("completed", played=1, pos=13.0)))
+        self.assertIsNone(serial_telemetry.parse_pipe_line(
+            feedback_line("completed", pos=13.0)))
 
 
 class ParseSessionLine(unittest.TestCase):
@@ -246,6 +249,48 @@ class EvaluateLiveCapture(unittest.TestCase):
         results = serial_telemetry.evaluate_capture(samples, live=True)
         no_pos = [r for r in results if r.name == "live_records_no_position"][0]
         self.assertTrue(no_pos.ok)
+
+
+def _pos_field(pos):
+    """位点字段：数字带单位后缀，字面 'live' 原样（锚点行是一位小数口径）。"""
+    return pos if isinstance(pos, str) else f"{pos}s"
+
+
+def ending_line(reason="completed", played=1, pos=269.0, url="http://h/stream"):
+    """收场锚点（issue #7）：播放器在 worker 退出前打，带五个事实位推出来的原因。"""
+    return (f"I (300) MusicPlayer: Music ended: reason={reason} "
+            f"played={played} pos={_pos_field(pos)} url={url}")
+
+
+def feedback_line(reason="completed", pos=269.0, sound="success", screen="ended",
+                  wake_word="on", interactive="scheduled"):
+    """反馈锚点（issue #7）：应用侧报告这次收场给用户的声音/屏幕/回到可交互。"""
+    return (f"I (301) Application: Music feedback: reason={reason} "
+            f"pos={_pos_field(pos)} sound={sound} screen={screen} "
+            f"wake_word={wake_word} interactive={interactive}")
+
+
+def feedback_skip_line(reason="replaced", pos=12.0):
+    """跳过型反馈：旧会话的收场归新会话，不出声也不改写屏幕。"""
+    return (f"I (302) Application: Music feedback: reason={reason} "
+            f"pos={_pos_field(pos)} skipped=new_session")
+
+
+def ending_capture(ending, feedback=None, *, start=0, form="finite", t0=1000.0,
+                   pairs=((2, 2.0), (4, 4.0), (6, 6.0), (8, 8.0)),
+                   ending_dt=8.1, feedback_dt=8.2, tail=()):
+    """一场会话的抓取：起流锚点 + 位点样本 + 收场锚点（+ 反馈锚点 + 尾巴）。
+
+    tail = [(行, 相对锚点的秒数), …]，用来把收场锚点推到窗口中间（不被
+    「抓取截断」放行）。
+    """
+    samples = [{"t": t0, "line": session_line(start=start, form=form)}]
+    samples += [{"t": t0 + dt, "line": pipe_line(pos)} for pos, dt in pairs]
+    samples.append({"t": t0 + ending_dt, "line": ending})
+    if feedback is not None:
+        samples.append({"t": t0 + feedback_dt, "line": feedback})
+    samples += [{"t": t0 + dt, "line": line} for line, dt in tail]
+    return samples
 
 
 def pause_marker(kind="user", pos=30, t=0.0):
@@ -769,6 +814,307 @@ class EvaluatePauseResume(unittest.TestCase):
         results = serial_telemetry.evaluate_capture(samples)
         seam = [r for r in results if r.name == "resume_continues_position"][0]
         self.assertFalse(seam.ok)
+
+
+class ParseEndingLines(unittest.TestCase):
+    """收场/反馈锚点行解析（issue #7）。"""
+
+    def test_ending_line_fields(self):
+        parsed = serial_telemetry.parse_ending_line(
+            ending_line("interrupted", 1, 73.4))
+        self.assertEqual(parsed, {"reason": "interrupted", "played": 1,
+                                 "pos": 73.4, "url": "http://h/stream"})
+
+    def test_ending_line_carries_played_flag_and_url(self):
+        parsed = serial_telemetry.parse_ending_line(
+            ending_line("start_failed", 0, "live", url="http://h/s?src=x"))
+        self.assertEqual((parsed["played"], parsed["pos"]), (0, "live"))
+        self.assertEqual(parsed["url"], "http://h/s?src=x")
+
+    def test_feedback_line_fields(self):
+        parsed = serial_telemetry.parse_feedback_line(feedback_line(
+            "stopped", 12.5, sound="none", screen="stopped", wake_word="on",
+            interactive="already"))
+        self.assertEqual(parsed["sound"], "none")
+        self.assertEqual(parsed["screen"], "stopped")
+        self.assertEqual(parsed["interactive"], "already")
+        self.assertEqual(parsed["pos"], 12.5)
+        self.assertIsNone(parsed["skipped"])
+
+    def test_feedback_skip_line(self):
+        parsed = serial_telemetry.parse_feedback_line(
+            feedback_skip_line("replaced", 12))
+        self.assertEqual(parsed["reason"], "replaced")
+        self.assertEqual(parsed["skipped"], "new_session")
+        self.assertIsNone(parsed["sound"])
+
+    def test_unknown_reason_is_still_parsed_for_validation(self):
+        # 正则宽容（reason 取出什么就是什么），合法性交给断言组——否则固件打错
+        # 名字会被静默当成「没抓住」，变成不报错的假通过。
+        parsed = serial_telemetry.parse_ending_line(
+            "I (1) MusicPlayer: Music ended: reason=bogus played=1 pos=3.0s url=u")
+        self.assertEqual(parsed["reason"], "bogus")
+
+    def test_pipe_and_session_lines_are_not_ending_or_feedback(self):
+        self.assertIsNone(serial_telemetry.parse_ending_line(pipe_line(3)))
+        self.assertIsNone(serial_telemetry.parse_feedback_line(pipe_line(3)))
+        self.assertIsNone(serial_telemetry.parse_ending_line(feedback_line()))
+        self.assertIsNone(serial_telemetry.parse_feedback_line(ending_line()))
+
+
+class EvaluateEndings(unittest.TestCase):
+    """三种收场可区分 + 用户主动停止不报故障音（issue #7）。"""
+
+    def result(self, results, name):
+        hits = [r for r in results if r.name == name]
+        self.assertTrue(hits, f"没有 {name}：[{', '.join(r.name for r in results)}]")
+        return hits[0]
+
+    def assert_all_ok(self, results):
+        failed = [r for r in results if not r.ok]
+        self.assertEqual(failed, [],
+                         "；".join(f"{r.name}: {r.detail}" for r in failed))
+
+    def test_capture_without_endings_has_no_ending_assertions(self):
+        # issue #3/#4 那套核验（窗口里全是在播）不该凭空多出收场断言。
+        pairs = [(2, 2.0), (4, 4.1), (6, 6.0), (8, 8.2)]
+        results = serial_telemetry.evaluate_capture(samples_with_wall_clock(pairs))
+        names = [r.name for r in results]
+        self.assertNotIn("ending_reason_recorded", names)
+        self.assertNotIn("ending_has_feedback", names)
+        self.assert_all_ok(results)
+
+    def test_completed_feedback_is_distinguishable_from_failure(self):
+        # 自然播完与链路中断各一条完整锚点，都要求全绿。
+        done = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended")))
+        self.assert_all_ok(done)
+        broken = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("interrupted", 1, 40.0, url="http://h/s"),
+            feedback_line("interrupted", 40.0, "alert", "interrupted")))
+        self.assert_all_ok(broken)
+
+    def test_completed_and_interrupted_cues_differ(self):
+        # issue #7 的核心：两种收场必须给不同的音（遥测里读得出，不靠耳朵）。
+        self.assertNotEqual(serial_telemetry.ENDING_FEEDBACK["completed"],
+                            serial_telemetry.ENDING_FEEDBACK["interrupted"])
+        done = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended")))
+        broken = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("interrupted", 1, 40.0),
+            feedback_line("interrupted", 40.0, "alert", "interrupted")))
+        self.assertTrue(self.result(done, "ending_feedback_matches_reason").ok)
+        self.assertTrue(self.result(broken, "ending_feedback_matches_reason").ok)
+
+    def test_wrong_tone_for_reason_fails(self):
+        # 播完了却放故障音：逐条比对照表，不是只看「有反馈」。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "alert", "interrupted")))
+        self.assertFalse(self.result(results, "ending_feedback_matches_reason").ok)
+
+    def test_stale_screen_text_for_reason_fails(self):
+        # 音对了但屏幕没换成收场文案（还留着歌名）：一样算没区分开。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("interrupted", 1, 40.0),
+            feedback_line("interrupted", 40.0, "alert", "none")))
+        self.assertFalse(self.result(results, "ending_feedback_matches_reason").ok)
+
+    def test_user_stop_never_warns(self):
+        # 「停止」不得有故障音；屏幕报「已停止」。
+        ok = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("stopped", 1, 12.0),
+            feedback_line("stopped", 12.0, "none", "stopped")))
+        self.assert_all_ok(ok)
+        self.assertTrue(self.result(ok, "user_stop_never_warns").ok)
+
+        bad = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("stopped", 1, 12.0),
+            feedback_line("stopped", 12.0, "alert", "interrupted")))
+        self.assertFalse(self.result(bad, "user_stop_never_warns").ok)
+
+    def test_alert_for_interrupted_is_not_reported_as_warning_for_user_stop(self):
+        # 反向：链路中断本来就该响故障音——「用户停不报故障」不是无差别静音。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("interrupted", 1, 40.0),
+            feedback_line("interrupted", 40.0, "alert", "interrupted")))
+        self.assertTrue(self.result(results, "user_stop_never_warns").ok)
+
+    def test_replaced_session_is_silent_and_leaves_screen_alone(self):
+        # 换歌：旧会话收场归新会话——跳过型反馈，不出声、不改屏幕。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("replaced", 1, 12.0),
+            feedback_skip_line("replaced", 12.0)))
+        self.assert_all_ok(results)
+        self.assertTrue(self.result(results, "user_stop_never_warns").ok)
+
+    def test_alert_without_played_flag_fails(self):
+        # 从未出声（played=0）却报 interrupted：那是起流失败，不是链路中断。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("interrupted", 0, 0.5),
+            feedback_line("interrupted", 0.5, "alert", "interrupted")))
+        self.assertFalse(self.result(results, "ending_played_flag_consistent").ok)
+
+    def test_start_failed_is_silent(self):
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("start_failed", 0, 0.0),
+            feedback_line("start_failed", 0.0, "none", "none")))
+        self.assert_all_ok(results)
+
+    def test_start_failed_without_any_session_anchor_is_seen(self):
+        # 起流失败的真实形状：**没有**起流锚点（从未出声就不打「Music stream
+        # started」），也没有位点样本。收场锚点必须照样被断言看见——早先它在
+        # 「无会话」分支里被直接丢弃，成了不报错的假通过。
+        samples = [{"t": 1000.0, "line": ending_line("start_failed", 0, 0.0)},
+                   {"t": 1000.1, "line": feedback_line("start_failed", 0.0, "none",
+                                                        "none")}]
+        results = serial_telemetry.evaluate_capture(
+            samples, expect_ending=("start_failed",))
+        self.assertTrue(self.result(results, "ending_expected_seen").ok)
+        self.assertTrue(self.result(results, "ending_reason_recorded").ok)
+        self.assertTrue(self.result(results, "ending_has_feedback").ok)
+        self.assertTrue(self.result(results, "playback_returns_interactive").ok)
+
+    def test_unknown_reason_fails_recorded_assertion(self):
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            "I (300) MusicPlayer: Music ended: reason=bogus played=1 pos=3.0s url=u",
+            feedback_line("bogus", 3.0, "alert", "interrupted")))
+        self.assertFalse(self.result(results, "ending_reason_recorded").ok)
+
+    def test_missing_feedback_is_reported(self):
+        # 收了场却没反馈：用户那边一片寂静，分不出是放完了还是断了。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0), None,
+            tail=[(pipe_line(269), 10.0)]))
+        self.assertFalse(self.result(results, "ending_has_feedback").ok)
+
+    def test_ending_at_capture_cut_is_tolerated(self):
+        # 收场正好在窗口末尾（反馈还没打出来就被截了）：不当失败报。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0), None))
+        self.assertTrue(self.result(results, "ending_has_feedback").ok)
+
+    def test_playback_returns_interactive(self):
+        ok = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended",
+                          wake_word="on", interactive="scheduled")))
+        self.assertTrue(self.result(ok, "playback_returns_interactive").ok)
+        bad = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended",
+                          wake_word="off", interactive="none")))
+        self.assertFalse(self.result(bad, "playback_returns_interactive").ok)
+
+    def test_wake_word_only_restore_counts_as_interactive(self):
+        # 音频通道还没开（离线/未连上）：唤醒词恢复是能拿到的全部，如实计数。
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended",
+                          wake_word="on", interactive="wake_word_only")))
+        self.assertTrue(self.result(results, "playback_returns_interactive").ok)
+
+    def test_ending_inside_pause_span_fails(self):
+        # 按钮打断只是暂停：暂停跨度里不该出现收场/反馈锚点。
+        t0 = 1000.0
+        samples = [{"t": t0, "line": session_line(start=0)}]
+        samples.append({"t": t0 + 2.0, "line": pipe_line(2)})
+        samples.append(pause_marker("user", 2, t=t0 + 2.2))
+        samples.append({"t": t0 + 4.0, "line": pipe_line(2, flags="PAUSED_USER")})
+        samples.append({"t": t0 + 4.5, "line": ending_line("stopped", 1, 2.0)})
+        samples.append({"t": t0 + 4.6,
+                        "line": feedback_line("stopped", 2.0, "none", "stopped")})
+        samples.append({"t": t0 + 6.0, "line": pipe_line(2, flags="PAUSED_USER")})
+        samples.append(resume_marker("continue", 2, t=t0 + 6.2))
+        samples.append({"t": t0 + 8.0, "line": pipe_line(4)})
+        samples.append({"t": t0 + 10.0, "line": pipe_line(6)})
+        results = serial_telemetry.evaluate_capture(samples)
+        self.assertFalse(self.result(results, "pause_is_not_an_ending").ok)
+
+    def test_ending_outside_pause_span_passes(self):
+        # 停止（不是暂停）发生在暂停跨度之外：正常收场，不该报。
+        t0 = 1000.0
+        samples = [{"t": t0, "line": session_line(start=0)}]
+        samples.append({"t": t0 + 2.0, "line": pipe_line(2)})
+        samples.append(pause_marker("user", 2, t=t0 + 2.2))
+        samples.append({"t": t0 + 4.0, "line": pipe_line(2, flags="PAUSED_USER")})
+        samples.append(resume_marker("continue", 2, t=t0 + 4.2))
+        samples.append({"t": t0 + 6.0, "line": pipe_line(4)})
+        samples.append({"t": t0 + 8.0, "line": pipe_line(6)})
+        samples.append({"t": t0 + 8.1, "line": ending_line("stopped", 1, 7.0)})
+        samples.append({"t": t0 + 8.2,
+                        "line": feedback_line("stopped", 7.0, "none", "stopped")})
+        samples.append({"t": t0 + 12.0, "line": pipe_line(6)})
+        results = serial_telemetry.evaluate_capture(samples)
+        self.assertTrue(self.result(results, "pause_is_not_an_ending").ok)
+
+    def test_expect_ending_requires_the_requested_reason(self):
+        samples = ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended"))
+        seen = serial_telemetry.evaluate_capture(samples, expect_ending=("completed",))
+        self.assertTrue(self.result(seen, "ending_expected_seen").ok)
+        missing = serial_telemetry.evaluate_capture(samples,
+                                                    expect_ending=("interrupted",))
+        self.assertFalse(self.result(missing, "ending_expected_seen").ok)
+
+    def test_expect_ending_requires_all_requested_reasons(self):
+        # --expect-ending 可以点名多个原因：要求**每一个**都真出现（用来验收
+        # 「一次抓取覆盖了三种收场」这种场景），不是「命中其一即可」。
+        samples = ending_capture(
+            ending_line("stopped", 1, 12.0),
+            feedback_line("stopped", 12.0, "none", "stopped"))
+        partial = serial_telemetry.evaluate_capture(
+            samples, expect_ending=("completed", "stopped"))
+        seen = self.result(partial, "ending_expected_seen")
+        self.assertFalse(seen.ok)
+        self.assertIn("completed", seen.detail)
+        all_seen = serial_telemetry.evaluate_capture(
+            samples, expect_ending=("stopped",))
+        self.assertTrue(self.result(all_seen, "ending_expected_seen").ok)
+
+    def test_expect_ending_accepts_several_reasons(self):
+        # 两种收场全在窗口里：点名两条即成立（逐条都真出现了）。
+        samples = ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended"))
+        samples += ending_capture(
+            ending_line("stopped", 1, 12.0),
+            feedback_line("stopped", 12.0, "none", "stopped"), t0=1200.0)
+        results = serial_telemetry.evaluate_capture(
+            samples, expect_ending=("completed", "stopped"))
+        seen = self.result(results, "ending_expected_seen")
+        self.assertTrue(seen.ok)
+        self.assertIn("completed", seen.detail)
+        self.assertIn("stopped", seen.detail)
+
+    def test_two_endings_in_one_capture_each_get_checked(self):
+        # 一次抓取连播两首：两首各自有反馈，逐条比对照表——第二首音错了要报。
+        first = ending_capture(
+            ending_line("completed", 1, 269.0),
+            feedback_line("completed", 269.0, "success", "ended"))
+        second = ending_capture(
+            ending_line("completed", 1, 12.0),
+            feedback_line("completed", 12.0, "alert", "interrupted"),
+            t0=1200.0)
+        results = serial_telemetry.evaluate_capture(first + second)
+        self.assertFalse(self.result(results, "ending_feedback_matches_reason").ok)
+
+    def test_live_ending_records_live_position(self):
+        # 直播流被中断：位点是 live，反馈照样要报（位点不参与收场判定）。
+        samples = [{"t": 1000.0, "line": session_line(form="live", duration=0)}]
+        samples.append({"t": 1002.0, "line": pipe_line("live")})
+        samples.append({"t": 1004.0, "line": pipe_line("live")})
+        samples.append({"t": 1004.1,
+                        "line": ending_line("interrupted", 1, "live")})
+        samples.append({"t": 1004.2,
+                        "line": feedback_line("interrupted", "live", "alert",
+                                              "interrupted")})
+        samples.append({"t": 1008.0, "line": pipe_line("live")})
+        results = serial_telemetry.evaluate_capture(samples)
+        self.assert_all_ok(results)
 
 
 if __name__ == "__main__":

@@ -1268,9 +1268,7 @@ bool Application::StartMusicNow(const std::string& url) {
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
     if (!music_player_.Start(url, [this](const MusicPlayer::FinishedResult& result) {
-            Schedule([this, result]() {
-                HandleMusicFinished(result.success, result.resume_failed);
-            });
+            Schedule([this, result]() { HandleMusicFinished(result); });
         })) {
         ESP_LOGE(TAG, "Failed to start music: %s", url.c_str());
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
@@ -1452,42 +1450,110 @@ void Application::StopMusic() {
     }
 }
 
-void Application::HandleMusicFinished(bool success, bool resume_failed) {
-    ESP_LOGI(TAG, "Music playback %s%s", success ? "completed" : "aborted",
-             resume_failed ? " (resume failed)" : "");
-    // 回调在播放器把 worker_running_ 清零之后才发出（WorkerEntry 的顺序），
-    // 所以这里忙碌为假 = 这次回调属于**当前**会话，而不是换歌路上那条陈旧的
-    // 收尾回调（换歌时新 worker 已在跑，这里必须什么都不做）。
-    if (!IsMusicBusy()) {
-        // 会话已经结束：撤掉自动续播与暂停记账。
-        CancelPauseAutoResume();
-        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        // Music over: bring wake-word detection back (it was paused while
-        // streaming to keep the TCP receive path responsive).
-        audio_service_.EnableWakeWordDetection(true);
-        if (resume_failed) {
-            // 续播接不上：给一个可辨的提示音并回到可交互状态（不静默——
-            // 用户不该把「断线」听成「歌放完了」）。通道还开着才回聆听；
-            // 否则留在待机（那里唤醒词是开着的），别造出一个「在聆听但
-            // 没人听」的半死状态。
-            audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
-            Schedule([this]() {
-                if (GetDeviceState() == kDeviceStateIdle && protocol_ != nullptr &&
-                    protocol_->IsAudioChannelOpened()) {
-                    SetDeviceState(kDeviceStateListening);
-                }
-            });
-            return;
-        }
-        // Music over: resume listening (only when a conversation could be
-        // continued, i.e. the audio channel is still open).
-        Schedule([this]() {
-            if (GetDeviceState() == kDeviceStateIdle &&
-                protocol_ != nullptr && protocol_->IsAudioChannelOpened()) {
-                SetDeviceState(kDeviceStateListening);
-            }
-        });
+void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result) {
+    // 收场分类是本次会话自己产出的（回调与结果同线程一起交上来），不靠共享
+    // 状态反推——「用户按停」与「链路中断」从前都是同一种 Bool 组合，那次混作
+    // 一谈就是 issue #7 要修的东西。
+    const MusicEnding ending = result.ending;
+
+    // 换歌：旧会话的收场归**新**会话，这里什么都不做——不出声、不改屏幕、
+    // 不碰省电与唤醒词（新会话正拿着音箱与 TCP 路径）。陈旧的收尾回调
+    // （旧 worker 稍后才跑完）也会撞到这里：忙碌为真就不插手，与 IsMusicBusy()
+    // 同一判据、同一处理的跳过分支。
+    if (ending == MusicEnding::kReplaced || IsMusicBusy()) {
+        char pos_field[32];
+        WritePositionField(result.position_s, result.live, pos_field, sizeof(pos_field));
+        ESP_LOGI(TAG, "Music feedback: reason=%s pos=%s skipped=new_session",
+                 MusicEndingName(ending), pos_field);
+        return;
     }
+
+    // 会话已经结束：撤掉自动续播与暂停记账。
+    CancelPauseAutoResume();
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    // Music over: bring wake-word detection back (it was paused while
+    // streaming to keep the TCP receive path responsive).
+    audio_service_.EnableWakeWordDetection(true);
+
+    // ── 反馈（issue #7）────────────────────────────────────────
+    // 音效分支：自然播完 / 链路中断（含续播失败）各一个不同的音；用户主动
+    // 停止、换歌、起流失败都不出声。屏幕文案同理：用户主动停止要写在屏幕上
+    // 报出来，别让屏幕留着歌名（那正是读不出来的错）。
+    const char* sound = "none";
+    const char* screen_text = "none";
+    const char* message = nullptr;
+    // 提示音**不在这里播**：进 Listening 的路上可能 ResetDecoder（Realtime
+    // 聆听模式直接 StartListeningAudio → EnableVoiceProcessing(true)），会把
+    // 刚进队列的音一起清掉。所以实际出声放在下面 Schedule 的尾巴——那时代
+    // 解码器已经重设过，音一定留得住。（AutoStop 模式下转态会等
+    // IsPlaybackIdle()，提示音先播完才开聆听——正是想要的顺序。）
+    const std::string_view* sound_asset = nullptr;
+    switch (MusicEndingCue(ending)) {
+        case MusicCue::kSuccess:
+            // 自然播完：提示音 +「播放结束」。
+            sound_asset = &Lang::Sounds::OGG_SUCCESS;
+            sound = "success";
+            message = Lang::Strings::MUSIC_ENDED;
+            screen_text = "ended";
+            break;
+        case MusicCue::kWarning:
+            // 链路中断（含续播接不上）：提示音 +「播放中断」——用户不该把
+            // 「断了」听成「歌放完了」。
+            sound_asset = &Lang::Sounds::OGG_EXCLAMATION;
+            sound = "alert";
+            message = Lang::Strings::MUSIC_INTERRUPTED;
+            screen_text = "interrupted";
+            break;
+        case MusicCue::kNone:
+            // 用户主动停止：不出声（用户自己按的，报故障音是打扰），但屏幕上
+            // 要报「已停止」——那时没有新会话接手屏幕。
+            if (ending == MusicEnding::kStopped) {
+                message = Lang::Strings::MUSIC_STOPPED;
+                screen_text = "stopped";
+            }
+            // 换歌/起流失败：屏幕归新会话 / 起播那一刻已报过错，什么都不做。
+            break;
+    }
+
+    // 回到可交互（回归守卫）：唤醒词已在上面恢复；能说话时再回 Listening，
+    // 否则留在待机（那里唤醒词也是开着的）——“在聆听但没人听”的半死状态
+    // 不发。三个字段都如实报（唤醒词可能因没配/引擎起不来而真没恢复，
+    // 那时报 on 就是在撒谎，断言也白设）。
+    const DeviceState state = GetDeviceState();
+    const bool can_listen = state == kDeviceStateIdle && protocol_ != nullptr &&
+                            protocol_->IsAudioChannelOpened();
+    const bool wake_word = audio_service_.IsWakeWordRunning();
+    const char* interactive = can_listen                       ? "scheduled"
+                              : state == kDeviceStateListening    ? "already"
+                              : wake_word                        ? "wake_word_only"
+                                                                 : "none";
+
+    // 发声与写屏都放在这里，**不能**在上面直接做：
+    //   1) 进 Listening 时 idle 分支会 ClearChatMessages（主循环同一轮先处理
+    //      STATE_CHANGED 再处理 SCHEDULE），直接写会被抹掉；
+    //   2) 进 Listening 时可能 ResetDecoder 清掉 decode 队列（见上面 sound_asset
+    //      处注释）——先转态再出声，音才留得住。
+    Schedule([this, message, can_listen, sound_asset]() {
+        if (can_listen) {
+            SetDeviceState(kDeviceStateListening);
+        }
+        if (sound_asset != nullptr) {
+            audio_service_.PlaySound(*sound_asset);
+        }
+        if (message != nullptr) {
+            Board::GetInstance().GetDisplay()->SetChatMessage("system", message);
+        }
+    });
+
+    // 反馈锚点（issue #7 的串口断言）：原因 → 提示音/屏幕 + 是否回到可交互。
+    // 位点一位小数（与 pause/resume/ended 锚点同口径）；直播流报 live。
+    char pos_field[32];
+    WritePositionField(result.position_s, result.live, pos_field, sizeof(pos_field));
+    ESP_LOGI(TAG,
+             "Music feedback: reason=%s pos=%s sound=%s screen=%s wake_word=%s "
+             "interactive=%s",
+             MusicEndingName(ending), pos_field, sound, screen_text,
+             wake_word ? "on" : "off", interactive);
 }
 
 void Application::StopNotification() {

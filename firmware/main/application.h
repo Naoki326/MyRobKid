@@ -280,7 +280,10 @@ private:
     void StartListeningAudio();
     void ConfigureWakeWordForListening();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
-    void HandleMusicFinished(bool success, bool resume_failed);
+    // 音乐会话收场（issue #7）：按**收场分类**给用户可辨反馈（音效 + 屏幕），
+    // 并把设备交回可交互态。分类由播放器产出（music_ending.h）——用户主动停止
+    // 与换歌都不出声，自然播完与链路中断各给一个不同的音。
+    void HandleMusicFinished(const MusicPlayer::FinishedResult& result);
     void LaunchPendingMusic();
     void UpdatePauseAutoResume();
     static void MusicStartTaskEntry(void* arg);

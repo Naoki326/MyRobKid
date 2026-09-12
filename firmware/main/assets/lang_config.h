@@ -42,6 +42,9 @@ namespace Lang {
         constexpr const char* LOADING_PROTOCOL = "登录服务器...";
         constexpr const char* MAX_VOLUME = "最大音量";
         constexpr const char* MODEM_INIT_ERROR = "模组初始化失败";
+        constexpr const char* MUSIC_ENDED = "播放结束";
+        constexpr const char* MUSIC_INTERRUPTED = "播放中断";
+        constexpr const char* MUSIC_STOPPED = "已停止";
         constexpr const char* MUTED = "已静音";
         constexpr const char* NEW_VERSION = "新版本 ";
         constexpr const char* OTA_UPGRADE = "OTA 升级";

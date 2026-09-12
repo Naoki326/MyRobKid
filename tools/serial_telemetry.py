@@ -5,6 +5,7 @@
   server/.venv/bin/python tools/serial_telemetry.py [秒数，默认 120]
   server/.venv/bin/python tools/serial_telemetry.py 25 --assert [--start N] [--live]
       [--min-lines K] [--offset-tol S] [--expect-restart] [--expect-auto-resume]
+      [--expect-ending REASON[,REASON…]]
 
 插上 USB 后自动探测 /dev/cu.usbmodem*，全量日志存 /tmp/serial_full.log。
 
@@ -28,6 +29,16 @@
                                 「暂停」后随便聊一句，音乐不自动响）
   - 可选 --expect-restart       本次抓取要覆盖「原连接不可用」分支
   - 可选 --expect-auto-resume   本次抓取要覆盖「静默数秒自动续播」
+
+收场反馈（issue #7）——三种收场必须可区分，且用户主动停止不报故障音：
+  - ending_reason_recorded          `Music ended: reason=…` 是已知的六种之一
+  - ending_played_flag_consistent   played=0 的收场只能是 start_failed
+  - ending_feedback_matches_reason  每条收场都配上对的提示音与屏幕文案
+  - ending_cues_are_distinguishable 自然播完与链路中断的音必须不同、都不静音
+  - user_stop_never_warns           用户主动停止/换歌一律无声（硬不变量）
+  - pause_is_not_an_ending          暂停跨度里不该出现收场锚点（按钮打断只是暂停）
+  - playback_returns_interactive    收场后唤醒词恢复 / 回到 Listening
+  - 可选 --expect-ending REASON     本次抓取要覆盖指定收场（可逗号分隔/重复）
 
 一个抓取窗口里可能连播多首（每首一条起流锚点行），断言**按会话分段**跑：位点
 单调、起点下限、挂钟偏差都只在同一会话内比较，换歌不误报。起点取自锚点行
@@ -67,6 +78,51 @@ RESUME_RE = re.compile(
     r"(?:\s+from=(?P<from>\d+(?:\.\d+)?s|live))?(?:\s+margin=(?P<margin>\d+)s)?")
 # 自动续播：静默计时到阈值（issue #4 的会话性暂停由它驱动）。
 AUTO_RESUME_RE = re.compile(r"Music auto-resume:\s+quiet=(?P<quiet>\d+)s")
+# 收场锚点（issue #7）：播放器在 worker 退出前打，reason 是五个事实位推出来的结局，
+# played= 是「本次会话真出过声」的自我声明（用户客观上听见了才有「中断」可言）。
+ENDING_RE = re.compile(
+    r"Music ended:\s+reason=(?P<reason>\w+)\s+played=(?P<played>[01])\s+pos=" +
+    _NUM_POS + r"(?:\s+url=(?P<url>.*))?")
+# 反馈锚点（issue #7）：应用侧报告这次收场给了用户什么——sound= 提示音、
+# screen= 屏幕文案、wake_word=/interactive= 证明播放结束后设备回到了可交互态。
+# 两个正则分开写：换歌的跳过型反馈没声没屏（skipped=new_session），用同一个
+# 正则装两套字段会让「少了字段」和「字段为空」分不开。
+FEEDBACK_RE = re.compile(
+    r"Music feedback:\s+reason=(?P<reason>\w+)\s+pos=" + _NUM_POS +
+    r"\s+sound=(?P<sound>\w+)\s+screen=(?P<screen>\w+)"
+    r"\s+wake_word=(?P<wake_word>\w+)\s+interactive=(?P<interactive>\w+)")
+FEEDBACK_SKIP_RE = re.compile(
+    r"Music feedback:\s+reason=(?P<reason>\w+)\s+pos=" + _NUM_POS +
+    r"\s+skipped=(?P<skipped>\w+)")
+
+# 收场原因 → (提示音, 屏幕文案) 的**验收对照表**（issue #7 的契约）。固件那边同
+# 一张表分开实现（music_ending.cc 给提示音，application.cc 给文案）；这里独立写
+# 一份，是为了让「固件只改了注释、忘了改行为」也能被逮住。
+# 自然播完给 success、链路中断给 alert——两者必须不同（issue #7 的核心）；
+# 用户主动停止与换歌一律 none（绝不报故障音）。
+ENDING_FEEDBACK = {
+    "completed": ("success", "ended"),
+    "interrupted": ("alert", "interrupted"),
+    "resume_failed": ("alert", "interrupted"),
+    "stopped": ("none", "stopped"),
+    "replaced": ("none", "none"),
+    "start_failed": ("none", "none"),
+}
+# 没出过声（played=0）就没有「中断/续播失败」可言，一律 start_failed。
+# 表里没列的原因（stopped/replaced）两种都合法——用户可能在出声前就按停/换歌。
+ENDING_REQUIRES_PLAYED = {
+    "completed": True,
+    "interrupted": True,
+    "resume_failed": True,
+    "start_failed": False,
+}
+# 用户主动引起的收场：任何情况下不得伴故障音（issue #7 的硬不变量）。
+NO_WARNING_ENDINGS = ("stopped", "replaced")
+# 播放器锚点与反馈锚点之间的合理延迟：主循环一拍就能转过去；超过就说明反馈丢了。
+FEEDBACK_MAX_DELAY_S = 2.0
+# 「回到可交互」的合法计数：scheduled = 已安排回 Listening、already = 当时就已
+# 空闲、wake_word_only = 音频通道没开、只能恢复唤醒词（离线时能拿到的全部）。
+INTERACTIVE_MODES = ("scheduled", "already", "wake_word_only")
 
 DEFAULT_OFFSET_TOL = 0.6  # 位点-挂钟偏差容差（秒）：ring 预读 ≈ +0.8s 必越界
 # 续播接缝容差（spec 的 ±0.5s）：锚点行带一位小数，接缝「接在原处」判据是
@@ -165,6 +221,48 @@ def parse_auto_resume_line(text):
     return {"quiet_s": int(m.group("quiet"))}
 
 
+def parse_ending_line(text):
+    """解析收场锚点行（Music ended: reason=… played=… pos=… url=…）。
+
+    未命中返回 None。reason 原样返回（不在这里判合法性）——未知原因要能被
+    断言组报出来，在这里筛掉就变成「没抓住」的静默假通过。
+    """
+    m = ENDING_RE.search(text)
+    if not m:
+        return None
+    return {
+        "reason": m.group("reason"),
+        "played": int(m.group("played")),
+        "pos": _parse_pos(m.group("pos")),
+        "url": m.group("url") or "",
+    }
+
+
+def parse_feedback_line(text):
+    """解析反馈锚点行（Music feedback: reason=…）。未命中返回 None。
+
+    两种形态共用一条理由字段：正常反馈带 sound=/screen=/wake_word=/interactive=，
+    换歌的跳过型只有 skipped=（它不出声也不改屏幕）。跳过的几个字段为 None。
+    """
+    m = FEEDBACK_SKIP_RE.search(text)
+    if m:
+        return {"reason": m.group("reason"), "pos": _parse_pos(m.group("pos")),
+                "skipped": m.group("skipped"), "sound": None, "screen": None,
+                "wake_word": None, "interactive": None}
+    m = FEEDBACK_RE.search(text)
+    if not m:
+        return None
+    return {
+        "reason": m.group("reason"),
+        "pos": _parse_pos(m.group("pos")),
+        "skipped": None,
+        "sound": m.group("sound"),
+        "screen": m.group("screen"),
+        "wake_word": m.group("wake_word"),
+        "interactive": m.group("interactive"),
+    }
+
+
 def _parse_pos(raw):
     """位点原始字段 → 数值（'live' / None 原样返回）。
 
@@ -217,7 +315,7 @@ def effective_start(session, cli_start):
 
 def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
                      offset_tol=DEFAULT_OFFSET_TOL, expect_restart=False,
-                     expect_auto_resume=False):
+                     expect_auto_resume=False, expect_ending=()):
     """对抓到的采样做断言。samples = [{'t': 抓到时刻, 'line': 原始行}, …]。
 
     返回 [AssertionResult, …]；全部 .ok 为 True 才算验收通过。
@@ -238,15 +336,32 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
     def add(name, ok, detail):
         results.append(AssertionResult(name, bool(ok), detail))
 
-    sessions = []  # [{'t', 'session', 'events': [...], 'markers': [...]}, …]
+    sessions = []  # [{'t', 'session', 'events': […], 'markers': […], 'endings': […]}]
     orphan_events = []  # 锚点缺失时的兜底容器
     orphan_markers = []
+    orphan_endings = []  # 起流失败时**没有**锚点（从未出声就没打过）
+    feedbacks = []  # 反馈锚点不归会话：它是应用侧对「刚刚那次收场」的处置
     for s in samples:
         line = s["line"]
         session = parse_session_line(line)
         if session is not None:
             sessions.append({"t": s["t"], "session": session, "events": [],
-                             "markers": []})
+                             "markers": [], "endings": []})
+            continue
+        ending = parse_ending_line(line)
+        if ending is not None:
+            record = {"t": s["t"], "ending": ending}
+            if sessions:
+                sessions[-1]["endings"].append(record)
+            else:
+                # 收场锚点先于任何起流锚点：**起流失败就是这种形状**（从未出声
+                # 就不会打 Music stream started）。不能丢——丢了就成了「没抓到」
+                # 的静默假通过。
+                orphan_endings.append(record)
+            continue
+        feedback = parse_feedback_line(line)
+        if feedback is not None:
+            feedbacks.append({"t": s["t"], "feedback": feedback})
             continue
         pause = parse_pause_line(line)
         resume = parse_resume_line(line)
@@ -270,10 +385,29 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
     if orphan_events or orphan_markers:
         # 没抓到锚点的抓取（旧固件或起播早于开抓）：整段当一次会话，起点靠 CLI。
         sessions.insert(0, {"t": None, "session": None, "events": orphan_events,
-                            "markers": orphan_markers})
+                            "markers": orphan_markers, "endings": orphan_endings})
+    elif orphan_endings:
+        # 只有孤儿收场（起流失败）：照样要能被断言看见，但不造出一个空会话
+        # （那会让位点断言对着零个样本失败，把一条真结论误报成三条噪声）。
+        sessions.append({"t": None, "session": None, "events": [],
+                         "markers": [], "endings": orphan_endings})
 
     events = [e for s in sessions for e in s["events"]]
     markers = [m for s in sessions for m in s["markers"]]
+    endings = [e for s in sessions for e in s["endings"]]
+
+    # ── 收场断言（issue #7）：三种收场可区分、用户主动停止不报故障 ────
+    # 没有收场锚点的抓取（issue #3/#4 那套核验）这里什么都不加——不凭空多断言。
+    _add_ending_assertions(add, endings, feedbacks, expect_ending, events, markers,
+                           last_t=max((s["t"] for s in samples), default=None))
+
+    if not events and endings:
+        # 一次根本没出声的抓取（典型：起流失败）：位点类断言无从谈起，不适用。
+        # 如实报一条，而不是用五条必然失败把真正的结论（收场分类与不报警）淹掉。
+        add("position_checks_not_applicable", True,
+            "本段抓取无 pipe: 位点样本（未出声，如起流失败）——位点类断言不适用")
+        return results
+
     add("enough_position_lines", len(events) >= min_lines,
         f"{len(events)} 行 pipe: 遥测（要求 ≥ {min_lines}）")
 
@@ -429,6 +563,199 @@ def _net_playback_offsets(numeric_events, session_t=None, pause_intervals=None):
                      for start, end in intervals)
         played.append(max(0.0, t - origin - paused))
     return played
+
+
+def _add_ending_assertions(add, endings, feedbacks, expect_ending, events, markers,
+                           last_t=None):
+    """收场断言组（issue #7）：三种收场可区分、用户主动停止不报故障。
+
+    只在抓取里真的出现收场锚点（`Music ended:`）或调用方用 `--expect-ending`
+    点名要求时断言——没跑到收场的抓取（issue #3/#4 那套核验）不该凭空多断言。
+
+    判据一律以**锚点行自报的信息**为准，不靠耳朵：
+      - ended 锚点的 reason/played 固定了这次会话的真相；
+      - feedback 锚点的 sound/screen 是应用侧对真相的处置，逐条比对照表；
+      - 用户主动停止与换歌一律不得伴提示音（issue #7 的硬不变量）；
+      - 暂停不是收场：按钮打断只暂停，暂停跨度里不该出现收场锚点；
+      - 收场后设备必须回到可交互（唤醒词恢复 / 回到 Listening）。
+    """
+    expected = tuple(expect_ending or ())
+    if not endings and not expected:
+        return
+
+    records = [e["ending"] for e in endings]
+    if records:
+        reasons = list(dict.fromkeys(r["reason"] for r in records))
+        unknown = sorted({r for r in reasons if r not in ENDING_FEEDBACK})
+        add("ending_reason_recorded", not unknown,
+            ("收场原因：" + ", ".join(reasons)) if not unknown else
+            "未知收场原因：" + ", ".join(unknown)
+            + f"（实际收到：{', '.join(reasons)}）")
+
+        # 自我声明的一致性：没出过声就没有「中断」可言（那是起流失败）。
+        bad_flags = []
+        for r in records:
+            want = ENDING_REQUIRES_PLAYED.get(r["reason"])
+            if want is not None and bool(r["played"]) != want:
+                bad_flags.append(f"{r['reason']} 却报 played={r['played']}")
+        add("ending_played_flag_consistent", not bad_flags,
+            "played 标志与收场原因一致" if not bad_flags else "；".join(bad_flags))
+
+        # 逐条比对照表：提示音与屏幕文案都得对上，两个方向都查（反馈缺了、错了、
+        # 或者根本收场错）——这样「固件改了一边忘了另一边」藏不住。
+        mismatched = []
+        missing = []
+        tolerated = []
+        used = set()
+        for e in endings:
+            r = e["ending"]
+            want = ENDING_FEEDBACK.get(r["reason"])
+            if want is None:
+                continue  # 未知原因已由 ending_reason_recorded 报过
+            # 跳过已被前一条收场消费的反馈：一次抓取可能连播多首且原因相同
+            # （两首都是 completed），逐条配对才不会串位。
+            hits = [(i, f) for i, f in enumerate(feedbacks)
+                    if i not in used and f["feedback"]["reason"] == r["reason"]
+                    and 0 <= f["t"] - e["t"] <= FEEDBACK_MAX_DELAY_S]
+            if not hits:
+                if _ending_is_last_sample(r, endings, last_t):
+                    # 收场落在抓取窗口末尾：反馈还没打出来就被截了。
+                    tolerated.append(r["reason"])
+                else:
+                    missing.append(r["reason"])
+                continue
+            idx, hit = hits[0]
+            used.add(idx)
+            # 跳过型反馈（换歌）没有 sound=/screen= 字段：它本来就该无声无屏，
+            # 按 none 计——「没字段」与「字段写 none」在这里是同一件事。
+            got = (hit["feedback"]["sound"] or "none",
+                   hit["feedback"]["screen"] or "none")
+            if got != want:
+                mismatched.append(f"{r['reason']}：期望 sound={want[0]} "
+                                  f"screen={want[1]}，实收 sound={got[0]} "
+                                  f"screen={got[1]}")
+        # 两条分开报：「反馈有没有到」和「到的那条对不对」是两件事——混在
+        # 一条里，音错了的详情会被「未见反馈」的措辞遮蔽。
+        add("ending_has_feedback", not missing,
+            _ending_feedback_detail(records, [], missing, tolerated))
+        add("ending_feedback_matches_reason", not mismatched,
+            _ending_feedback_detail(records, mismatched, [], []))
+
+        # 自然播完与链路中断必须给**不同**的音（issue #7 的核心），且都不是静音
+        # ——上面那条比的是实际抓到的音；这条卡的是对照表本身，防止两边一起
+        # 被改成同一个音而断言仍绿。
+        done = ENDING_FEEDBACK["completed"][0]
+        broken = ENDING_FEEDBACK["interrupted"][0]
+        add("ending_cues_are_distinguishable",
+            done != broken and done != "none" and broken != "none",
+            f"自然播完 sound={done}，链路中断 sound={broken}（必须不同且都不是静音）")
+
+        # 用户主动停止 / 换歌：绝不报故障音——也不能报「放完了」的喜庆音。
+        noisy = [f"{f['feedback']['reason']}(sound={f['feedback']['sound']})"
+                 for f in feedbacks
+                 if f["feedback"]["reason"] in NO_WARNING_ENDINGS
+                 and f["feedback"]["sound"] not in (None, "none")]
+        silent = list(dict.fromkeys(r["reason"] for r in records
+                                    if r["reason"] in NO_WARNING_ENDINGS))
+        add("user_stop_never_warns", not noisy,
+            ("用户主动停止/换歌均无声（"
+             + (", ".join(silent) if silent else "本次未出现")
+             + "）") if not noisy else
+            "用户主动停止/换歌却报了提示音：" + ", ".join(noisy))
+
+        # 暂停不是收场：按钮打断只暂停（会话继续），暂停跨度里不该出现收场锚点。
+        inside = [f"{e['ending']['reason']}@{t0:.1f}s" for e in endings
+                  for t0, t1 in _pause_intervals(events, markers)
+                  if t0 <= e["t"] <= t1]
+        add("pause_is_not_an_ending", not inside,
+            "收场均发生在暂停跨度之外" if not inside else
+            "暂停跨度里出现收场锚点：" + ", ".join(inside)
+            + "（按钮打断只是暂停，不该结束会话）")
+
+        # 回到可交互：每次收场后设备必须重新可用（唤醒词恢复 / 回到 Listening）。
+        # 跳过型反馈（换歌）没有这组字段——那时新会话持有屏幕与音箱。
+        #
+        # 关于 wake_word=on 这条曾经写在这里的检查：它是**恒真**的，已在
+        # 2026-09-13 核实并删除。原因：interactive 的取值由 wake_word 推导而来
+        # （application.cc：wake_word ? "wake_word_only" : "none"），所以
+        # interactive==wake_word_only **蕴含** wake_word 为真，那句
+        # `wake_word != "on"` 永远不成立，零判别力。
+        #
+        # 为什么不换成硬要 wake_word=on：`EnableWakeWordDetection(true)` 在缺
+        # 唤醒词资源（未配唤醒词／引擎起不来）时会**如实**清掉
+        # AS_EVENT_WAKE_WORD_RUNNING（audio_service.cc:663），固件也刻意如实
+        # 上报（application.cc：「唤醒词可能因没配/引擎起不来而真没恢复，那时
+        # 报 on 就是在撒谎」）。硬要 on 会把「设备本来就没配唤醒词」误判成回归；
+        # interactive=already（已回 Listening）时唤醒词本就该关（聆听走 AFE
+        # 路径），off 也是正确状态。
+        #
+        # 真正有判别力的判据：`none` 是**非法收场态**——它意味着设备既没在聆听、
+        # 也没空闲到能回聆听、唤醒词又没起来，正是固件刻意避免的「半死状态」。
+        # 所以白名单就是主判据，而播放期唤醒词本应关闭（音乐模式停唤醒词，
+        # ADR-0008），若收场后仍报 off 且没回 Listening，就是恢复没做。
+        bad_interactive = []
+        for f in feedbacks:
+            fb = f["feedback"]
+            if fb["skipped"] is not None:
+                continue
+            if fb["interactive"] not in INTERACTIVE_MODES:
+                bad_interactive.append(f"{fb['reason']}：interactive={fb['interactive']}")
+            elif (fb["interactive"] == "wake_word_only"
+                  and fb["wake_word"] != "on"):
+                # 不可达（见上），但留着做解析自洽校验：日志格式改歪时先叫。
+                bad_interactive.append(
+                    f"{fb['reason']}：报 interactive=wake_word_only "
+                    f"却 wake_word={fb['wake_word']}（日志自相矛盾）")
+        restored = [f["feedback"] for f in feedbacks
+                    if f["feedback"]["skipped"] is None]
+        # 只在本该恢复的场景下断言：换歌的跳过型反馈本来就无事可做（新会话
+        # 持有屏幕与音箱），没有反馈锚点的情形已由上面那条报「未见反馈」。
+        if restored:
+            if bad_interactive:
+                detail = "收场后未回到可交互：" + "; ".join(bad_interactive)
+            else:
+                last = restored[-1]
+                detail = (f"{len(restored)} 次收场后回到可交互"
+                          f"（wake_word={last['wake_word']}, "
+                          f"interactive={last['interactive']}）")
+            add("playback_returns_interactive", not bad_interactive, detail)
+
+    # 可选：本次抓取要覆盖指定的收场原因（--expect-ending）。
+    if expected:
+        seen = {r["reason"] for r in records}
+        absent = [r for r in expected if r not in seen]
+        add("ending_expected_seen", not absent,
+            ("出现的收场原因：" + (", ".join(sorted(seen)) if seen else "（无）"))
+            + ("" if not absent else "；缺：" + ", ".join(absent)))
+
+
+def _ending_is_last_sample(ending, endings, last_t):
+    """这条收场是不是抓取窗口里的**最后一行**（反馈没来得及打就被截了）。
+
+    ending 是收场记录本身（`e["ending"]`）。只放行这一种情况：收场就是窗口
+    末尾——那时「反馈还没到」与「反馈丢了」在数据上不可分。只要后面还有任何
+    一行遥测，设备就有时间打反馈却没打，按失败算。
+    """
+    if endings and ending is not endings[-1]["ending"]:
+        return False
+    t = next(e["t"] for e in endings if e["ending"] is ending)
+    return last_t is None or t >= last_t
+
+
+def _ending_feedback_detail(records, mismatched, missing, tolerated):
+    """收场-反馈对照的明细：对了几条、哪条错了、哪条没等到。"""
+    shown = ", ".join(dict.fromkeys(r["reason"] for r in records))
+    if not mismatched and not missing:
+        parts = [f"{len(records)} 条收场（{shown}）均已反馈"]
+    else:
+        parts = [f"{len(records)} 条收场（{shown}）"]
+    if mismatched:
+        parts.append("音屏不符：" + "; ".join(mismatched))
+    if missing:
+        parts.append("未见反馈：" + ", ".join(dict.fromkeys(missing)))
+    if tolerated:
+        parts.append("窗口末尾未及反馈：" + ", ".join(dict.fromkeys(tolerated)))
+    return "；".join(parts)
 
 
 def _add_pause_assertions(add, events, markers, expect_restart, expect_auto_resume,
@@ -727,7 +1054,7 @@ def main(argv=None):
     # CLI 只在没抓到锚点时兜底。
     flags = {"assert": False, "start": None, "live": None, "min-lines": 3,
              "offset-tol": DEFAULT_OFFSET_TOL, "expect-restart": False,
-             "expect-auto-resume": False}
+             "expect-auto-resume": False, "expect-ending": []}
     positional = []
     i = 0
     while i < len(args):
@@ -743,6 +1070,12 @@ def main(argv=None):
         elif a == "--expect-auto-resume":
             # 本次抓取要求覆盖「会话性暂停 → 静默数秒自动续播」。
             flags["expect-auto-resume"] = True
+        elif a == "--expect-ending":
+            # 本次抓取要求覆盖指定的收场原因（issue #7）。可重复，也可逗号分隔：
+            #   --expect-ending completed --expect-ending interrupted
+            i += 1
+            flags["expect-ending"] += [part.strip() for part in args[i].split(",")
+                                       if part.strip()]
         elif a == "--start":
             i += 1
             flags["start"] = int(args[i])
@@ -778,7 +1111,8 @@ def main(argv=None):
         samples, start_s=flags["start"], live=flags["live"],
         min_lines=flags["min-lines"], offset_tol=flags["offset-tol"],
         expect_restart=flags["expect-restart"],
-        expect_auto_resume=flags["expect-auto-resume"])
+        expect_auto_resume=flags["expect-auto-resume"],
+        expect_ending=tuple(flags["expect-ending"]))
     ok = True
     for r in results:
         mark = "✅" if r.ok else "❌"

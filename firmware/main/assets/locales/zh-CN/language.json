@@ -54,6 +54,9 @@
         "HELLO_MY_FRIEND": "你好，我的朋友！",
         "CONNECTION_SUCCESSFUL": "连接成功",
         "FLIGHT_MODE_OFF": "飞行模式已关闭",
-        "FLIGHT_MODE_ON": "飞行模式已开启"
+        "FLIGHT_MODE_ON": "飞行模式已开启",
+        "MUSIC_ENDED": "播放结束",
+        "MUSIC_INTERRUPTED": "播放中断",
+        "MUSIC_STOPPED": "已停止"
     }
 }
