@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""网络吞吐基线契约（ADR-0011 / issue #23）。
+"""网络内存约束与吞吐来源契约（ADR-0011 / issue #23）。
 
-判据只有一条：入库的 WiFi/网络栈配置不得低于吞吐下限。
+判据两条：
 
-为什么必须有这条测试：**配置被改回低值后设备仍能正常启动**——运行时的任何
-行为断言都覆盖不到这种回退，只有数值契约能。本仓的这批配置是从上游（ESP-HI /
-ESP32-C3）复制来的省内存取向，历史上已经因此把吞吐压在 10–30KB/s 量级；没有
-契约，下次从上游同步默认配置时会静默退回。
+  1. **内存上限**：接收缓冲与 lwIP 窗口不得高于当前值——它们是真实分配的内部
+     RAM，往上调就是与 camera/LVGL/AFE 抢内存（曾把 free sram 打到 9919、
+     minimal 2095，出现 `Failed to create music start task`）。
+  2. **吞吐来源**：WiFi 驱动 IRAM 加速必须开启——它是段内挪移、不占运行时堆，
+     是唯一一项只赚不赔的改动。
+
+为什么必须有这条测试：**配置错了设备仍能正常启动**——运行时的行为断言覆盖不到
+（OOM 只在特定负载下暴露，且表现为别处的功能失败）。只有数值契约能拦住。
 
 三个真相源都要查（ADR-0002 的纪律：改一处不够）：
 
   1. `sdkconfig.defaults` + `sdkconfig.defaults.esp32s3` 合并后的有效默认值；
   2. 板卡构建预设（`main/boards/zhengchen/minicam/config.json` 的
-     `sdkconfig_append`）——它排在目标默认值之后，能把下限压回去；
+     `sdkconfig_append`）——它排在目标默认值之后，能覆盖它们；
   3. 入库的 `sdkconfig`——`idf.py build` 直接读它，不读 defaults。
 
-数值下限写在下面的 `NUMERIC_FLOOR` / `REQUIRED_ON` / `REQUIRED_OFF` 里，是
+数值上限写在下面的 `NUMERIC_CEILING` / `REQUIRED_ON` / `REQUIRED_OFF` 里，是
 契约本体，不是构建旋钮。
 
 运行：python3 -m unittest scripts.tests.test_network_throughput_defaults -v
@@ -36,18 +40,30 @@ SPEC.loader.exec_module(build)
 ROBOT_BOARD = "zhengchen/minicam"
 ROBOT_BUILD = "zhengchen-minicam"
 
-# 数值下限。取值理由见 ADR-0011：向 IDF 默认靠拢但不照抄，给内存留余量。
-NUMERIC_FLOOR = {
-    # IDF 默认分别是 10 / 32 / 6；这里取中，不照抄。
-    "CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM": 8,
-    "CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM": 16,
-    "CONFIG_ESP_WIFI_RX_BA_WIN": 6,
-    # IDF 默认 5760（= 4×MSS），未开窗口缩放时上限 65535。
-    "CONFIG_LWIP_TCP_WND_DEFAULT": 16384,
-    "CONFIG_LWIP_TCP_SND_BUF_DEFAULT": 16384,
+# 数值约束（2026-09-12 修正）。
+#
+# 初版这里写的是「不低于 IDF 默认」的**下限**，方向是错的：接收缓冲与 lwIP
+# 窗口是**真实分配的内部 RAM**，往上调就是在跟 camera/LVGL/AFE 抢内存。
+# 实测：提到 8/16/6 + 窗口 16384 后，设备 free sram 从 41067 掉到 9919、
+# minimal 掉到 2095，出现 `Failed to create music start task`（OOM）。
+#
+# 所以这里锁的是**上限**：这组值不得高于当前值。要提性能请走 PSRAM 承载
+# 网络缓冲（CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP），那是另一条路径。
+#
+# lwIP 窗口为何连「上调」都不需要：带宽时延积分析——局域网 RTT 3.5–30ms
+# 下，5760B 窗口的理论上限是 188–1607KB/s，而验收目标是 200KB/s。窗口从未
+# 限制过吞吐，为它花内存是纯浪费。
+NUMERIC_CEILING = {
+    "CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM": 3,
+    "CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM": 6,
+    "CONFIG_ESP_WIFI_RX_BA_WIN": 3,
+    "CONFIG_LWIP_TCP_WND_DEFAULT": 5760,
+    "CONFIG_LWIP_TCP_SND_BUF_DEFAULT": 5760,
 }
 
-# IDF 默认即 y，本项目曾显式关掉（省 10KB + 17KB IRAM，代价是吞吐下降）。
+# 吞吐的真实来源：WiFi 驱动 IRAM 加速。它是**段内挪移**（DRAM 共享段 → IRAM），
+# 不占运行时堆，且 IDF 文档明说关掉会降吞吐——唯一一项可以只赚不赔的改动。
+# IDF 默认即 y，本项目曾显式关掉。
 REQUIRED_ON = (
     "CONFIG_ESP_WIFI_IRAM_OPT",
     "CONFIG_ESP_WIFI_RX_IRAM_OPT",
@@ -99,28 +115,31 @@ def _board_append(board, build_name):
     raise AssertionError(f"{config_path}: build {build_name!r} not found")
 
 
-def _floor_violations(assignments):
-    """返回所有违反吞吐基线的项；空列表即合规。
+def _ceiling_violations(assignments):
+    """返回所有超出内存上限的项；空列表即合规。
 
     数值项要求**显式写出**（缺失即失败）：这批值必须出现在 defaults 里，
-    否则读的人看不见、diff 里也看不见，正是上次静默退回低值的方式。
+    否则读的人看不见、diff 里也看不见，正是上次静默退回高值的方式。
     布尔项相反——缺失等于 IDF 默认，而 IDF 对这里两个开关的默认恰好就是
     我们要的值（加速项 y、PSRAM 承载项 n），所以「删掉那行覆盖」是合法修法，
     只有显式写反才失败。
     """
     problems = []
-    for key, minimum in sorted(NUMERIC_FLOOR.items()):
+    for key, maximum in sorted(NUMERIC_CEILING.items()):
         raw = assignments.get(key)
         if raw is None:
-            problems.append(f"{key} 未在 defaults 中显式给出（需 >= {minimum}）")
+            problems.append(f"{key} 未在 defaults 中显式给出（需 <= {maximum}）")
             continue
         try:
             value = int(raw)
         except ValueError:
-            problems.append(f"{key}={raw} 不是数字（需 >= {minimum}）")
+            problems.append(f"{key}={raw} 不是数字（需 <= {maximum}）")
             continue
-        if value < minimum:
-            problems.append(f"{key}={value} < {minimum}")
+        if value > maximum:
+            problems.append(
+                f"{key}={value} > {maximum}——这是真实分配的内部 RAM，"
+                "上调会与 camera/LVGL/AFE 抢内存（曾导致 OOM）"
+            )
     for key in REQUIRED_ON:
         # 缺失 = IDF 默认 y = 符合意图；只有显式关掉才算回退。
         if assignments.get(key) == "n":
@@ -133,37 +152,37 @@ def _floor_violations(assignments):
 
 
 class NetworkThroughputDefaultsTests(unittest.TestCase):
-    """入库配置不得低于吞吐下限（ADR-0011 / issue #23）。"""
+    """入库配置不得突破内存上限、且保留吞吐来源（ADR-0011 / issue #23）。"""
 
-    def assert_meets_floor(self, assignments, where):
-        problems = _floor_violations(assignments)
+    def assert_within_ceiling(self, assignments, where):
+        problems = _ceiling_violations(assignments)
         self.assertEqual(
             [],
             problems,
-            f"{where} 低于网络吞吐基线（ADR-0011 / issue #23）：\n  "
+            f"{where} 突破网络内存上限（ADR-0011 / issue #23）：\n  "
             + "\n  ".join(problems),
         )
 
-    def test_target_defaults_meet_throughput_floor(self):
-        self.assert_meets_floor(
+    def test_target_defaults_stay_within_memory_ceiling(self):
+        self.assert_within_ceiling(
             _effective_defaults("esp32s3"),
             "sdkconfig.defaults + sdkconfig.defaults.esp32s3",
         )
 
-    def test_board_preset_does_not_lower_the_floor(self):
-        # 板卡预设排在目标默认值之后，能覆盖它们——这里正是它会被压回去的地方。
+    def test_board_preset_does_not_raise_the_ceiling(self):
+        # 板卡预设排在目标默认值之后，能覆盖它们——这里正是它会被调高的地方。
         merged = _effective_defaults("esp32s3")
         appended = build._sdkconfig_assignments(
             _board_append(ROBOT_BOARD, ROBOT_BUILD)
         )
-        self.assert_meets_floor(
+        self.assert_within_ceiling(
             {**merged, **appended},
             f"{ROBOT_BOARD} 构建预设 {ROBOT_BUILD} 的生效配置",
         )
 
-    def test_checked_in_sdkconfig_meets_throughput_floor(self):
+    def test_checked_in_sdkconfig_stays_within_memory_ceiling(self):
         # `idf.py build` 读的是这个文件，不是 defaults；只改 defaults 会静默失配。
-        self.assert_meets_floor(
+        self.assert_within_ceiling(
             _read_assignments(ROOT / "sdkconfig"),
             "入库的 firmware/sdkconfig",
         )

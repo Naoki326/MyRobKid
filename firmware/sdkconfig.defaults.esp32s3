@@ -10,19 +10,30 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 CONFIG_SPIRAM_MEMTEST=n
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
-# 网络吞吐取向（ADR-0011）。基础 defaults 里那套省内存数值是从 ESP-HI（ESP32-C3）
-# 复制的，在 ESP32-S3 上属于错配：把接收缓冲/聚合窗口压到最小、lwIP 窗口取 4×MSS
-# 下限，并用 Wi-Fi 驱动 IRAM 加速换 27KB IRAM。S3 的段占用实测还有 175KB 剩余堆，
-# 这笔交易不值得。取值向 IDF 默认靠拢但不照抄（10/32/6 → 8/16/6）以保留内存余量。
-# 期望效果：OTA 与内容下载从 10–30KB/s 回到自测均值 >=200KB/s。
-# 契约测试：scripts/tests/test_network_throughput_defaults.py（改这组值必须同时改它）。
+# **内存约束与窗口取舍（2026-09-12 实测推翻初版 ADR-0011 的两个判断）**
+#
+# 1) 接收缓冲是**真实分配**的内部 RAM，不是可自由调大的旋钮。初版提到 8/16/6
+#    后，设备运行时 free sram 从 41067 掉到 **9919**、minimal 掉到 **2095**，
+#    并出现 `Failed to create music start task`（OOM）。内部 SRAM 已被
+#    camera/LVGL/AFE 吃得紧，原值 3/6/3 是为省内存选的，不是错配。
+#
+# 2) lwIP TCP 窗口**不是瓶颈**，没必要为它花内存。带宽时延积（BDP）
+#    分析：局域网 RTT 3.5–30ms 下，5760B 窗口的理论上限是 188–1607KB/s，
+#    而验收目标是 200KB/s——**窗口从未限制过吞吐**。把它提到 16384 是每
+#    socket +10.4KB × 两个方向，纯浪费。
+#
+# 结论：**只保留 IRAM 加速**（它是段内挪移，不占运行时堆，且是吞吐主来源）。
+# 缓冲与窗口维持原值。真正的吞吐出路是让 WiFi/lwIP 缓冲走 PSRAM
+# （CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP），需单独验证延迟后再上，见 ADR-0011。
 CONFIG_ESP_WIFI_IRAM_OPT=y
 CONFIG_ESP_WIFI_RX_IRAM_OPT=y
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_RX_BA_WIN=6
-CONFIG_LWIP_TCP_WND_DEFAULT=16384
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_RX_BA_WIN=3
+# 显式写成 IDF 默认值（= 4×MSS），不是靠缺省——避免下次有人看到「没写」
+# 就以为可以随便调。BDP 分析表明局域网下窗口不是瓶颈，无需上调。
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 
