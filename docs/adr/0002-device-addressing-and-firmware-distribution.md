@@ -4,6 +4,36 @@
 
 **入库口径**：`.gitignore:13/19` 排除了 `server/data/` 与 `server/config.yaml`，地址的**值**只登记在部署机上，不入库；仓库（公开）只存规范、模板与固件内编译进去的地址。要核对现场地址就去宿主机读文件，别指望文档里有。
 
+**2026-09-12 修正**：上述口径写的是「地址的值不入库」，但**实际早已被自己违反**——`main/boards/zhengchen/minicam/config.json` 的 `sdkconfig_append` 里就写着 `CONFIG_OTA_URL` 的完整值，且它是本次寻址链路的真相源之一。本仓只服务自己的设备（其余 147 块板卡的配置是上游余留），地址值入库不构成额外风险。因此口径修订为：**地址的值以「能构建出正确产物」为准，允许入库；真正必须守的是产物不出现官方云地址**。守的方式从「代码审查纪律」换成 `firmware/scripts/tests/test_device_addressing.py` 的断言（6 条，纯逻辑）。
+
+## 2026-09-12：地址兜底与板卡身份归位（Kconfig 层）
+
+2.4.24 实施 issue #23（网络吞吐）时，为重新生成 `sdkconfig` 而删掉它并裸跑 `idf.py reconfigure`——产物里 `CONFIG_OTA_URL` **掉回了上游默认的官方云地址** `https://api.tenclass.net/xiaozhi/ota/`。当场还原，但暴露了一个结构性缺口：**官方地址一直是地址链路的最后一层兜底**。
+
+地址的求值链（低 → 高）是：**Kconfig 默认值** → `sdkconfig.defaults*`（无此项）→ **板卡预设 `sdkconfig_append`**（经 `build/xiaozhi-build.sdkconfig.defaults` 片段传入）。平时由板卡预设覆盖，看不出问题；一旦绕过 `scripts/build.py` 以干净环境重新配置（删 `sdkconfig` 与 build 目录后直接 `reconfigure`），就落到 Kconfig 默认值——而它指向官方云。这就是 2.4.5 事故的完整机制。
+
+决定：**把 Kconfig 的 `OTA_URL` 默认值改成自建服务端地址**，让最后一层兜底也指向自己。改在 `main/Kconfig.projbuild`，与板卡预设同值，两者一致性由测试守护。
+
+**四条路径的实测行为**（2026-09-12，修好 Kconfig 默认值之后）：
+
+| 配置方式 | `CONFIG_OTA_URL` | `CONFIG_BOARD_TYPE_*` |
+|---|---|---|
+| 干净环境裸 `reconfigure`（新 build 目录） | ✅ 自建 | ⚠️ 上游默认板卡 |
+| `scripts/build.py zhengchen/minicam --name zhengchen-minicam` | ✅ 自建 | ✅ 正确 |
+| 删 `sdkconfig` 但 build 目录尚在 | ✅ 自建（从片段） | ✅ 正确（从片段） |
+| 删 `sdkconfig` 且删片段 | **cmake 硬报错**（`SDKCONFIG_DEFAULTS ... does not exist`） | 同左 |
+
+最后一行是关键发现：**这台机器上删掉 `sdkconfig` 后裸跑 `reconfigure` 不会静默产出官方地址** —— CMakeCache 记住了 `SDKCONFIG_DEFAULTS` 指向 `build/xiaozhi-build.sdkconfig.defaults`，片段不在就直接失败。真正的风险窗口是**「新 build 目录」或「`fullclean` 之后」**，那里才无片段可依赖。
+
+**澄清两处此前的错误归因**（均为本次实测推翻，勿再引用）：
+
+1. 2.4.24 实施时那次「裸跑 `reconfigure` 把 OTA_URL 掉回官方」的记录不完整。当时 build 目录里的片段是被上一次 `build.py` 写入过的，而**删 `sdkconfig` 不删片段时 OTA_URL 实际会从片段保住**（上表第三行）。当时看到官方地址，是因为更早的操作已把片段也清掉了。结论不变（Kconfig 兜底是官方地址，必须改），但触发条件要写准：**是「无片段」，不是「无 sdkconfig」**。
+2. 本条最初草稿曾把「板卡身份掉成 `BREAD_COMPACT_WIFI`」解释为「来自 CMakeCache 的 `BOARD_NAME`，所以不会被重置」，**这是错的**。板卡身份与 OTA_URL 走的是**同一个来源**：`build.py` 写入片段里的 `CONFIG_BOARD_TYPE_*`。干净环境裸 `reconfigure` 时两者**一起**掉成上游默认（上表第一行）；build 目录尚在时两者**一起**被片段保住。
+
+诊断口诀：**两者总是一起掉，因为来自同一个片段**。「只有一个掉」的情形不存在；若只观察到其中一个，说明观察不完整（比如只看 `sdkconfig` 没看构建产物）。
+
+新增守护：`firmware/scripts/tests/test_device_addressing.py`——断入库产物、Kconfig 兜底、板卡预设三者都不得含官方云主机名；三处来源两两同值；入库 `sdkconfig` 的板卡身份正确。这组断言取代了此前只能靠「记得用 `build.py`」的纪律。
+
 ## Context（两次事故）
 
 - **2.4.5 事故**：固件源码 vendoring 后用主仓重编，而 2.4.4 的 `CONFIG_OTA_URL` 是当年编译时临时改动、从未存档——重编产物带着官方默认地址，设备开机即被官方云接管（童声/官方角色），且从此不再回来找我们的 OTA，只能 USB 救援。

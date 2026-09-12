@@ -2,7 +2,19 @@ menu "Xiaozhi Assistant"
 
 config OTA_URL
     string "Default OTA URL"
-    default "https://api.tenclass.net/xiaozhi/ota/"
+    # MyRobKid: 默认指向自建服务端，**不是**上游的官方云（tenclass）。
+    #
+    # 上游默认值是官方云地址，在这里改掉是必须的：Kconfig 默认值是整个地址
+    # 链路的最后一层兼底——删掉 sdkconfig 后裸跑 `idf.py reconfigure`（或任何
+    # 不经过 scripts/build.py 的重新配置）就会落到它。落在官方地址上的产物会
+    # 让设备开机即被官方云接管，且此后怎么刷都变官方音色（ADR-0002 的 2.4.5
+    # 事故）。
+    #
+    # 上层的板卡预设（main/boards/zhengchen/minicam/config.json 的
+    # sdkconfig_append）会再设一次同值；两处必须一致，一致性由
+    # scripts/tests/test_device_addressing.py 守护。改地址时三处同改：
+    # 本行 + 板卡预设 + 入库的 firmware/sdkconfig（ADR-0002 寻址纪律）。
+    default "http://chenMac-mini.local:8080/xiaozhi/ota/"
     help
         The application will access this URL to check for new firmwares and server address.
 
