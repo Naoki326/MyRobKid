@@ -334,8 +334,11 @@ private:
     void ShowMusicScreen(const char* action, const std::string& text, bool owns,
                          const MusicScreenFacts* facts = nullptr);
     /*
-     * 用当前播放会话快照写「正在播放」（仅主循环线程调用）。
-     * 会话已不在（快照为 kIdle）时清空并交还所有权。
+     * 用当前播放会话快照写消息区（仅主循环线程调用，issue #8/#11）。
+     * action 只是遥测标签（now-playing / paused / repaint）；文案与前缀由快照
+     * 现取：播放态给曲目·作者·总量，两种暂停各给自己的前缀 + 已播位点，
+     * 直播流不给任何时钟。会话已不在（快照为 kIdle）时清空并交还所有权
+     * （那时 action 固定报 skip——它实际上是清空，不是一次曲目写屏）。
      */
     void WriteMusicNowPlaying(const char* action);
     /*
@@ -354,7 +357,9 @@ private:
      */
     void RepaintOrClearMusicScreen(std::function<void()>&& clear_fn);
     // 同上，但可从任意任务调用（排到主循环的下轮，保证晚于 pending 的转态）。
-    void ScheduleMusicNowPlaying();
+    // action 只是遥测标签：now-playing（起播/续播）/ paused（两种暂停，快照
+    // 现取决定前缀与位点）/ repaint / end-state / skip。
+    void ScheduleMusicScreen(const char* action);
     /*
      * 消息区当前是不是归音乐所有（issue #8）。
      * 为什么需要它：不只 idle 分支会清消息区（音频通道关闭、通知结束、告警

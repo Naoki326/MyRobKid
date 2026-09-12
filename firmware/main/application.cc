@@ -1324,7 +1324,7 @@ bool Application::StartMusicNow(const std::string& url) {
     // 为什么不在这里直接 SetChatMessage：换歌走这条路（StartMusicNow 也由
     // 先前的对话结束路径过来），而 StartMusicNow 在**任意**任务上运行；写屏
     // 必须在主循环，与 idle 分支的重画同线程、有确定先后。
-    ScheduleMusicNowPlaying();
+    ScheduleMusicScreen("now-playing");
     // 推送通道（issue #9）：**首帧已解码**（Start 已返回 true）才推 started
     // ——旧会话若有，其收场归新会话（replaced 不推），这里报的就是新曲目。
     // SendMcpMessage 内部已 Schedule，从本任务调安全。
@@ -1364,6 +1364,16 @@ bool Application::PauseMusic(PauseKind kind) {
         auto_resume_armed_ = false;
         pause_quiet_ticks_ = 0;
     }
+    // 屏幕出口（issue #11）：暂停后消息区换成暂停标识 + 已播位点，两种暂停
+    // 文案可区分。与起播/续播同一机制——写屏经 Schedule 排到主循环
+    // （ScheduleMusicScreen）：暂停发生在任意任务上（按钮、MCP 工具、
+    // 唤醒词路径），而写屏必须与 idle 分支的重画/清屏同线程、有确定先后；
+    // 这里尤其要紧——唤醒触发的那次暂停正在「-> idle」这条路上，而那轮的
+    // 清屏（或重画）在主循环里，直接写会被它盖掉。**前缀不在这里选**：它由
+    // WriteMusicNowPlaying 现读快照选（此刻已是 paused_*），与上面这一行
+    // 同一个理由——入参不进屏幕，快照才是事实（用户暂停升级/降级被拒时，
+    // 入参与实际种类恰好不同）。
+    ScheduleMusicScreen("paused");
     return true;
 }
 
@@ -1411,7 +1421,7 @@ bool Application::ResumeMusicNow() {
     // 同样经 Schedule：对话途中的续播会在 tts stop 那一刻执行，而那一刻
     // idle 分支可能刚重画过消息区（“说完话再播”这条路的清屏在前、写曲目在
     // 后），次序不能靠运气。
-    ScheduleMusicNowPlaying();
+    ScheduleMusicScreen("now-playing");
     // 推送通道（issue #9）：这里才是「真的又出声了」（Resume() 已置位、解码器
     // 已复位）。deferred 的那条路在 tts stop 之后的真实续播点会再走到这里，
     // 由它推 resumed——延后的那一次不算出声，不推假话。
@@ -1541,19 +1551,38 @@ void Application::ShowMusicScreen(const char* action, const std::string& text,
         snprintf(total_field, sizeof(total_field), "%s",
                  FormatMusicClock(facts->duration_s).c_str());
     }
-    // 屏幕出口锚点（issue #8）：文本、曲目/作者/形态/总量与**写屏那一刻的设备
-    // 状态**同一条行里对齐。「曲目在状态转移之后设置」这件事因此不靠人看屏幕：
-    // now-playing 行的 device= 必须是 idle（音乐在空闲态下播）、且它晚于
-    // `State: … -> idle` 那一行；idle 分支的重画另打 repaint。
+    // 位点字段（issue #11）：与总量同一套「无就说 none」的口径，但走
+    // WritePositionField 而不是 FormatMusicClock——屏幕上是人看的 `1:12`，
+    // 锚点里是脚本核的 `72s`（与 `Music pause:` / `pipe:` 同一折算），两者
+    // 同一判据（暂停态 + 有限内容 + 位点已知），不会一个有一个没有。
+    // state= 是**写屏那一刻**呈现的态（playing / paused_conversation /
+    // paused_user）——「两种暂停文案可区分」在串口上的断言就靠它加 text=：
+    // 两条 state 不同的行不得有同一个 text。
+    const char* state_field = "none";
+    char pos_field[32] = "none";
+    if (facts != nullptr) {
+        // 呈现态 → 锚点串的映射收在 music_screen.cc（与 MusicEndingName 同一
+        // 先例：遥测契约收进纯逻辑头，改错/漏分支当场被测拉住）。
+        state_field = MusicScreenStateName(facts->state);
+        WritePositionField(facts->position_s, facts->live,
+                           MusicScreenShowsPosition(*facts), pos_field,
+                           sizeof(pos_field));
+    }
+    // 屏幕出口锚点（issue #8、#11）：文本、曲目/作者/形态/总量/位点/呈现态与
+    // **写屏那一刻的设备状态**同一条行里对齐。「曲目在状态转移之后设置」因此
+    // 不靠人看屏幕：now-playing 行的 device= 必须是 idle（音乐在空闲态下播）、
+    // 且它晚于 `State: … -> idle` 那一行；idle 分支的重画另打 repaint。
     ESP_LOGI(TAG,
              "Music screen: action=%s seq=%u owns=%s idle_gen=%u device=%s "
-             "title='%s' author='%s' form=%s duration=%ds total=%s text='%s'",
+             "title='%s' author='%s' form=%s duration=%ds total=%s state=%s "
+             "pos=%s text='%s'",
              action, seq, music_screen_owns_content_ ? "on" : "off",
              idle_repaint_gen_, DeviceStateMachine::GetStateName(GetDeviceState()),
              facts != nullptr ? facts->title.c_str() : "",
              facts != nullptr ? facts->author.c_str() : "",
              facts == nullptr ? "none" : (facts->live ? "live" : "finite"),
-             facts != nullptr ? facts->duration_s : 0, total_field, text.c_str());
+             facts != nullptr ? facts->duration_s : 0, total_field, state_field,
+             pos_field, text.c_str());
 }
 
 void Application::WriteMusicNowPlaying(const char* action) {
@@ -1572,8 +1601,29 @@ void Application::WriteMusicNowPlaying(const char* action) {
         facts.duration_s = status.duration_s;
         // 内容形态的单一判据是 seekable（live == !seekable），不去问 duration。
         facts.live = !status.seekable;
-        ShowMusicScreen(action,
-                        BuildMusicNowPlaying(facts, Lang::Strings::MUSIC_NOW_PLAYING),
+        // 呈现态与位点现取快照（issue #11）：暂停时 position_s 是**冻结**值
+        // （暂停后 worker 不再推帧，PositionSeconds 天然钉住），所以屏幕上的
+        // 位点与真实位点同源同值，不会随时间虚涨。四态 → 三态的映射在这里
+        // 做一次（kIdle 已在上面被挡掉）；两个暂停态各自挑自己的 Lang 前缀
+        // ——「两种暂停文案可区分」的实现在这一行。
+        facts.position_s = status.position_s;
+        const char* prefix = Lang::Strings::MUSIC_NOW_PLAYING;
+        switch (status.state) {
+            case MusicPlaybackStatus::State::kPausedConversation:
+                facts.state = MusicScreenState::kPausedConversation;
+                prefix = Lang::Strings::MUSIC_PAUSED_CONVERSATION;
+                break;
+            case MusicPlaybackStatus::State::kPausedUser:
+                facts.state = MusicScreenState::kPausedUser;
+                prefix = Lang::Strings::MUSIC_PAUSED_USER;
+                break;
+            case MusicPlaybackStatus::State::kPlaying:
+            case MusicPlaybackStatus::State::kIdle:
+            default:
+                facts.state = MusicScreenState::kPlaying;
+                break;
+        }
+        ShowMusicScreen(action, BuildMusicNowPlaying(facts, prefix),
                         /*owns=*/true, &facts);
     }
 }
@@ -1594,13 +1644,15 @@ void Application::RepaintOrClearMusicScreen(std::function<void()>&& clear_fn) {
     }
 }
 
-void Application::ScheduleMusicNowPlaying() {
-    // 起播/续播发生在应用层与 music_start 任务上，而写屏必须落在主循环、且
-    // 在 pending 的 STATE_CHANGED **之后**：音乐恰恰在「说话态 → 空闲态」这条
-    // 路径上起播，idle 分支就在那条路径上重画/清空消息区。经 Schedule 排到
-    // 下一轮，那一轮先处理 STATE_CHANGED 再处理 SCHEDULE（与 ADR-0014 决策 4
-    // 同一机制、同一理由）。
-    Schedule([this]() { WriteMusicNowPlaying("now-playing"); });
+void Application::ScheduleMusicScreen(const char* action) {
+    // 起播/续播/暂停发生在应用层、music_start 任务、按钮与唤醒词路径上，而
+    // 写屏必须落在主循环、且在 pending 的 STATE_CHANGED **之后**：音乐恰恰在
+    // 「说话态 → 空闲态」这条路径上起播（暂停也在唤醒那条路上），idle 分支
+    // 就在那条路径上重画/清空消息区。经 Schedule 排到下一轮，那一轮先处理
+    // STATE_CHANGED 再处理 SCHEDULE（与 ADR-0014 决策 4 同一机制、同一理由）。
+    // action 只是遥测标签（now-playing / paused / repaint / end-state / skip），
+    // 文案与状态一样现取快照——同一函数服务多种转移，不会各自抄一份。
+    Schedule([this, action]() { WriteMusicNowPlaying(action); });
 }
 
 void Application::PushMusicSessionEvent(const char* event, const char* state) {

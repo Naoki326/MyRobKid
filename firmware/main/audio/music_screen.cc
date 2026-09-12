@@ -40,8 +40,27 @@ std::string BuildMusicNowPlaying(const MusicScreenFacts& facts,
     };
     append(facts.title);
     append(facts.author);
-    if (MusicScreenShowsTotal(facts)) {
-        append(FormatMusicClock(facts.duration_s));
+    // 位点与总量互斥，且**按态定**：暂停只报「放到哪」（位点未知就什么都不
+    // 报，不退回总量——那是播放态的数字，混进来会让两态看着一样）；播放只报
+    // 「还有多久」。直播流两个 Shows* 各自把 live 挡掉，一次都不出。
+    if (facts.state == MusicScreenState::kPlaying) {
+        if (MusicScreenShowsTotal(facts)) {
+            append(FormatMusicClock(facts.duration_s));
+        }
+    } else if (MusicScreenShowsPosition(facts)) {
+        append(FormatMusicClock(facts.position_s));
     }
     return prefix + body;
+}
+
+const char* MusicScreenStateName(MusicScreenState state) {
+    switch (state) {
+        case MusicScreenState::kPausedConversation:
+            return "paused_conversation";
+        case MusicScreenState::kPausedUser:
+            return "paused_user";
+        case MusicScreenState::kPlaying:
+            break;
+    }
+    return "playing";
 }

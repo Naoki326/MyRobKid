@@ -45,6 +45,8 @@ namespace Lang {
         constexpr const char* MUSIC_ENDED = "播放结束";
         constexpr const char* MUSIC_INTERRUPTED = "播放中断";
         constexpr const char* MUSIC_NOW_PLAYING = "正在播放：";
+        constexpr const char* MUSIC_PAUSED_CONVERSATION = "已暂停（说完自动继续）：";
+        constexpr const char* MUSIC_PAUSED_USER = "已暂停（说“继续”恢复）：";
         constexpr const char* MUSIC_STOPPED = "已停止";
         constexpr const char* MUTED = "已静音";
         constexpr const char* NEW_VERSION = "新版本 ";

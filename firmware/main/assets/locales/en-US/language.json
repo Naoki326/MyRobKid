@@ -58,6 +58,8 @@
         "MUSIC_ENDED": "Playback finished",
         "MUSIC_INTERRUPTED": "Playback interrupted",
         "MUSIC_NOW_PLAYING": "Now playing: ",
+        "MUSIC_PAUSED_CONVERSATION": "Paused (resumes after you finish): ",
+        "MUSIC_PAUSED_USER": "Paused (say \"resume\" to continue): ",
         "MUSIC_STOPPED": "Stopped"
     }
 }

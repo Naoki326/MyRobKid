@@ -294,9 +294,11 @@ class MusicEndingHostTest(unittest.TestCase):
             if "void WritePositionField" in code:
                 continue          # 定义
             calls.append(hit)
-        # 四个锚点：播放器收场、应用层跳过分支、反馈行、会话推送。
-        self.assertEqual(len(calls), 4,
-                         "锚点格式化应恰好四处调用，实际：\n" + "\n".join(calls))
+        # 五个锚点：播放器收场、应用层跳过分支、反馈行、会话推送、屏幕出口
+        # （issue #11 新增的那处——屏幕位点与其余锚点同一个 `live`/未知口径，
+        # 否则「直播不报位点」就只在一半锚点上成立）。
+        self.assertEqual(len(calls), 5,
+                         "锚点格式化应恰好五处调用，实际：\n" + "\n".join(calls))
         for name in ("music_player.cc", "application.cc"):
             self.assertTrue(any(name in c for c in calls),
                             "应覆盖 %s 的锚点，实际：\n%s" % (name, "\n".join(calls)))

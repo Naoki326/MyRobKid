@@ -49,10 +49,20 @@
   - ended_screen_has_no_stale_track 收场后给出结束态，不残留旧曲目
   - 可选 --expect-screen         本次抓取要验证屏幕出口（没抓到锚点即失败）
 
-锚点行：`Music screen: action=<now-playing|repaint|end-state|skip> seq=N
+暂停态屏幕（issue #11）——位点与两种暂停可区分：
+  - pause_screen_distinguishes_kinds  会话性暂停与用户暂停的文本不同（用户据此
+                                    决定该等还是该说继续）；只抓到一种时报不适用
+  - paused_screen_shows_position      暂停写屏带数字位点与时钟，播放写屏不带
+                                    （位点与总量在屏幕上是互斥的两态）
+  - live_screen_has_no_position       直播写屏的 pos 一律 live，无数字位点
+  - paused_position_matches_truth     屏幕上的位点与暂停锚点（`Music pause: pos=`）
+                                    一致（±2s）——「位点与真实位点一致」的串口佐证
+
+锚点行：`Music screen: action=<now-playing|paused|repaint|end-state|skip> seq=N
   owns=<on|off> idle_gen=N device=<state> title='…' author='…' form=<live|finite>
-  duration=Ns total=<m:ss|none> text='…'`——设备真正写给消息区的那串字符与当时
-的事实同一条行里对齐；`State: … -> idle` 行（DeviceStateMachine）用来定先后。
+  duration=Ns total=<m:ss|none> state=<playing|paused_conversation|paused_user>
+  pos=<Ns|live|none> text='…'`——设备真正写给消息区的那串字符与当时的事实同一条
+行里对齐；`State: … -> idle` 行（DeviceStateMachine）用来定先后。
 
 一个抓取窗口里可能连播多首（每首一条起流锚点行），断言**按会话分段**跑：位点
 单调、起点下限、挂钟偏差都只在同一会话内比较，换歌不误报。起点取自锚点行
@@ -108,16 +118,20 @@ FEEDBACK_RE = re.compile(
 FEEDBACK_SKIP_RE = re.compile(
     r"Music feedback:\s+reason=(?P<reason>\w+)\s+pos=" + _NUM_POS +
     r"\s+skipped=(?P<skipped>\w+)")
-# 屏幕出口锚点（issue #8）：应用侧每次把消息区设成什么、当时设备在哪个状态、
-# 这块区域归不归音乐所有，都在这条行里对齐。「曲目在状态转移之后设置」因此在
-# 串口上可验，不靠人看屏幕。
-#   action=now-playing   起播/续播成功后写曲目与作者
+# 屏幕出口锚点（issue #8，issue #11 扩展 state=/pos=）：应用侧每次把消息区设成
+# 什么、当时设备在哪个状态、呈现的是哪种态（playing / paused_conversation /
+# paused_user）、这块区域归不归音乐所有，都在这条行里对齐。「曲目在状态转移
+# 之后设置」与「两种暂停文案可区分」因此都在串口上可验，不靠人看屏幕。
+#   action=now-playing   起播/续播成功后写曲目与作者（含暂停恢复）
+#   action=paused        暂停（issue #11）：两种暂停的文本必须可区分
 #   action=repaint      有东西要覆写/清空消息区，而音乐还握着它 → 重画曲目
 #                       （idle 分支、收尾清屏、通知接管、告警撤销四条路）
 #   action=end-state     收场反馈（播放结束/中断/已停止），不保留旧曲目
 #   action=skip          起播没成功（换歌失败/起播任务起不来）：清空并交还所有权
 #                       ——换歌本身不写 skip（旧会话的收场归新会话，见 ADR-0014
 #                       决策 5），新曲目由新会话的 now-playing 接着写上
+# state= 是**写屏那一刻呈现的态**（与 device= 那次状态不同一回事）、pos= 是锚点
+# 口径的位点（`72s` / `live` / `none`）。
 # text= 是**最后**一个字段：曲目里带单引号（`Don't Stop`）时，前面的非贪婪
 # 匹配仍能对得上。
 SCREEN_RE = re.compile(
@@ -125,6 +139,7 @@ SCREEN_RE = re.compile(
     r"owns=(?P<owns>\w+)\s+idle_gen=(?P<idle_gen>\d+)\s+device=(?P<device>\w+)\s+"
     r"title='(?P<title>.*?)'\s+author='(?P<author>.*?)'\s+form=(?P<form>\w+)\s+"
     r"duration=(?P<duration>\d+)s\s+total=(?P<total>[\w:]+)\s+"
+    r"state=(?P<state>\w+)\s+pos=(?P<pos>[\w.]+)\s+"
     r"text='(?P<text>.*)'\s*$")
 # 设备状态转移行（DeviceStateMachine，TAG=StateMachine）：屏幕文本必须晚于它那
 # 一次转移——idle 分支就在那条路径上重画/清空消息区。
@@ -168,6 +183,10 @@ DEFAULT_OFFSET_TOL = 0.6  # 位点-挂钟偏差容差（秒）：ring 预读 ≈
 # （回退 ≤ margin + 0.5s），且不许前进超过 0.5s。
 RESUME_SEAM_TOL = 0.5
 RESTART_MARGIN_FALLBACK = 2.0  # 锚点没带 margin= 时的兜底安全余量（固件常量）
+# 屏幕位点与暂停锚点位的容差（秒，issue #11 的验收缝「误差在数秒内」）。
+# 两者同源（设备自己的记账），理论上应完全相等；留 2s 是因为屏幕写屏与暂停
+# 锚点是两次独立采样，中间可能夹着一次真实的推帧（暂停置位与锚点行打印之间）。
+PAUSE_SCREEN_POS_TOL = 2.0
 
 def parse_pipe_line(text):
     """解析 pipe: 行。命中返回 dict，否则 None。
@@ -323,6 +342,13 @@ def parse_screen_line(text):
         "form": m.group("form"),
         "duration_s": int(m.group("duration")),
         "total": m.group("total"),
+        # 呈现态（issue #11）：playing / paused_conversation / paused_user。
+        # 与 pos= 配合才是「两种暂停可区分」的判据——单看 state 只能证明设备
+        # 知道自己在哪一态，state + text 才能证明屏幕上真写了不同的字。
+        "state": m.group("state"),
+        # 位点（issue #11）：锚点口径（`72s` / `live` / `none`）。屏幕上是人读的
+        # `1:12`，这里是脚本核的数字；两者同一判据，不会一个有一个没有。
+        "pos": _parse_pos(m.group("pos")),
         "text": m.group("text"),
     }
 
@@ -336,12 +362,14 @@ def parse_state_line(text):
 
 
 def _parse_pos(raw):
-    """位点原始字段 → 数值（'live' / None 原样返回）。
+    """位点原始字段 → 数值（'live' / 'none' / None 原样返回）。
 
     单一解析口：`pipe:` 行（整秒）与三条锚点行（一位小数）都经它。单位后缀
     只在这里 strip 一次，别各处再 spread 出一份 rstrip("s")。
+    'none' 是屏幕锚点的「无位点」（issue #11）：它与 'live' 是两回事——前者
+    说的是「这一屏不必显示位点」（播放态/未知），后者说的是「这个内容没有位点」。
     """
-    if raw is None or raw == "live":
+    if raw is None or raw in ("live", "none"):
         return raw
     return float(raw.rstrip("s"))
 
@@ -455,8 +483,8 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
         resume = parse_resume_line(line)
         auto_resume = parse_auto_resume_line(line)
         if pause is not None or resume is not None or auto_resume is not None:
-            marker = {"t": s["t"], "line": line, "pause": pause, "resume": resume,
-                      "auto_resume": auto_resume}
+            marker = {"t": s["t"], "i": idx, "line": line, "pause": pause,
+                      "resume": resume, "auto_resume": auto_resume}
             if sessions:
                 sessions[-1]["markers"].append(marker)
             else:
@@ -496,7 +524,7 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
     # 点名要求（没抓到就是失败——「这次要验屏幕」不能静默放行）。
     if screens or expect_screen:
         _add_screen_assertions(add, screens, states, sessions, endings, feedbacks,
-                               events)
+                               events, markers)
 
     if not events and endings:
         # 一次根本没出声的抓取（典型：起流失败）：位点类断言无从谈起，不适用。
@@ -663,21 +691,27 @@ def _net_playback_offsets(numeric_events, session_t=None, pause_intervals=None):
 
 
 def _add_screen_assertions(add, screens, states, sessions, endings, feedbacks,
-                           events):
-    """屏幕出口断言组（issue #8）：屏幕被设成了什么，不靠人眼。
+                           events, markers):
+    """屏幕出口断言组（issue #8、#11）：屏幕被设成了什么，不靠人眼。
 
     判据一律以**锚点行自报的信息**为准：`Music screen: action=… text='…'` 是
-    设备真正写给消息区的那串字符，title=/author=/form=/total= 是当时的事实。
-    本组证明五件事：
+    设备真正写给消息区的那串字符，title=/author=/form=/total=/state=/pos= 是
+    当时的事实。本组证明八件事：
       - 播放中的文本含曲目与作者；
       - 换歌后屏幕上立刻是新曲目（不是顶着上一首）；
       - 曲目文本晚于它那一次 `State: … -> idle`（写屏在状态转移之后，idle
         分支的清屏在前——这是 issue #8 唯一必须在真机上验证的时序）；
       - 直播流的 form/total 都是 live/none，且文本里没有 m:ss；
-      - 收场之后屏幕上再没有旧曲目名，且参与反馈的原因都有一次 end-state 写屏。
+      - 收场之后屏幕上再没有旧曲目名，且参与反馈的原因都有一次 end-state 写屏；
+      - **两种暂停的文本不同**（issue #11 的核心：用户据此决定该等还是该说继续）；
+      - **暂停写屏带位点、播放写屏带总量**（位点与总量互斥，两态各自只出用户
+        当时关心的那个数字）；
+      - **屏幕上的位点等于当时真实的位点**（误差在数秒内）——这是 issue #11
+        最难用肉眼验的一条（人读不出 1:12 还是 1:16），所以必须在串口上核。
 
     会话（sessions）用来把「换歌」认出来：每首一条起流锚点，写屏只认「向后最近
-    的那条锚点」——那正是它写的曲目。
+    的那条锚点」——那正是它写的曲目。markers 用来把「暂停」认出来（`Music
+    pause: kind=…`），跨设备侧的冻结论述与屏幕的呈现对齐。
     """
     now = [s for s in screens if s["screen"]["action"] in ("now-playing", "repaint")]
     ends = [s for s in screens if s["screen"]["action"] == "end-state"]
@@ -813,6 +847,132 @@ def _add_screen_assertions(add, screens, states, sessions, endings, feedbacks,
             if not missing and not leftover else
             "; ".join(([f"未见结束态写屏：{', '.join(missing)}"] if missing else [])
                       + ([f"屏幕仍留旧曲目：{'; '.join(leftover)}"] if leftover else [])))
+
+    _add_paused_screen_assertions(add, screens, now, sessions, markers)
+
+
+def _add_paused_screen_assertions(add, screens, now, sessions, markers):
+    """暂停态屏幕断言（issue #11）：位点、位点正确性、两种暂停可区分。
+
+    四条断言各抓一类真错（工单要求「断言必须能抓住两种暂停文案被写成一样与
+    直播流显示了位点这两个真实错误」）：
+      - `pause_screen_distinguishes_kinds`  两种暂停写屏的 text 不同。一条把两种
+        写成同一句的实现（典型：忘了按 state 挑前缀）在这里必失败——只断言
+        「文本含曲目」的测试看不见。
+      - `paused_screen_shows_position`      暂停写屏有数字 pos 且文本含时钟；
+        播放写屏不得带 pos（位点与总量互斥）。抓住「暂停了却不显示位点」与
+        「播放中反而显示位点」两个方向。
+      - `live_screen_has_no_position`       直播写屏的 pos 一律为 live（或无），
+        且文本无时钟——抓住「直播流显示了位点」这个真错。本组独立于 #8 的
+        `live_screen_has_no_total`：那条只管总量，这条管位点（工单：两样都不显示）。
+      - `paused_position_matches_truth`     屏幕上的 pos= 与暂停锚点（`Music
+        pause: pos=`）同源：两者都是设备自己报的，同一份记账，故必须一致
+        （容差数秒，spec 的验收缝）。它抓的是「屏幕显示了一个设备自己都不认的
+        位点」——例如把总量错当位点、或拿陈旧快照去写。
+
+    为什么暂停断言只在真的出现暂停写屏时跑：没按暂停的抓取（只验播放中屏幕）
+    不该凭空多出四条必然失败的断言——与 #8 的取舍一致。
+    """
+    # 3) 直播流不显示位点（issue #11）：**暂停态也照样不能有**。与 #8 的
+    #    live_screen_has_no_total 分开——两样都不显示的判据要各自可断言。
+    #    扫的是**全部**写屏（now + paused + repaint），不只是 now：漏掉暂停
+    #    等于把 issue 里「直播没位点」这半张验收表空着。
+    #    ⚠ 位置在前面的「没有暂停写屏就返回」**之前**：那一条是为「四条暂停
+    #    断言不该凭空失败」而设的，而直播这条在没按暂停的抓取里同样成立。
+    live_writes = [s for s in screens if s["screen"]["form"] == "live"]
+    if live_writes:
+        bad = [s for s in live_writes
+               if s["screen"]["pos"] not in (None, "none", "live")]
+        add("live_screen_has_no_position", not bad,
+            f"{len(live_writes)} 条直播写屏 pos=live，无数字位点"
+            if not bad else
+            "直播流上出现了数字位点：" + "; ".join(
+                f"action={s['screen']['action']} state={s['screen']['state']} "
+                f"pos={s['screen']['pos']} text='{s['screen']['text']}'"
+                for s in bad))
+
+    paused_writes = [s for s in screens if s["screen"]["state"].startswith("paused_")]
+    if not paused_writes:
+        return
+
+    # 1) 两种暂停的文本必须不同（同一首曲目、同一位置时尤其如此——那是最容易
+    #    被写成一样的形状）。按 state 分组比对：只要有至少两组，它们的 text
+    #    就不能撞。只出现一种暂停时报「不适用」，不用一条必然失败算回归。
+    by_state = {}
+    for s in paused_writes:
+        by_state.setdefault(s["screen"]["state"], []).append(s["screen"]["text"])
+    if len(by_state) >= 2:
+        # 取每一态最后一次写屏的正文（去掉前缀后的部分）来比：前缀不同才算
+        # 可区分，正文本就该一样（曲目/作者/位点）。直接比整串会把「前缀不同、
+        # 正文也碰巧不同」的偶然当判据。这里比整串——两个 Lang 前缀本就不同，
+        # 整串不同是它们必然的结果；相同才是错。
+        texts = {state: texts[-1] for state, texts in by_state.items()}
+        distinct = len(set(texts.values())) == len(texts)
+        add("pause_screen_distinguishes_kinds", distinct,
+            "两种暂停的屏幕文本不同：" + "；".join(
+                f"{state}={text!r}" for state, text in texts.items())
+            if distinct else
+            "两种暂停被写成了同一个文本（用户分不出该等还是该说继续）："
+            + "；".join(f"{state}={text!r}" for state, text in texts.items()))
+    else:
+        add("pause_screen_distinguishes_kinds", True,
+            f"本次抓取只有一种暂停（{next(iter(by_state))}）——两种文案的区分"
+            "断言不适用（会话性暂停与用户暂停各来一次才能比对）")
+
+    # 2) 暂停写屏带位点、播放写屏不带。方向上正反都查：暂停缺位点、播放多了位点
+    #    都是错（位点与总量在屏幕上是互斥的两态）。
+    #    直播流的暂停写屏例外：它本来就**不该**有位点（pos=live，见上面第 3 条），
+    #    拿「暂停就必须有位点」去卡它会让正确的屏幕被误报成违规。
+    paused_without_pos = [s for s in paused_writes
+                          if s["screen"]["form"] != "live"
+                          and (s["screen"]["pos"] in (None, "none", "live")
+                               or not _CLOCK_RE.search(s["screen"]["text"]))]
+    playing_with_pos = [s for s in now
+                        if s["screen"]["state"] == "playing"
+                        and s["screen"]["pos"] not in (None, "none", "live")]
+    add("paused_screen_shows_position",
+        not paused_without_pos and not playing_with_pos,
+        f"{len(paused_writes)} 次暂停写屏各带位点，播放写屏不带"
+        if not paused_without_pos and not playing_with_pos else
+        "; ".join(
+            ([f"暂停写屏未显示位点：" + "; ".join(
+                f"state={s['screen']['state']} pos={s['screen']['pos']} "
+                f"text='{s['screen']['text']}'" for s in paused_without_pos)]
+             if paused_without_pos else [])
+            + ([f"播放写屏带了位点：" + "; ".join(
+                f"pos={s['screen']['pos']} text='{s['screen']['text']}'"
+                for s in playing_with_pos)] if playing_with_pos else [])))
+
+    # 4) 屏幕上的位点等于当时真实的位点（误差数秒）：暂停锚点的 pos= 与它那条
+    #    写屏的 pos= 同源（设备自己的记账），故取「写屏之前最近的一条暂停锚点」
+    #    比对。抓的是：屏幕拿总量冒充位点、拿陈旧快照写、或两处折算分叉。
+    pause_anchors = [m for m in markers if m.get("pause") is not None]
+    mismatched = []
+    compared = 0
+    for s in paused_writes:
+        pos = s["screen"]["pos"]
+        if pos in (None, "none", "live"):
+            continue
+        before = [m for m in pause_anchors if m["i"] is not None and m["i"] <= s["i"]]
+        if not before:
+            continue
+        anchor_pos = before[-1]["pause"]["pos"]
+        if anchor_pos in (None, "none", "live"):
+            continue
+        compared += 1
+        if abs(float(pos) - float(anchor_pos)) > PAUSE_SCREEN_POS_TOL:
+            mismatched.append(
+                f"屏幕 pos={pos} 与暂停锚点 pos={anchor_pos}（state="
+                f"{s['screen']['state']}）差超过 {PAUSE_SCREEN_POS_TOL}s")
+    if compared:
+        add("paused_position_matches_truth", not mismatched,
+            f"{compared} 条暂停写屏的位点与暂停锚点一致（±{PAUSE_SCREEN_POS_TOL}s）"
+            if not mismatched else "; ".join(mismatched))
+    else:
+        # 有暂停写屏但没有可比的暂停锚点（例如抓取只覆盖了屏幕那一侧）：不适用。
+        add("paused_position_matches_truth", True,
+            f"有 {len(paused_writes)} 次暂停写屏，但无相邻的暂停锚点可比——"
+            "位点真值核对不适用")
 
 
 def _add_ending_assertions(add, endings, feedbacks, expect_ending, events, markers,

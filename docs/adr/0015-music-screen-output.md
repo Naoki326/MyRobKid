@@ -71,6 +71,77 @@ Music screen: action=<now-playing|repaint|end-state|skip> seq=N owns=<on|off>
 - **`--expect-screen`**：默认「抓到屏幕锚点才断言」（旧固件与只验位点的抓取不受影响），点名后没抓到就是失败。
 - `PROJECT_VER` 2.4.27 → 2.4.28；新增 `MUSIC_NOW_PLAYING`（en-US / zh-CN）。
 
+## 后续修订（issue #11）：暂停态——位点与两种暂停
+
+#8 留下的扩展位（`MusicScreenFacts` 的 `state` / `position_s`）在这里填上，调用点与所有权机制未动——扩展点确实没波及调用点。
+
+**1. 新增 `MusicScreenState` 三态（播放 / 会话性暂停 / 用户暂停），无 kIdle。**
+四态快照里 kIdle 是「没有会话可写」——那是清屏（`skip`），不是这里的事。让空闲**无法被传进来**，拼装里就不必再防一次。两个暂停态的文案差别**只有前缀**（Lang 提供，正文相同：曲目 · 作者 · 位点），所以一个枚举撑起两件事：`BuildMusicNowPlaying` 决定「显示不显示位点」，调用方按它挑前缀——两边不会各判一次。
+
+**2. 位点与总量在屏幕上是互斥的两态。**
+播放态显示总量（用户关心「还有多久」），暂停态显示已播位点（时间停住了，「放到哪」是唯一能回答「卡住还是暂停」的数字）。互斥是**按态定**的：暂停且位点未知时**什么都不显示**，不退回总量——退回会让暂停态与播放态看着一样，那种“差不多”的呈现正是要消掉的。判定落在 `MusicScreenShowsPosition`（暂停 + 有限内容 + 位点已知）与既有的 `MusicScreenShowsTotal`。
+
+**3. 两种暂停文案必须不同，前缀只从快照挑。**
+`已暂停（说完自动继续）：` / `已暂停（说“继续”恢复）：`（en：`Paused (resumes after you finish): ` / `Paused (say "resume" to continue): `）。选这一组而不是「说话中暂停」之类的短句，是因为它直接说出**用户该做什么**——会话性暂停该等、用户暂停该说「继续」，这正是工单的立论。
+
+前缀**现取快照**（`WriteMusicNowPlaying` 里的 `switch (status.state)`），不从 `PauseMusic(kind)` 的入参挑。两条真实路径会把入参判错（`Pause()` 返回 true 但种类不一定是入参那个）：
+
+| 路径 | 入参 | 播放器实际持有 | 从快照取 | 从入参取（错） |
+|---|---|---|---|---|
+| 会话性暂停期间用户改口说「暂停」（升级） | user | user | 「说继续恢复」✓ | 「说完自动继续」✗——用户等下去，音乐永不回来 |
+| 用户暂停期间再来一次唤醒（降级被拒） | conversation | user | 「说继续恢复」✓ | 「说完自动继续」✗——屏幕在说谎 |
+
+同一取舍已在 `PauseMusic`/`UpdatePauseAutoResume` 的自动续播判定上用过（ADR-0013 决策 4）。写屏也走 `ScheduleMusicScreen("paused")`——暂停发生在任意任务（按钮、MCP 工具、唤醒词）上，而写屏必须落在主循环、晚于唤醒触发的那次 `-> idle` 清屏（与决策 1 同一理由）。
+
+**4. 遥测扩展而不新增类：`Music screen:` 锚点加 `state=` 与 `pos=`。**
+```text
+Music screen: action=<now-playing|paused|repaint|end-state|skip> seq=N owns=<on|off>
+  idle_gen=N device=<state> title='…' author='…' form=<live|finite> duration=Ns
+  total=<m:ss|none> state=<playing|paused_conversation|paused_user>
+  pos=<Ns|live|none> text='…'
+```
+
+为什么扩现有锚点而不是新开一条：`state=` 与 `text=` 必须**同行**才构成「两种暂停可区分」的判据（两条不同的 `state` 行不得有同一个 `text`），拆到两条行就又要靠时间戳对时。`pos=` 走 `WritePositionField`（与 `pipe:`/`pause`/`resume`/收场四处同一口径）；`total=` 留 `FormatMusicClock`（人读的 `1:12`）——屏幕上给人看的与锚点里给脚本核的故意不同，但两处的判定同源（两个 Shows* 谓词）。
+
+`tools/serial_telemetry.py` 新增四条断言，各抓一类真错：
+
+| 断言 | 抓住什么错 |
+|---|---|
+| `pause_screen_distinguishes_kinds` | 两种暂停被写成同一句（忘了按 state 挑前缀）——只断言「文本含曲目」的测试看不见 |
+| `paused_screen_shows_position` | 暂停不显示位点（正向）与播放反而显示位点（反向） |
+| `live_screen_has_no_position` | 直播流显示了数字位点——工单点名要抓的真错（与 #8 的 `live_screen_has_no_total` 分开，两样都要各自可断言） |
+| `paused_position_matches_truth` | 屏幕位点与暂停锚点（设备自己的记账）不一致（±2s）——抓住「拿总量冒充位点」或「拿陈旧快照写屏」 |
+
+它们各有一条测试把真错写出来验证判别力（`tools/tests/test_screen_telemetry.py` 的 `PausedScreenAssertions`）：写成同一句、缺位点、播放带位点、直播带位点、屏幕位点与锚点分叉。
+
+**5. 「前缀只从快照挑」用源码级结构不变量锁住。**
+普通行为测试看不见它——错只在「某种暂停下又发生一次事件」时出现（抓取里最不常覆盖的组合）。所以判据放在源码层：三个 Lang 前缀的赋值必须在同一个 `switch (status.state)` 内（`firmware/scripts/tests/test_music_screen.py` 的 `MusicScreenPausedStructureTest`）。已验证判别力：把前缀改成从 `kind` 入参取 → 立即失败。
+
+**6. `FormatMusicClock` 的 0 与负数是两回事。**
+负数（含 `-1`，调用方拿来表示未知）给空串；`0` 是合法位点（刚开始就暂停）——显示 `0:00`。位点与总量共用这一个格式函数，口径不会分叉。
+
+### 取证链（issue #11）
+
+| 断言 | 观察点 | 判据 |
+|---|---|---|
+| 暂停时显示暂停标识与已播位点 | `action=paused` 且 `state=paused_*` 的行 | `pos=` 是数字、`text=` 含 `m:ss` |
+| 两种暂停文案可区分 | 两条 `state=` 不同的写屏 | 两个 `text=` 不相等 |
+| 恢复播放后回到播放中显示 | 续播后的写屏行 | `state=playing` 且 `pos=none`、`total=` 是时钟 |
+| 直播流不显示位点与总量 | `form=live` 的写屏行 | `pos=live` 或 `none`、`total=none`、`text=` 无时钟 |
+| 显示的位点与真实位点一致 | `pos=` 与最近一条 `Music pause: pos=` | 差 ≤ 2s（同源同值） |
+
+### 待人工验收（需插 USB + 真机）
+
+```
+python3 tools/serial_telemetry.py 60 --assert --expect-screen
+```
+
+1. **放一首 → 说话唤醒** → 屏幕变「已暂停（说完自动继续）：曲目 · 作者 · 1:12」，不再报总量；答完不说话，数秒后自动续 → 屏幕回到「正在播放：…」
+2. **说「暂停」** → 屏幕变「已暂停（说“继续”恢复）：…」；随便聊一句 → 音乐不自动响、屏幕不变
+3. **说「继续」** → 屏幕回到播放中
+4. **电台（直播）** → 暂停与播放两态都**不**出现任何时钟；加 `--live` 跑一次
+5. 两条暂停文案**肉眼读数不同**（这正是“可区分”的最终判据）
+
 ## 取证链
 
 | 断言 | 观察点 | 判据 |
