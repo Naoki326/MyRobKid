@@ -31,9 +31,10 @@ std::string UrlDecode(const std::string& value) {
     return out;
 }
 
-// 时长是纯十进制秒数；带任何非数字字符即视为缺失（0）。
+// 纯十进制秒数解析：带任何非数字字符即视为缺失（0）。duration 与 ss 共用
+// ——两者都是「这个字段是个秒数」，多一位小数/负号都按缺失处理。
 // 上限 8640000（100 天）防溢出，正常内容远达不到。
-int ParseDurationSeconds(const std::string& s) {
+int ParseSecondsFromDigits(const std::string& s) {
     if (s.empty()) {
         return 0;
     }
@@ -50,13 +51,13 @@ int ParseDurationSeconds(const std::string& s) {
     return value;
 }
 
-}  // namespace
-
-MusicContentMeta ParseMusicContentMeta(const std::string& url) {
-    MusicContentMeta meta;
+// 逐对走访查询串，对每对参数调用 fn(key, value)；value 已 percent 解码。
+// src 的值整体经 percent 编码，其中的 '&' 已是 %26，按 '&' 切分安全。
+template <typename Fn>
+void WalkQueryParams(const std::string& url, Fn&& fn) {
     size_t query_start = url.find('?');
     if (query_start == std::string::npos) {
-        return meta;
+        return;
     }
     size_t query_end = url.find('#', query_start);
     size_t query_len = (query_end == std::string::npos)
@@ -75,22 +76,31 @@ MusicContentMeta ParseMusicContentMeta(const std::string& url) {
         if (pair.empty()) {
             continue;
         }
-        // src 的值整体经 percent 编码，其中的 '&' 已是 %26，按 '&' 切分安全。
         size_t eq = pair.find('=');
         std::string key =
             pair.substr(0, eq == std::string::npos ? std::string::npos : eq);
         std::string value =
             (eq == std::string::npos) ? "" : UrlDecode(pair.substr(eq + 1));
+        fn(key, value);
+    }
+}
+
+}  // namespace
+
+MusicContentMeta ParseMusicContentMeta(const std::string& url) {
+    MusicContentMeta meta;
+    WalkQueryParams(url, [&meta](const std::string& key,
+                                 const std::string& value) {
         if (key == "title") {
-            meta.title = std::move(value);
+            meta.title = value;
         } else if (key == "author") {
-            meta.author = std::move(value);
+            meta.author = value;
         } else if (key == "duration") {
-            meta.duration_s = ParseDurationSeconds(value);
+            meta.duration_s = ParseSecondsFromDigits(value);
         } else if (key == "form") {
             meta.live = (value == "live");
         }
-    }
+    });
     return meta;
 }
 
@@ -103,4 +113,15 @@ std::string AppendMusicStart(const std::string& url, int start_seconds) {
     out += "ss=";
     out += std::to_string(start_seconds);
     return out;
+}
+
+int ParseMusicStartSeconds(const std::string& url) {
+    int start = 0;
+    WalkQueryParams(url, [&start](const std::string& key,
+                                  const std::string& value) {
+        if (key == "ss") {
+            start = ParseSecondsFromDigits(value);
+        }
+    });
+    return start;
 }

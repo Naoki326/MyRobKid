@@ -657,41 +657,9 @@ public:
         return nullptr;
     }
 
-    virtual std::string GetDeviceStatusJson() override {
-        auto root = cJSON_CreateObject();
-
-        auto audio_speaker = cJSON_CreateObject();
-        if (auto codec = GetAudioCodec()) {
-            cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
-        }
-        cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
-
-        auto screen = cJSON_CreateObject();
-        if (auto backlight = GetBacklight()) {
-            cJSON_AddNumberToObject(screen, "brightness", backlight->brightness());
-        }
-        if (auto display = GetDisplay(); display && display->height() > 64) {
-            if (auto theme = display->GetTheme()) {
-                cJSON_AddStringToObject(screen, "theme", theme->name().c_str());
-            }
-        }
-        cJSON_AddItemToObject(root, "screen", screen);
-
-        auto network = cJSON_CreateObject();
-        auto& wifi = WifiManager::GetInstance();
-        cJSON_AddStringToObject(network, "type", "wifi");
-        cJSON_AddStringToObject(network, "ssid", wifi.GetSsid().c_str());
-        int rssi = wifi.GetRssi();
-        const char* signal = rssi >= -60 ? "strong" : (rssi >= -70 ? "medium" : "weak");
-        cJSON_AddStringToObject(network, "signal", signal);
-        cJSON_AddItemToObject(root, "network", network);
-
-        auto str = cJSON_PrintUnformatted(root);
-        std::string result(str);
-        cJSON_free(str);
-        cJSON_Delete(root);
-        return result;
-    }
+    // GetDeviceStatusJson 不再覆写（issue #3）：板卡那份是 WifiBoard 的
+    // 重复实现，且漏了电量与芯片温度——只改基类这里会静默无输出。统一
+    // 走 WifiBoard::GetDeviceStatusJson，音乐子状态（music）也随之生效。
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
         level = battery_percent_;

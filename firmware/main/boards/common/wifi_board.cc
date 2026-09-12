@@ -400,6 +400,29 @@ std::string WifiBoard::GetDeviceStatusJson() {
         cJSON_AddItemToObject(root, "chip", chip);
     }
 
+    // Music session (issue #3): player state + absolute playback position.
+    // 音乐字段只写这一处——各板卡的状态上报统一走基类实现后自然带上。
+    auto music_status = Application::GetInstance().GetMusicStatus();
+    auto music = cJSON_CreateObject();
+    cJSON_AddStringToObject(music, "state", music_status.state_name());
+    if (music_status.state != MusicPlaybackStatus::State::kIdle) {
+        // 直播流不可定位：不报位点/时长，只标 seekable=false。
+        cJSON_AddBoolToObject(music, "seekable", music_status.seekable);
+        if (music_status.seekable) {
+            cJSON_AddNumberToObject(music, "position_s", music_status.position_s);
+            if (music_status.duration_s > 0) {
+                cJSON_AddNumberToObject(music, "duration_s", music_status.duration_s);
+            }
+        }
+        if (!music_status.title.empty()) {
+            cJSON_AddStringToObject(music, "title", music_status.title.c_str());
+        }
+        if (!music_status.author.empty()) {
+            cJSON_AddStringToObject(music, "author", music_status.author.c_str());
+        }
+    }
+    cJSON_AddItemToObject(root, "music", music);
+
     auto str = cJSON_PrintUnformatted(root);
     std::string result(str);
     cJSON_free(str);

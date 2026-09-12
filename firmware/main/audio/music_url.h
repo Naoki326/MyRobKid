@@ -28,4 +28,9 @@ MusicContentMeta ParseMusicContentMeta(const std::string& url);
 // 直播流请传 0（定位无意义，由调用方先判断 MusicContentMeta::live）。
 std::string AppendMusicStart(const std::string& url, int start_seconds);
 
+// 从播放地址读回起点（AppendMusicStart 写入的 ss=，播放会话状态）。
+// 供 MusicPlayer 折算绝对位点：位点 = 起点 + 已推入播放队列的 PCM 量。
+// 非数字 / 负值 / 缺失一律返回 0（与 duration 同一宽容口径）。
+int ParseMusicStartSeconds(const std::string& url);
+
 #endif  // MUSIC_URL_H

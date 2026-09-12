@@ -60,6 +60,17 @@ const char* TAG = "MusicPlayer";
 bool IsSupportedUrl(const std::string& url) {
     return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
 }
+
+// 位点折算的单一定义（ADR-0010）：起始偏移 + 已推入播放队列的 PCM 折算秒数。
+// 状态上报与 pipe: 遥测都经此，同一口径不写两遍——两处分叉会让「串口断言
+// 通过」与「模型答出的位点」各说各话。
+int PositionSeconds(int start_offset_s, uint64_t pushed_samples, int sample_rate) {
+    if (sample_rate <= 0) {
+        sample_rate = 1;
+    }
+    return start_offset_s +
+           static_cast<int>(pushed_samples / static_cast<uint64_t>(sample_rate));
+}
 }  // namespace
 
 MusicPlayer::MusicPlayer(AudioService& audio_service) : audio_service_(audio_service) {}
@@ -94,6 +105,11 @@ bool MusicPlayer::Start(std::string url, FinishedCallback finished_callback) {
         url_ = std::move(url);
         finished_callback_ = std::move(finished_callback);
         cancelled_ = false;
+        // 新会话：内容属性与起点从播放地址读回（起点由 play_music 工具以
+        // ss= 追加），位点记账清零。
+        meta_ = ParseMusicContentMeta(url_);
+        start_s_ = ParseMusicStartSeconds(url_);
+        pushed_samples_.store(0);
     }
 
     // Set before creating the task: a worker that fails immediately must
@@ -145,6 +161,29 @@ void MusicPlayer::Stop() {
 
 bool MusicPlayer::IsBusy() const { return worker_running_.load(); }
 
+MusicPlaybackStatus MusicPlayer::GetPlaybackStatus() const {
+    MusicPlaybackStatus status;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!worker_running_.load()) {
+        // 空闲：不携带上一首的陈旧位点。会话性/用户暂停两态由暂停票置入，
+        // 置入时同样只报冻结时的位点、不随时间推进。
+        status.state = MusicPlaybackStatus::State::kIdle;
+        return status;
+    }
+    status.state = MusicPlaybackStatus::State::kPlaying;
+    status.title = meta_.title;
+    status.author = meta_.author;
+    status.duration_s = meta_.duration_s;
+    status.seekable = !meta_.live;
+    if (status.seekable) {
+        // 直播流不记位点：恢复是重连，不是定位。
+        int rate = audio_service_.GetOutputSampleRate();
+        status.position_s = PositionSeconds(
+            start_s_, pushed_samples_.load(std::memory_order_relaxed), rate);
+    }
+    return status;
+}
+
 void MusicPlayer::WorkerEntry(void* arg) {
     auto* player = static_cast<MusicPlayer*>(arg);
     player->WorkerTask();
@@ -157,11 +196,18 @@ void MusicPlayer::WorkerTask() {
     bool success = false;
     std::string url;
     FinishedCallback finished_callback;
+    MusicContentMeta meta;
+    int start_s = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         url = url_;
         finished_callback = finished_callback_;
+        meta = meta_;
+        start_s = start_s_;
     }
+    // 位点折算基准：推入播放队列的 PCM 已是输出采样率（含重定向后的单声道）。
+    const uint64_t output_rate =
+        static_cast<uint64_t>(std::max(1, audio_service_.GetOutputSampleRate()));
 
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
     esp_audio_simple_dec_handle_t dec = nullptr;
@@ -234,12 +280,22 @@ void MusicPlayer::WorkerTask() {
         size_t stat_pushed = 0;
         size_t stat_push_fail = 0;
         TickType_t stat_last = xTaskGetTickCount();
+        // EOF 收尾观测（issue #3）：流结束后剩余的解不动尾巴（标签/垃圾帧）
+        // 不能让会话永远挂在「在播」——唤醒词不恢复、位点停在旧值。
+        int eof_stall_passes = 0;
         while (!cancelled_.load() && !decode_error) {
+            size_t iter_consumed = 0;
+            size_t iter_decoded = 0;
+            // 停滞判据用会话内单调的推帧总数，不用 stat_pushed——后者每 2 秒
+            // 被遥测块清零，会把「本轮推过帧」误读成「本轮没推」。
+            const uint64_t pushed_before = pushed_samples_.load(std::memory_order_relaxed);
             // 1. Keep the ring above the high watermark — and keep the
             // compressed backlog filled even when the ring is full.
             // The compressed-buffer cap gates only *reading*: decoding must
             // keep consuming in_buf regardless, otherwise the loop stalls
-            // with a full in_buf and an empty ring.
+            // with a full in_buf and an empty ring. After EOF, keep decoding
+            // whatever is still buffered — skipping decode at EOF would let
+            // a backlog larger than the ring never drain.
             //
             // Pre-fill (2026-09-12, music stutter): the ring alone absorbs
             // only ~0.8 s of an upstream stall. The 64KB compressed backlog
@@ -249,11 +305,11 @@ void MusicPlayer::WorkerTask() {
             // SRAM. Gate: read while the ring has room OR the compressed
             // backlog is not yet full; the inner decode loop still honours
             // the ring watermark, so PCM never overflows.
-            while (!http_eof &&
-                   (ring.size() < kRingHighWatermark ||
-                    in_buf.size() < kMaxCompressedBuffer)) {
+            while ((ring.size() < kRingHighWatermark ||
+                    in_buf.size() < kMaxCompressedBuffer) &&
+                   (in_buf.size() > 0 || !http_eof)) {
                 size_t old_size = in_buf.size();
-                if (old_size < kMaxCompressedBuffer) {
+                if (!http_eof && old_size < kMaxCompressedBuffer) {
                     in_buf.resize(old_size + kHttpReadChunk);
                     int size = http->Read(reinterpret_cast<char*>(in_buf.data() + old_size),
                                           kHttpReadChunk);
@@ -288,6 +344,7 @@ void MusicPlayer::WorkerTask() {
                         break;
                     }
                     if (out.decoded_size > 0) {
+                        iter_decoded += out.decoded_size;
                         esp_audio_simple_dec_info_t info = {};
                         if (esp_audio_simple_dec_get_info(dec, &info) == ESP_AUDIO_ERR_OK) {
                             if (rate_cvt == nullptr) {
@@ -359,10 +416,13 @@ void MusicPlayer::WorkerTask() {
                         break;  // need more input data
                     }
                 }
+                iter_consumed += consumed_total;
                 // No reading happened and decoding consumed nothing: make
-                // this iteration always exit to avoid a livelock.
-                if (old_size >= kMaxCompressedBuffer && consumed_total == 0 &&
-                    !in_buf.empty()) {
+                // this iteration always exit to avoid a livelock. At EOF
+                // this is the undecodable tail — leave it to the stall
+                // counter in the finish checks below.
+                if ((old_size >= kMaxCompressedBuffer || http_eof) &&
+                    consumed_total == 0 && !in_buf.empty()) {
                     break;
                 }
                 if (decode_error) {
@@ -376,16 +436,28 @@ void MusicPlayer::WorkerTask() {
             if (!ring.empty() &&
                 (streaming_started || ring.size() >= kRingStartThreshold || http_eof)) {
                 std::vector<int16_t> frame(ring.front().begin(), ring.front().end());
+                // 位点记账先取帧样本数：TryPush 会 move 走 frame，之后 size()==0。
+                const size_t frame_samples = frame.size();
                 if (audio_service_.TryPushPcmToPlaybackQueue(frame)) {
                     ring.pop_front();
                     streaming_started = true;
                     stat_pushed++;
+                    // 只算真正推出的一帧。ring 里尚未推出的预读帧不计——
+                    // 那部分还没播，算进去位点就偏大。
+                    pushed_samples_.fetch_add(frame_samples,
+                                              std::memory_order_relaxed);
 
                     if (!first_frame_decoded_) {
                         std::lock_guard<std::mutex> start_lock(start_mutex_);
                         first_frame_decoded_ = true;
                         start_cv_.notify_all();
-                        ESP_LOGI(TAG, "Music stream started: %s", url.c_str());
+                        // 起流锚点（issue #3 串口断言用）：内容属性 + 起点。
+                        ESP_LOGI(TAG,
+                                 "Music stream started: title='%s' author='%s' "
+                                 "duration=%ds form=%s start=%ds",
+                                 meta.title.c_str(), meta.author.c_str(),
+                                 meta.duration_s, meta.live ? "live" : "finite",
+                                 start_s);
                     }
                 } else {
                     stat_push_fail++;
@@ -393,11 +465,23 @@ void MusicPlayer::WorkerTask() {
             }
 
             if (xTaskGetTickCount() - stat_last >= pdMS_TO_TICKS(2000)) {
+                // 位点遥测：绝对位点（起点 + 已推帧）；直播流标 live（不可定位）。
+                // 与状态上报同走 PositionSeconds，两处数字不会分叉。
+                char pos_field[32];
+                if (meta.live) {
+                    snprintf(pos_field, sizeof(pos_field), "live");
+                } else {
+                    snprintf(pos_field, sizeof(pos_field), "%us",
+                             (unsigned)PositionSeconds(
+                                 start_s,
+                                 pushed_samples_.load(std::memory_order_relaxed),
+                                 static_cast<int>(output_rate)));
+                }
                 ESP_LOGI(TAG,
-                         "pipe: ring=%u/%u in_buf=%uB read=%uB/2s pushed=%u fail=%u%s%s",
+                         "pipe: ring=%u/%u in_buf=%uB read=%uB/2s pushed=%u fail=%u pos=%s%s%s",
                          (unsigned)ring.size(), (unsigned)kRingHighWatermark,
                          (unsigned)in_buf.size(), (unsigned)stat_read_bytes,
-                         (unsigned)stat_pushed, (unsigned)stat_push_fail,
+                         (unsigned)stat_pushed, (unsigned)stat_push_fail, pos_field,
                          http_eof ? " EOF" : "", decode_error ? " DECERR" : "");
                 stat_read_bytes = stat_pushed = stat_push_fail = 0;
                 stat_last = xTaskGetTickCount();
@@ -407,6 +491,28 @@ void MusicPlayer::WorkerTask() {
             if (http_eof && in_buf.empty() && ring.empty()) {
                 success = true;
                 break;
+            }
+            // EOF 后若解码器对剩余字节既不消费也不产出、队列也推不进
+            // （可听内容其实已经播完，剩下的只是标签/垃圾尾巴），按正常
+            // 播完收尾：位点停在最后的值，会话转入空闲，唤醒词恢复。
+            // 阈值取 10 轮（~100ms）：先让队列里最后两帧播完，再判停滞。
+            if (http_eof && ring.empty() && iter_consumed == 0 &&
+                iter_decoded == 0 &&
+                pushed_samples_.load(std::memory_order_relaxed) == pushed_before) {
+                if (++eof_stall_passes >= 10) {
+                    ESP_LOGI(TAG,
+                             "Music tail drained: %uB undecodable at EOF, "
+                             "pos=%us",
+                             (unsigned)in_buf.size(),
+                             (unsigned)PositionSeconds(
+                                 start_s,
+                                 pushed_samples_.load(std::memory_order_relaxed),
+                                 static_cast<int>(output_rate)));
+                    success = true;
+                    break;
+                }
+            } else {
+                eof_stall_passes = 0;
             }
 
             // NOTE: CONFIG_FREERTOS_HZ=100, so pdMS_TO_TICKS(5) rounds to 0

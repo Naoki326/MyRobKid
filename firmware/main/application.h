@@ -129,6 +129,10 @@ public:
     bool StartMusic(const std::string& url);
     void StopMusic();
 
+    // 音乐会话快照（issue #3）：状态上报经此取「播到哪了」。
+    // 直接转述播放器的记账，线程安全。
+    MusicPlaybackStatus GetMusicStatus() const { return music_player_.GetPlaybackStatus(); }
+
     /*
      * Starts the stream immediately (idle case). Must not be called while a
      * conversation is active. Runs on any task; blocks up to 10 s waiting for

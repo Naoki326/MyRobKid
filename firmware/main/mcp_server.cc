@@ -44,9 +44,9 @@ void McpServer::AddCommonTools() {
     // Custom tools must be added in the board's InitializeTools function.
 
     AddTool("self.get_device_status",
-        "Provides the real-time information of the device, including the current status of the audio speaker, screen, battery, network, etc.\n"
+        "Provides the real-time information of the device, including the current status of the audio speaker, screen, battery, network, and music playback (the `music` object: playback state, played position in seconds for finite content, title; live radio is marked seekable=false), etc.\n"
         "Use this tool for: \n"
-        "1. Answering questions about current condition (e.g. what is the current volume of the audio speaker?)\n"
+        "1. Answering questions about current condition (e.g. what is the current volume of the audio speaker? where is the music playback at right now?)\n"
         "2. As the first step to control the device (e.g. turn up / down the volume of the audio speaker, etc.)",
         PropertyList(),
         [&board](const PropertyList& properties) -> ReturnValue {
