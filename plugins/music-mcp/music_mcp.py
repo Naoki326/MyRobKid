@@ -158,8 +158,10 @@ async def _resolve_play_urls(keyword: str, max_results: int = 3,
                     url = cdn_prefix + info.purl
                     ok = url.lower().endswith(".mp3") or ".mp3?" in url.lower() or quality_prefix
                     if ok or quality_prefix is None:
+                        # interval（秒）此前仅服务端列表显示用，现随 play_url 下发
                         songs.append({"name": song.name, "singer": _singer_str(song),
-                                      "url": url})
+                                      "url": url,
+                                      "duration": getattr(song, "interval", 0) or 0})
                         break
             except Exception:
                 continue
@@ -199,6 +201,9 @@ _PLAY_HINT = {
     "xiaozhi": (
         "拿到结果后，必须紧接着调用设备端工具 self.audio_speaker.play_music，"
         "并把 url 参数传为结果中的 play_url。URL 有时效性，应立即播放，不要缓存。"
+        "若用户要求从某个位置开始播（如「从 1 分钟开始放」「跳到中间」），"
+        "给 play_music 传可选的 start 参数（单位秒，整数；默认 0 表示从头）；"
+        "电台/直播流（form=live）定位无意义，不要传 start。"
     ),
     "mac": "返回的 play_url 可直接播放（ffplay/浏览器均可），或改用 play_song_locally 在本机播放。",
 }
@@ -229,7 +234,7 @@ async def search_song(keyword: str, quality: str = "M500") -> str:
     lines = [
         f"找到 {len(songs)} 首，推荐第 1 首：",
         f"歌曲: {best['name']} — {best['singer']}",
-        f"play_url: {_ensure_playable(best['url'])}",
+        f"play_url: {_ensure_playable(best['url'], title=best['name'], author=best['singer'], duration=best.get('duration'))}",
     ]
     if len(songs) > 1:
         others = "、".join(f"{s['name']}—{s['singer']}" for s in songs[1:])
@@ -268,7 +273,7 @@ async def search_radio(keyword: str, limit: int = 3) -> str:
             info += f" ({s['country']})"
         lines.append(info)
     best = stations[0]
-    lines.append(f"play_url: {_ensure_playable(best['url_resolved'])}")
+    lines.append(f"play_url: {_ensure_playable(best['url_resolved'], title=best['name'], form='live')}")
     lines.append(_PLAY_HINT.get(CONSUMER, ""))
     return "\n".join(lines)
 
@@ -299,12 +304,50 @@ async def get_lyrics(keyword: str) -> str:
 # 地址（含为什么用 mDNS 名）见文件头部「音乐代理地址：单一事实源」。
 
 
-def _ensure_playable(url: str, referer: str = None) -> str:
-    # 统一走局域网转码代理：即使 .mp3 结尾也可能是 302 跳转（如 wavpub 播客）。
+def _ensure_playable(url: str, referer: str = None, title: str = None,
+                     author: str = None, duration=None, form: str = "finite") -> str:
+    """统一走局域网转码代理：即使 .mp3 结尾也可能是 302 跳转（如 wavpub 播客）。
+
+    play_url 保持纯内容语义（issue #2）：除 src/referer 外还编码内容属性
+    title/author/duration/form（finite|live），设备解析后供状态呈现、位点记账
+    与续播语义使用。起点是播放会话状态、由设备持有——不编进 play_url，
+    设备起流时以 ss= 参数追加。
+    """
     u = f"{PROXY_BASE}?src={urllib.parse.quote(url, safe='')}"
     if referer:
         u += "&referer=" + urllib.parse.quote(referer, safe='')
+    if title:
+        u += "&title=" + urllib.parse.quote(title, safe='')
+    if author:
+        u += "&author=" + urllib.parse.quote(author, safe='')
+    if duration:
+        u += f"&duration={int(duration)}"
+    u += "&form=" + ("live" if form == "live" else "finite")
     return u
+
+
+def _parse_rss_duration(text) -> int | None:
+    """解析 RSS itunes:duration 的常见写法：纯秒数（"5430"）、"MM:SS"、"HH:MM:SS"。
+    无法解析或为 0 视为未知，返回 None。"""
+    if not text:
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    try:
+        if ":" in s:
+            parts = [int(p) for p in s.split(":")]
+            if any(p < 0 for p in parts):
+                return None
+            seconds = 0
+            for p in parts:
+                seconds = seconds * 60 + p
+            return seconds or None
+        if not s.isdigit():
+            return None
+        return int(s) or None
+    except ValueError:
+        return None
 
 
 # ── B 站音频（匿名 API + ffmpeg 转码代理） ────────────────────────
@@ -381,7 +424,9 @@ async def search_bilibili(keyword: str) -> str:
         except Exception:
             continue
         lines.append(f"播放：{v['title'][:38]}")
-        lines.append("play_url: " + _ensure_playable(m4s, referer="https://www.bilibili.com"))
+        lines.append("play_url: " + _ensure_playable(
+            m4s, referer="https://www.bilibili.com",
+            title=v["title"], author=v["up"], duration=v["duration_s"]))
         lines.append(_PLAY_HINT.get(CONSUMER, ""))
         return "\n".join(lines)
     return "\n".join(lines) + "\n（以上内容暂时取不到音频流，可换个关键词）"
@@ -412,7 +457,8 @@ def _itunes_search_podcast(keyword: str, limit: int = 3) -> list[dict]:
 
 
 def _latest_episode(feed_url: str) -> dict | None:
-    """拉取播客 RSS，返回最新一集 {title, url, pub_date}（mp3/m4a enclosure）。"""
+    """拉取播客 RSS，返回最新一集 {title, url, pub_date, duration_s}（mp3/m4a enclosure）。
+    时长取 itunes:duration（纯秒数或 MM:SS / HH:MM:SS），缺省为 None。"""
     import re
     import xml.etree.ElementTree as ET
 
@@ -430,10 +476,17 @@ def _latest_episode(feed_url: str) -> dict | None:
             if ".mp3" not in url.lower() and ".m4a" not in url.lower():
                 continue
         if url:
+            # itunes:duration 带命名空间，按本地名匹配（有的源用裸 <duration>）
+            duration_s = None
+            for child in item:
+                if child.tag.rsplit("}", 1)[-1] == "duration":
+                    duration_s = _parse_rss_duration(child.text)
+                    break
             return {
                 "title": title,
                 "url": url,
                 "pub_date": (item.findtext("pubDate") or "").strip(),
+                "duration_s": duration_s,
             }
     return None
 
@@ -471,7 +524,7 @@ async def search_podcast(keyword: str) -> str:
             ep = None
         if ep:
             lines.append(f"播放：{p['title']} — {ep['title']}")
-            lines.append(f"play_url: {_ensure_playable(ep['url'])}")
+            lines.append(f"play_url: {_ensure_playable(ep['url'], title=ep['title'], author=p['artist'], duration=ep.get('duration_s'))}")
             lines.append(_PLAY_HINT.get(CONSUMER, ""))
             return "\n".join(lines)
     return "\n".join(lines) + "\n（以上播客的最新一集音频暂时取不到，可换个关键词）"

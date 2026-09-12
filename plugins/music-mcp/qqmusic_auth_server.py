@@ -18,6 +18,7 @@ import base64
 import io
 import ipaddress
 import json
+import math
 import os
 import socket
 import subprocess
@@ -98,14 +99,45 @@ def _src_host_is_safe(src_url: str) -> bool:
         return False
 
 
+def _parse_seconds(value: str | None, name: str) -> float | None:
+    """把秒数参数解析为非负有限浮点；非法值抛 ValueError（端点转 400）。
+
+    起点支持小数（如 59.5）。None 表示未提供。
+    """
+    if value is None or value == "":
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 必须是秒数（支持小数），收到 {value!r}")
+    if not math.isfinite(seconds):
+        raise ValueError(f"{name} 必须是有限数，收到 {value!r}")
+    if seconds < 0:
+        raise ValueError(f"{name} 不能为负数，收到 {value!r}")
+    return seconds
+
+
+def _fmt_seconds(seconds: float) -> str:
+    # %g 在 ≥1e6 时产出科学计数法（"1e+06"），ffmpeg 解析不了；
+    # 定点六位再去尾零，任何有限值都不会出现科学计数法。
+    return f"{seconds:.6f}".rstrip("0").rstrip(".")
+
+
 @app.get("/stream")
 async def transcode_stream(
     src: str = Query(...),
     referer: str = Query(None),
+    ss: str = Query(None),
+    t: str = Query(None),
     request: Request = None,
 ):
     if not _src_host_is_safe(src):
         return JSONResponse({"error": "src 必须是公网 http(s) 地址"}, status_code=400)
+    try:
+        start_s = _parse_seconds(ss, "ss")
+        trim_s = _parse_seconds(t, "t")
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
     cmd = [
         "/opt/homebrew/bin/ffmpeg", "-loglevel", "error",
@@ -115,12 +147,21 @@ async def transcode_stream(
     if referer:
         # B 站等 CDN 有 Referer 防盗链
         headers += f"Referer: {referer}\r\n"
+    # 起点定位必须用输入定位（-ss 置于 -i 之前）：实测同一首歌全量转码 2.08s、
+    # 从 60s 定位 1.09s，产出时长与「总时长 − 60」偏差 0.0s；输出定位会先解码
+    # 丢弃，既慢又没有这个精度。起点超出源时长时交给 ffmpeg 自然产出空流。
+    # （契约测试：plugins/music-mcp/tests/test_transcode_proxy.py）
+    if start_s is not None:
+        cmd += ["-ss", _fmt_seconds(start_s)]
     cmd += ["-headers", headers, "-i", src,
             # 设备（zhengchen-minicam）codec 输出 24kHz：直出 24k 单声道，
             # 免掉设备端 44.1k→24k 软件重采样（CPU 大头），解码量也减半；
             # 24k 单声道 64kbps 已接近透明，还省一半网络吞吐。
-            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "24000", "-b:a", "64k",
-            "-f", "mp3", "pipe:1"]
+            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "24000", "-b:a", "64k"]
+    if trim_s is not None:
+        # 裁剪时长（输出侧 -t）：自动化验收能在数秒内完成，不必下载整首剩余部分。
+        cmd += ["-t", _fmt_seconds(trim_s)]
+    cmd += ["-f", "mp3", "pipe:1"]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,

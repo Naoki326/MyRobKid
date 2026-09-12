@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "audio/music_url.h"
 
 #define TAG "MCP"
 
@@ -64,13 +65,30 @@ void McpServer::AddCommonTools() {
         });
 
     AddTool("self.audio_speaker.play_music",
-        "Play music or an internet radio station from an HTTP(S) URL. The URL must be a direct audio stream URL (an mp3 file/stream or an ogg/opus stream), not a web page. Typical sources are internet radio station stream addresses. Music keeps playing after the conversation ends until it is stopped or the user wakes the device up again. If the user asks for music but no stream URL is known, ask the user for a stream URL instead of guessing one.",
+        "Play music, a podcast episode or an internet radio station from a play URL "
+        "returned by the music search tools. The URL carries the content attributes "
+        "(title, duration, finite/live form) of the content it points to. "
+        "Music keeps playing after the conversation ends until it is stopped or the user wakes the device up again. If the user asks for music but no stream URL is known, ask the user for a stream URL instead of guessing one.",
         PropertyList({
-            Property("url", kPropertyTypeString)
+            Property("url", kPropertyTypeString),
+            // 起点（秒）：用户说「从 1 分钟开始放」时由模型传入 60；默认 0 = 从头。
+            // 直播流（form=live）定位无意义，设备侧忽略该参数。
+            Property("start", kPropertyTypeInteger, 0, 0, 86400)
         }),
         [&board](const PropertyList& properties) -> ReturnValue {
             auto url = properties["url"].value<std::string>();
-            if (!Application::GetInstance().StartMusic(url)) {
+            auto start = properties["start"].value<int>();
+            auto meta = ParseMusicContentMeta(url);
+            // 串口可见：音乐会话的标题/时长/形态直接来自设备自己的播放地址。
+            ESP_LOGI(TAG, "Music content: title='%s' author='%s' duration=%ds form=%s",
+                     meta.title.c_str(), meta.author.c_str(), meta.duration_s,
+                     meta.live ? "live" : "finite");
+            if (meta.live && start > 0) {
+                ESP_LOGW(TAG, "Start position %ds ignored for live stream", start);
+                start = 0;
+            }
+            auto play_url = AppendMusicStart(url, start);
+            if (!Application::GetInstance().StartMusic(play_url)) {
                 throw std::runtime_error("Failed to start music playback (URL unreachable or not a decodable audio stream)");
             }
             return true;

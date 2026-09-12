@@ -28,3 +28,8 @@ QQ 音乐/播客播放从未真正成功过（旧固件 `Play()` 不验证即返
 - **方法论**：设备黑盒问题先建可观测性（遥测/串口）再动手；逐项排除法走了 6 版，遥测一加 2 版收敛。OTA 双槽回滚在 2.4.10 崩溃时正确兜底。
 - **遗留**：音乐期间喊唤醒词无响应（AFE 已停，按按钮可打断）——产品取舍已接受；`tcp_receive` prio 1 与 HttpClient 8KB 反压是上游组件短板，若音乐仍偶发卡顿，下一步提升组件内接收任务优先级或改消费偏移消除头部搬移。
 - **2026-09-11 地址漂移（不属于本 ADR 的管线问题）**：play_url 里的主机写死了旧 IP，Mac 漂到新 IP 后设备连不上，而 play_music 假成功不报错——症状是「搜完歌、说开始播放，机器人就不动了」。音乐无声**先跑 `tools/music_url_check.py` 排除地址**（判据：地址能取到音频字节），再查本 ADR 的管线。地址纪律见 ADR-0002「地址改用 mDNS 名」。
+- **2026-09-12 跳到指定位置 + play_url 携带内容元数据（issue #2）**：用户说「从 1 分钟开始放」不再从头播。分界延续「play_url 保持纯内容语义」：
+  - **代理**（`qqmusic_auth_server.py /stream`）新增 `ss`（起点秒，可小数）与 `t`（裁剪秒，可选）。定位必须用**输入定位**（`-ss` 置于 `-i` 之前）：实测同一首歌全量转码 2.08s、从 60s 定位 1.09s，产出时长与「总时长 − 60」偏差 0.0s；输出定位会先解码丢弃，既慢又没有这个精度。非法起点（负数/非数字/非有限数）一律 400，不许 200 空流；起点超源时长交给 ffmpeg 自然产出空流（200 + audio 头 + 极少字节，设备收不到可解码帧即报播放失败）。`-re` 行为不变：代理仍不按实时速率读。契约测试：`plugins/music-mcp/tests/test_transcode_proxy.py`。
+  - **play_url 新增内容属性**：`title`/`author`/`duration`（秒）/`form`（finite|live），四个搜索工具（歌曲/电台/B站/播客）统一由 `_ensure_playable` 编码；播客时长补上数据源（RSS `itunes:duration`，`_parse_rss_duration`）。电台流 `form=live` 且不带时长。起点**不编进 play_url**——它是播放会话状态、由设备持有，起流时追加。
+  - **设备**（2.4.20）：`play_music` 接受可选 `start`（秒，默认 0 = 从头），经 `audio/music_url.cc` 解析 play_url 内容属性（串口打 `Music content: title=/duration=/form=`）并把 `ss=<n>` 追加到地址后起流；直播流忽略 start（对直播流定位会静默乱跳）。
+  - 回归判据扩展进 `tools/music_url_check.py`（不新建脚本）：内容属性断言、起点 60s + 裁剪 10s 的产出量级（≈10s@64kbps ≈ 80KB）、非法起点 400；`--radio` 模式断言 form=live 无时长。
