@@ -92,11 +92,33 @@ class SimpleHttpServer:
                 # 轻量配置页路由（页面 + 读写 API）
                 app.add_routes(
                     [
+                        # 旧八组配置页：**本票不动**（expand 阶段原样保留在原 URL）。
+                        # 收线（302 到首域 + 退役）是后续票的事（父 spec §11）。
                         web.get("/xiaozhi/config/", self.config_handler.handle_page),
+                        # 页面拓扑：五域 + 逃生口（§8.1 的 slug 是用户契约）。
+                        # 无尾斜杠 → 尾斜杠的 301 由**应用层**发（§8.2），
+                        # 不依赖仓库外的 nginx 配置。
+                        web.get(
+                            "/xiaozhi/config",
+                            self.config_handler.handle_config_root_redirect,
+                        ),
+                        web.get(
+                            "/xiaozhi/config/{slug}",
+                            self.config_handler.handle_domain_redirect,
+                        ),
+                        web.get(
+                            "/xiaozhi/config/{slug}/",
+                            self.config_handler.handle_domain_page,
+                        ),
                         # 页面状态模型（无 DOM 依赖的 ES 模块，配置页 <script type="module"> 引入）
                         web.get(
                             "/xiaozhi/config/config_state_model.js",
                             self.config_handler.handle_state_model,
+                        ),
+                        # 域页的编辑脚本（五个域页共用同一份）
+                        web.get(
+                            "/xiaozhi/config/config_domain_page.js",
+                            self.config_handler.handle_domain_page_script,
                         ),
                         web.post(
                             "/xiaozhi/config/api/auth",

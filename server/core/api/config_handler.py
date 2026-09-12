@@ -2,9 +2,16 @@
 config_handler.py — 轻量配置页后端（读 / 改 data/.config.yaml）
 
 路由（挂载在 8003 aiohttp，nginx 8080 以 /xiaozhi/config/ 反代）：
-- GET  /xiaozhi/config/           配置页 HTML
+
+页面（父 spec §8.1 的 slug 是**用户契约**，ADR-0012）：
+- GET  /xiaozhi/config/           旧八组配置页（本票 expand 阶段原样保留）
+- GET  /xiaozhi/config/<slug>/   域页（dialogue / system 有内容，其余为占位页）
+- GET  /xiaozhi/config/raw/      逃生口：整份原始配置，只读一页看完
+- 无尾斜杠形态 301 到规范形（**应用层发**，不依赖仓库外的 nginx 配置）
+
+接口：
 - POST /xiaozhi/config/api/auth   兼容接口（直接放行）
-- GET  /xiaozhi/config/api/full   合并后的完整生效配置（敏感字段掩码）
+- GET  /xiaozhi/config/api/full   合并后的完整生效配置（敏感字段掩码）+ 存在信号
 - POST /xiaozhi/config/api/save   保存用户配置到 data/.config.yaml
 - POST /xiaozhi/config/api/restart 重启服务使配置生效
 
@@ -20,6 +27,7 @@ import os
 import re
 import subprocess
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from aiohttp import web
@@ -27,7 +35,32 @@ from aiohttp import web
 from core.api.base_handler import BaseHandler
 from core.utils import device_registry
 
+# 页面外壳与字段归属表（父 spec §4.2 的「服务端共享模板」与 §7 的机械复算）。
+# 放在 server/config/ 而不是 core/api/：它们是页面渲染资产，与 config_page.html
+# 同居，改页面不用动 handler。
+from config import config_shell as shell
+from config import page_domains
+
 TAG = __name__
+
+#: 逃生口页的脚本：把整棵掩码配置树填进只读容器。
+#: 内联在 handler 里而不是另开一个静态文件：逃生口页的脚本只有这几行，
+#: 而它的**唯一要求**是「与编辑页读同一份数据」（``api/full`` 的掩码树，
+#: §4.3 原文「整份 YAML 一页看完」）。多一个文件就多一个可能漂移的读取路径。
+RAW_PAGE_JS = """
+(function () {
+  var box = document.getElementById('rawView');
+  if (!box) return;
+  fetch('/xiaozhi/config/api/full')
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      box.textContent = JSON.stringify(d.config || {}, null, 2);
+    })
+    .catch(function (e) {
+      box.textContent = '加载失败：' + e.message;
+    });
+})();
+"""
 
 # 敏感字段：读取时掩码，防止密钥明文出现在页面/浏览器
 SENSITIVE_KEYS = {
@@ -126,6 +159,32 @@ def _secret_state(node, prefix="", out=None):
             elif _is_sensitive_key(k):
                 out[path] = {"configured": _is_configured_secret(v)}
     return out
+
+
+def _strip_template_comment(html: str) -> str:
+    """去掉骨架开头的作者注释。
+
+    那条注释写的是「这一页怎么搭起来的」（给改代码的人看），不该随响应发给
+    浏览器——它会让「页面里有没有某个字符串」这类检测（包括我们自己的契约
+    测试）把注释当成内容，得出假阳/假阴。
+
+    只删 ``<!DOCTYPE html>`` 与 ``<html>`` 之间那一段：那是骨架里唯一的注释区。
+    """
+    doctype = html.find("<!DOCTYPE html>")
+    if doctype < 0:
+        return html
+    html_tag = html.find("<html", doctype)
+    if html_tag < 0:
+        return html
+    head = html[doctype:html_tag]
+    if "<!--" not in head:
+        return html
+    start = head.find("<!--")
+    end = head.find("-->", start)
+    if end < 0:
+        return html
+    cleaned = head[:start] + head[end + 3:].lstrip("\n") + "\n"
+    return html[:doctype] + cleaned + html[html_tag:]
 
 
 class ConfigHandler(BaseHandler):
@@ -300,6 +359,161 @@ class ConfigHandler(BaseHandler):
             content_type="text/javascript",
             charset="utf-8",
         )
+
+    async def handle_domain_page_script(self, request):
+        """域页的编辑脚本（无 DOM 依赖的模块，五个域页共用同一份）。"""
+        js_path = Path(self.project_dir) / "config" / "config_domain_page.js"
+        if not js_path.exists():
+            return web.Response(text="config_domain_page.js not found", status=404)
+        return web.Response(
+            text=js_path.read_text(encoding="utf-8"),
+            content_type="text/javascript",
+            charset="utf-8",
+        )
+
+    # ---------------- 页面拓扑：五域 + 逃生口（父 spec §4 / §8.1 / §8.2） ----------------
+    #
+    # 三条规则都落在这一节里：
+    #   1. 每个页面恰一个规范 URL（尾斜杠收尾），由应用层 301 从无斜杠形态归一
+    #      —— 现状 slash 行为取决于从 8080 还是 8003 进（§8.2），根因在仓库外的
+    #      nginx 配置；应用层自己发 301 就不依赖它了；
+    #   2. 域 slug（dialogue / engine / tools / devices / system / raw）一经上线
+    #      即用户契约（ADR-0012）—— **本次新增，不动旧的 /xiaozhi/config/**；
+    #   3. 保存 / 重启动作区**只在配置编辑页渲染**：只读页（逃生口）与未上线域的
+    #      占位页拿不到按钮（§4.2）。
+
+    #: 未上线域（本票只交付占位页，内容是 #27/#28/#29 的事）。
+    _DOMAIN_BY_SLUG = {d["slug"]: d for d in shell.DOMAINS}
+    #: 逃生口与未上线域都是「无编辑对象」的页：动作区不渲染（§4.2）。
+    _RAW_SLUG = shell.RAW_ESCAPE["slug"]
+
+    @staticmethod
+    def _permanent_redirect(request) -> web.Response:
+        """301 到**尾斜杠规范形**，保留查询串。
+
+        用 301 而非 302：slug 是用户契约、规范形是长期形态（§8.2）。
+        目标从请求路径算（加个尾斜杠），不硬编码 host。
+        """
+        target = request.path + "/"
+        if request.query_string:
+            target += "?" + request.query_string
+        return web.HTTPMovedPermanently(location=target)
+
+    async def handle_config_root_redirect(self, request):
+        """/xiaozhi/config（无斜杠）→ /xiaozhi/config/（规范形）。"""
+        return self._permanent_redirect(request)
+
+    async def handle_domain_redirect(self, request):
+        """/xiaozhi/config/<slug> → /xiaozhi/config/<slug>/（规范形）。"""
+        return self._permanent_redirect(request)
+
+    def _read_page(self, name: str) -> str:
+        return (Path(self.project_dir) / "config" / name).read_text(encoding="utf-8")
+
+    def _render_domain_page(self, slug: str) -> web.Response:
+        """渲染一个域页（有内容的域）或占位页（未上线的域）。
+
+        共用 ``config_domain_page.html`` 骨架：域表以 JSON 注入，渲染逻辑在
+        ``config_domain_page.js``。占位页复用同一副壳，正文换成 ``placeholder``。
+        """
+        skeleton = self._read_page("config_domain_page.html")
+        if slug == self._RAW_SLUG:
+            return self._render_escape_page(skeleton)
+
+        domain = self._DOMAIN_BY_SLUG.get(slug)
+        if domain is None:
+            return web.Response(text="未知的页面域", status=404)
+        schema = page_domains.DOMAIN_SCHEMAS.get(slug)
+        actions = ""
+        savebar = ""
+        page_desc = domain["blurb"]
+        page_icon = domain["icon"]
+        if schema is not None:
+            body = ""  # 正文由 config_domain_page.js 按注入的域表渲染
+            actions = (
+                '<button class="btn primary" id="saveBtn" '
+                'onclick="xzhSave()" disabled>💾 保存修改</button>'
+                '<button class="btn danger" onclick="xzhRestart()">♻️ 重启服务生效</button>'
+            )
+            savebar = (
+                '<div class="savebar"><span class="info" id="saveInfo">'
+                '暂无未保存修改</span></div>'
+            )
+            schema_json = json.dumps(asdict(schema), ensure_ascii=False)
+        else:
+            # 未上线域：占位正文，且**动作区不渲染**（没有可保存的对象）。
+            body = shell.render_placeholder(domain)
+            # 占位页不需要域表驱动的编辑，但脚本仍以空表启动（骨架同一副）。
+            schema_json = json.dumps(
+                {"slug": slug, "label": domain["label"], "groups": []},
+                ensure_ascii=False)
+
+        html = self._fill_skeleton(
+            skeleton, title=f"小智 · {domain['label']}", active=slug,
+            page_label=domain["label"], page_icon=page_icon, page_desc=page_desc,
+            actions=actions, savebar=savebar, schema_json=schema_json, body=body)
+        return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+    def _render_escape_page(self, skeleton: str) -> web.Response:
+        """逃生口只读页：一页看完**整份**原始配置（§4.3）。
+
+        与旧页面的「全部配置」是同一份数据、同一个读取路径（api/full 的掩码树），
+        但它是**独立页 + 侧栏底部的非域入口**，不是侧栏第六域。没有动作区 ——
+        只读页没有可保存的对象（§4.2）。
+        """
+        body = (
+            '<section class="group"><h2>📦 原始配置 <span class="badge">只读</span></h2>'
+            '<div class="desc">当前生效的完整配置（敏感字段已掩码）。'
+            '改配置请到对应的域页；这里是孤儿字段的最后兑底，Ctrl+F 全局搜。</div>'
+            '<div class="jsonbox" id="rawView">正在加载…</div></section>'
+        )
+        schema_json = json.dumps(
+            {"slug": self._RAW_SLUG, "label": shell.RAW_ESCAPE["label"], "groups": []},
+            ensure_ascii=False)
+        html = self._fill_skeleton(
+            skeleton, title="小智 · 原始配置", active=self._RAW_SLUG,
+            page_label="原始配置", page_icon=shell.RAW_ESCAPE["icon"],
+            page_desc="整份原始配置，只读。",
+            actions="", savebar="", schema_json=schema_json, body=body,
+            page_script=RAW_PAGE_JS)
+        return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+    def _fill_skeleton(self, skeleton: str, **kw) -> str:
+        """把壳的拼装结果填进骨架占位符。
+
+        骨架里留的是字面占位符（``__SIDEBAR__`` 等）而不是 ``str.format`` 的
+        ``{}``：页面正文与 CSS 里花括号太多，用 ``format`` 会立刻炸。
+
+        ``html.escape`` 用不上——这里填的全是**自己生成**的 HTML 片段，不是
+        用户数据；唯一的例外是域表 JSON，它由 ``json.dumps`` 产物再转义 ``<``
+        与 ``&``（防 ``</script>`` 提前结束标签）。
+        """
+        topbar = shell.render_topbar(
+            f"小智 · {kw['title'].split('· ', 1)[-1]}", kw.get("actions", ""))
+        schema_json = (kw.get("schema_json", "{}")
+                       .replace("<", "\\u003c").replace("&", "\\u0026"))
+        html = skeleton
+        for name, value in (
+            ("__TITLE__", kw["title"]),
+            ("__SHELL_CSS__", shell.SHELL_CSS),
+            ("__TOPBAR__", topbar),
+            ("__SIDEBAR__", shell.render_sidebar(kw["active"])),
+            ("__PAGE_ICON__", kw.get("page_icon", "⚙️")),
+            ("__PAGE_LABEL__", kw.get("page_label", "配置")),
+            ("__PAGE_DESC__", kw.get("page_desc", "")),
+            ("__SCHEMA_JSON__", schema_json),
+            ("__SAVEBAR__", kw.get("savebar", "")),
+            ("__SHELL_JS__", shell.SHELL_JS),
+            ("__PAGE_JS__", kw.get("page_script", "")),
+            ("__BODY__", kw.get("body", "")),
+        ):
+            html = html.replace(name, value)
+        return _strip_template_comment(html)
+
+    async def handle_domain_page(self, request):
+        """域页 / 逃生口页（尾斜杠规范形）。"""
+        slug = request.match_info["slug"]
+        return self._render_domain_page(slug)
 
     async def handle_auth(self, request):
         """兼容接口：PIN 已移除，直接放行（前端登录逻辑保留，避免改动）。"""

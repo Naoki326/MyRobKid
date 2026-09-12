@@ -29,6 +29,8 @@ import {
   classifyDirty,
   computeDirty,
   dirtyLabel,
+  dirtySummary,
+  domainDirty,
   displayValue,
   effectiveDefault,
   groupDirty,
@@ -350,4 +352,146 @@ test('编辑动作返回新状态，不改原对象', () => {
   setSecretInput(p, 'LLM.ThirkingLLM.api_key', 'x');
   setSelection(p, 'LLM', 'DoubaoLLM');
   assert.equal(JSON.stringify(p), snapshot, '纯函数不得改入参');
+});
+
+/* ---------------------------------------------------------------------------
+ * 8. 跨页脏摘要（父 spec §4.6）——本票新增
+ *
+ * 被钉住的是一句话：**摘要是「哪些路径脏了 + 几条」，不是「改成了什么」。**
+ * 编辑缓冲只活在当前页内存；跨页只能传摘要。密钥新值一旦落进 localStorage
+ * 就永远不可能收回，所以这条断言必须是硬的、按形状钉的。
+ * ------------------------------------------------------------------------ */
+const SECRET_NEW_VALUE = 'sk-br4nd-new-secret-value';
+
+/** 造一份「含密钥替换」的脏结果：最容易把值带出去的那一类。 */
+function dirtyWithSecret() {
+  let p = setValue(page(), 'LLM.ThirkingLLM.max_tokens', 2048);
+  p = setSecretInput(p, 'LLM.ThirkingLLM.api_key', SECRET_NEW_VALUE);
+  p = setSelection(p, 'LLM', 'DoubaoLLM');
+  return computeDirty(p);
+}
+
+test('脏摘要只含路径与计数，一个值都不带', () => {
+  const summary = dirtySummary(dirtyWithSecret());
+  assert.deepEqual(Object.keys(summary).sort(), ['count', 'paths']);
+  assert.equal(typeof summary.count, 'number');
+  assert.ok(Array.isArray(summary.paths));
+  assert.ok(summary.paths.every(p => typeof p === 'string'));
+});
+
+test('密钥的新值绝不出现在摘要里（序列化后也不许）', () => {
+  // 判别力：把 entry.to 顺手塞进摘要是「最自然」的那行代码，而它会把用户刚
+  // 敲进去的密钥明文写进 localStorage。这里按**序列化后的整串**查，
+  // 不管它藏在 paths 里、还是藏在别的新增字段里。
+  const text = JSON.stringify(dirtySummary(dirtyWithSecret()));
+  assert.ok(!text.includes(SECRET_NEW_VALUE),
+    '摘要里出现了密钥新值——跨页摘要是只含路径与计数的，值不出页面内存');
+  assert.ok(!text.includes('ThirkingLLM → DoubaoLLM'),
+    '摘要里出现了「从…到…」的取值，同样属于值');
+});
+
+test('摘要按路径排序（跨页比对稳定）', () => {
+  const summary = dirtySummary(dirtyWithSecret());
+  assert.deepEqual(summary.paths, [...summary.paths].sort());
+  assert.equal(summary.count, summary.paths.length);
+});
+
+test('无脏时摘要是零计数空列表（保存/放弃后要能把它清干净）', () => {
+  assert.deepEqual(dirtySummary({}), { count: 0, paths: [] });
+  assert.deepEqual(dirtySummary(undefined), { count: 0, paths: [] });
+});
+
+test('域桶按页面给的判据分，无脏的域不出现', () => {
+  // 判据由页面注入（域表在 python 侧），本模块不内置第二份域表。
+  const domainForPath = (path) => {
+    if (path.startsWith('prompt') || path.startsWith('voiceprint')
+        || path.startsWith('wakeup')) return 'dialogue';
+    if (path.startsWith('LLM.') || path.startsWith('selected_module.')) return 'engine';
+    return undefined;
+  };
+  const buckets = domainDirty(dirtyWithSecret(), domainForPath);
+  // 三条脏（max_tokens / api_key / selected_module.LLM）全落在引擎域；
+  // 对话与角色域一处未改，所以它**不出现**在桶里（侧栏据此不画点）。
+  assert.deepEqual(Object.keys(buckets).sort(), ['engine']);
+  assert.equal(buckets.engine.count, 3, 'max_tokens / selected_module / api_key 都在引擎域');
+  assert.ok(buckets.engine.paths.includes('selected_module.LLM'));
+  assert.ok(!('dialogue' in buckets), '无脏的域不出现，否则侧栏会画一个假的脏点');
+});
+
+test('域桶里只有路径与计数，密钥值同样不得泄露', () => {
+  const buckets = domainDirty(dirtyWithSecret(),
+    (p) => (p.startsWith('LLM.') || p.startsWith('selected_module.') ? 'engine' : 'dialogue'));
+  const text = JSON.stringify(buckets);
+  assert.ok(!text.includes(SECRET_NEW_VALUE));
+  for (const bucket of Object.values(buckets)) {
+    assert.deepEqual(Object.keys(bucket).sort(), ['count', 'paths']);
+  }
+});
+
+test('归不到任何域的脏不静默丢（调用方能看见它没被分桶）', () => {
+  // 摘要的用途是「侧栏说有几处未保存」。归错域会少一个脏点，
+  // 但**悄悄丢掉**会让计数对不上界面上的保存栏，比少一个点更糟。
+  const buckets = domainDirty({ 'log.log_level': { kind: 'param', from: 'INFO', to: 'DEBUG' } },
+    () => undefined);
+  assert.deepEqual(buckets, {});
+  const summary = dirtySummary({ 'log.log_level': { kind: 'param', from: 'INFO', to: 'DEBUG' } });
+  assert.equal(summary.count, 1, '总计数与分桶是两件事，总计数不得因分桶失败而缩水');
+});
+
+/* ---------------------------------------------------------------------------
+ * 9. 域内散字段的生效性（本票新增的边界）
+ *
+ * #17 把脏分两组，是为了区分「重启后生效」与「**仅提前配好 · 当前不生效**」。
+ * 后者专指**未选中引擎**——配好了、但当前不生效的那一类。域内散字段（系统域
+ * 的 `log.*` / `server.*`、对话与角色域的 `prompt` / `voiceprint.*`）没有
+ * 「选中」这个状态：改了就重启生效，不存在「当前不生效」。
+ *
+ * 判别力：旧口径把任何三段路径都当引擎块，于是 `log.log_level`（三段）落进
+ * staged，系统域每一次修改都被标成「当前不生效」——分类在说谎，比保守更糟。
+ * ------------------------------------------------------------------------ */
+const ENGINE_CATEGORIES = ['VAD', 'ASR', 'LLM', 'VLLM', 'TTS', 'Memory'];
+
+test('非引擎域的三段路径不算「当前不生效」', () => {
+  assert.equal(classifyDirty('log.log_level', {}, ENGINE_CATEGORIES), 'active',
+    '系统域的散字段改了就重启生效，没有「当前不生效」这回事');
+  assert.equal(classifyDirty('voiceprint.speakers', {}, ENGINE_CATEGORIES), 'active');
+  assert.equal(classifyDirty('end_prompt.enable', {}, ENGINE_CATEGORIES), 'active');
+});
+
+test('引擎域的三段路径仍按选中分（边界没有被放宽掉）', () => {
+  const selection = { LLM: 'ThirkingLLM' };
+  assert.equal(classifyDirty('LLM.ThirkingLLM.max_tokens', selection, ENGINE_CATEGORIES), 'active');
+  assert.equal(classifyDirty('LLM.DoubaoLLM.max_tokens', selection, ENGINE_CATEGORIES), 'staged');
+  assert.equal(classifyDirty('TTS.MlxTTS.speed', { TTS: 'MlxTTS' }, ENGINE_CATEGORIES), 'active');
+});
+
+test('不传类目集合时逐字保持旧口径（旧页面调用形态，不得静默改行为）', () => {
+  // 引擎路径：仍按选中分。
+  assert.equal(classifyDirty('LLM.DoubaoLLM.max_tokens', { LLM: 'ThirkingLLM' }), 'staged');
+  assert.equal(classifyDirty('LLM.ThirkingLLM.max_tokens', { LLM: 'ThirkingLLM' }), 'active');
+  // 非引擎路径：旧口径一律 staged；这里易错成 'active'（域页的新口径是
+  // 传了类目集合才生效的），旧页面不传参数就拿到新行为 = 静默回归。
+  assert.equal(classifyDirty('prompt', {}), 'staged',
+    '旧口径：短路径也当「当前不生效」');
+  assert.equal(classifyDirty('log.log_level', {}), 'staged',
+    '旧口径：两段路径（非引擎）同样 staged');
+  assert.equal(classifyDirty('server.port', {}), 'staged');
+  assert.equal(classifyDirty('Intent.functions', {}), 'staged');
+});
+
+test('传了类目集合才把非引擎散字段归入「重启后生效」', () => {
+  // 与上一条成对：同一路径，传 / 不传参数给不同组 —— 证明差异只来自参数，
+  // 不是默认值被悄悄换了。
+  assert.equal(classifyDirty('log.log_level', {}), 'staged');
+  assert.equal(classifyDirty('log.log_level', {}, ENGINE_CATEGORIES), 'active');
+});
+
+test('系统域的改动全部落进「重启后生效」组', () => {
+  const dirty = {
+    'log.log_level': { kind: 'param', from: 'INFO', to: 'DEBUG' },
+    'server.port': { kind: 'param', from: 8002, to: 8009 },
+  };
+  const g = groupDirty(dirty, {}, ENGINE_CATEGORIES);
+  assert.equal(g.active.length, 2);
+  assert.equal(g.staged.length, 0, '系统域不该出现「当前不生效」的条目');
 });

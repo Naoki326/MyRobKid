@@ -301,17 +301,40 @@ function collectRemoved(orig, cur, base, out) {
  * - ``selected_module.*``             → active（它本身就在改写「谁生效」）
  * - ``CAT.name.field``，name 当前选中 → active
  * - ``CAT.name.field``，name 未选中   → staged（只是提前配好）
+ * - 非引擎域的散字段（系统域 ``log.*`` / ``server.*``、对话与角色域
+ *   ``prompt`` / ``voiceprint.*``…）  → active
+ *
+ * 最后一条不是新裁决，而是同一句话的推论：#17 把脏分两组是为了区分「重启后
+ * 生效」与「仅提前配好·当前不生效」——**后者专指未选中引擎**（配好了但当前
+ * 不生效的那类）。域内散字段不存在「不生效」这回事：它们没有「选中」这个状态，
+ * 改了就重启生效。把它们一律扫进 staged 会让系统域的每一次修改都被标成
+ * 「当前不生效」——那是分类在说谎，不是保守。
  *
  * 分类**随当前选中动态变化**：改了 A 引擎后又把选中切到 B，A 的改动就从
  * 「重启后生效」降级为「仅提前配好」。这是有意为之，且必须可见（§5.4）。
  */
-export function classifyDirty(path, selection) {
+export function classifyDirty(path, selection, engineCategories) {
   if (String(path).startsWith('selected_module.')) return 'active';
   const parts = String(path).split('.');
-  if (parts.length >= 3 && selection && selection[parts[0]] === parts[1]) {
-    return 'active';
+  // 引擎块路径的形状是 ``<类目>.<引擎名>.<字段>``。只有类目名真的在引擎域
+  // 类目集合里（VAD/ASR/LLM/VLLM/TTS/Memory），才谈得上「选中 / 未选中」。
+  //
+  // 不传类目集合时**逐字保持旧口径**：任何三段路径都当引擎块，其余一律
+  // 归 ``staged``（旧页面 config_page.html 的调用形态，不允许静默改行为）。
+  // 传了类目集合才按「是否真在引擎域类目里」细化，非引擎域散字段归 ``active``
+  // ——它们没有「选中」状态，「仅提前配好」对它不成立。
+  if (!engineCategories) {
+    const isEnginePath = parts.length >= 3;
+    if (isEnginePath) {
+      return (selection && selection[parts[0]] === parts[1]) ? 'active' : 'staged';
+    }
+    return 'staged';
   }
-  return 'staged';
+  const isEnginePath = parts.length >= 3 && engineCategories.includes(parts[0]);
+  if (isEnginePath) {
+    return (selection && selection[parts[0]] === parts[1]) ? 'active' : 'staged';
+  }
+  return 'active';
 }
 
 /** 两个生效分组（组名沿用父 spec §5.4 的措辞）。 */
@@ -321,10 +344,10 @@ export const DIRTY_GROUPS = {
 };
 
 /** 按生效性把脏条目分组（供侧栏/保存栏渲染）。 */
-export function groupDirty(dirty, selection) {
+export function groupDirty(dirty, selection, engineCategories) {
   const groups = { active: [], staged: [] };
   for (const [path, entry] of Object.entries(dirty)) {
-    const bucket = classifyDirty(path, selection);
+    const bucket = classifyDirty(path, selection, engineCategories);
     groups[bucket].push({ path, ...entry });
   }
   return groups;
@@ -335,6 +358,56 @@ export function dirtyLabel(entry) {
   const prefix = entry.kind === DIRTY_KIND.SELECT ? '[选择] '
     : entry.kind === DIRTY_KIND.SECRET ? '[密钥] ' : '';
   return `${prefix}${entry.from} → ${entry.to}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * 跨页脏状态（父 spec §4.6）
+ *
+ * 编辑缓冲（未保存的值）只活在当前页内存；跨页只能传**摘要**——脏条目路径
+ * 列表 + 计数。这两条纯函数就是摘要的形状与产出，页面拿它写 localStorage，
+ * 侧栏拿它画脏点。
+ *
+ * 为什么单独成函数而不是让页面顺手写：父 spec 的硬约束是「摘要只含路径与计数、
+ * 不含任何值」。顺手写在页面里的话，把 entry.to 也写进去是**最自然**的那行代码
+ * （反正已经有了），而密钥新值一旦落进 localStorage 就永远不可能收回。所以
+ * 这里用**白名单重建**而不是「过滤掉 from/to」——白名单漏不了后来新增的字段。
+ * ------------------------------------------------------------------------ */
+
+/** 脏摘要：只提取路径（顺带排序，跨页比对稳定）。
+ *
+ * 产出物是纯字符串数组，**没有任何值**——它是 ``localStorage`` 里唯一允许
+ * 存在的形状。
+ */
+export function dirtySummary(dirty) {
+  const paths = Object.keys(dirty || {});
+  paths.sort();
+  return { count: paths.length, paths };
+}
+
+/** 按域前缀把脏路径分桶。
+ *
+ * ``domainForPath`` 是页面注入的判据（域 → 顶层键/完整路径前缀），本模块不
+ * 内置域表——域表属于 Python 侧的字段归属（page_domains.py），在这里再抄一份
+ * 就是两把尺子，迟早分叉。
+ *
+ * @param {object} dirty computeDirty 的结果
+ * @param {(path: string) => string|undefined} domainForPath 路径 → 域 slug
+ * @returns {object} {域 slug: {count, paths:[...]}}，无脏的域**不出现**
+ */
+export function domainDirty(dirty, domainForPath) {
+  const out = {};
+  for (const path of Object.keys(dirty || {})) {
+    const domain = domainForPath(path);
+    if (!domain) continue;
+    if (!out[domain]) out[domain] = [];
+    out[domain].push(path);
+  }
+  const result = {};
+  for (const [domain, paths] of Object.entries(out)) {
+    paths.sort();
+    result[domain] = { count: paths.length, paths };
+  }
+  return result;
 }
 
 /* ---------------------------------------------------------------------------

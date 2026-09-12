@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  config_domain_page.html — 域页的静态骨架（服务端不做模板渲染）。
+
+  页面是「壳 + 一张域表 + 一棵配置树」：壳由 config_shell.py 在服务端生成，
+  域表由 page_domains.py 以 JSON 注入（见 config_handler.handle_domain_page），
+  配置值由浏览器从 api/full 拉。为什么域表走注入而不是页面里硬编码一遍：
+  字段归属是服务端已经算过的事实（父 spec §7 的机械复算），在页面里再抄一份
+  就是两把尺子；脏计数与渲染都必须数同一张表。
+
+  编辑逻辑在 config_domain_page.js（外部 ES 模块，与 config_state_model.js
+  同源），这样它和状态模型一样是可读、可 diff、无内联脚本的单文件。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>__SHELL_CSS__</style>
+<style>
+/* 域页自己的一点样式；骨架与 token 一律来自壳。 */
+.hash-flash{animation:hashFlash 1.4s ease}
+@keyframes hashFlash{0%{box-shadow:0 0 0 3px rgba(91,140,255,.5)}100%{box-shadow:none}}
+</style>
+</head>
+<body>
+__TOPBAR__
+<div class="layout">
+  <aside class="sidebar" id="sidebar">__SIDEBAR__</aside>
+  <main class="content" id="main">
+    <div class="pagehead">
+      <h1>__PAGE_ICON__ __PAGE_LABEL__</h1>
+      <div class="desc" id="pageDesc">__PAGE_DESC__</div>
+    </div>
+    <div id="domainBody">__BODY__</div>
+  </main>
+</div>
+__SAVEBAR__
+<div id="dirtyPanel"></div>
+<div id="toast"></div>
+
+<!-- 域表：服务端注入（page_domains.py 的 JSON 形态），页面不硬编码字段归属 -->
+<script id="domain-schema" type="application/json">__SCHEMA_JSON__</script>
+<!--
+  路径写**绝对**前缀，不用 ``./config_domain_page.js``：
+  规范 URL 是 ``/xiaozhi/config/<slug>/``（目录形式），相对路径会解析成
+  ``/xiaozhi/config/<slug>/config_domain_page.js``，多一级 slug 段。
+  脚本与状态模型都在上一层——两页共用同一份，连路径也要表现得像同一份。
+-->
+<script type="module" src="/xiaozhi/config/config_domain_page.js"></script>
+<script>__SHELL_JS__</script>
+<script>__PAGE_JS__</script>
+</body>
+</html>
