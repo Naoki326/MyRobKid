@@ -35,6 +35,8 @@
   - ending_played_flag_consistent   played=0 的收场只能是 start_failed
   - ending_feedback_matches_reason  每条收场都配上对的提示音与屏幕文案
   - ending_cues_are_distinguishable 自然播完与链路中断的音必须不同、都不静音
+  - warning_screens_are_distinguishable  共用告警音的收场（链路中断 / 续播失败）
+                                    屏幕文案必须不同（音一样，屏再一样就分不开）
   - user_stop_never_warns           用户主动停止/换歌一律无声（硬不变量）
   - pause_is_not_an_ending          暂停跨度里不该出现收场锚点（按钮打断只是暂停）
   - playback_returns_interactive    收场后唤醒词恢复 / 回到 Listening
@@ -156,7 +158,10 @@ _CLOCK_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 ENDING_FEEDBACK = {
     "completed": ("success", "ended"),
     "interrupted": ("alert", "interrupted"),
-    "resume_failed": ("alert", "interrupted"),
+    # 续播失败与链路中断**共用同一个告警音**（用户听得出「出事了」，分不出是
+    # 哪一种），屏幕才是把它们分开的地方（issue #12）：`resume_failed` 是「再点
+    # 一次」，`interrupted` 是「查网络/上游」。两行屏幕文案必须不同。
+    "resume_failed": ("alert", "resume_failed"),
     "stopped": ("none", "stopped"),
     "replaced": ("none", "none"),
     "start_failed": ("none", "none"),
@@ -1059,6 +1064,21 @@ def _add_ending_assertions(add, endings, feedbacks, expect_ending, events, marke
         add("ending_cues_are_distinguishable",
             done != broken and done != "none" and broken != "none",
             f"自然播完 sound={done}，链路中断 sound={broken}（必须不同且都不是静音）")
+
+        # 续播失败与链路中断共用 `alert` 音——它们的分辨出口只有屏幕（issue
+        # #12）。这条卡对照表本身：两条的 screen 一旦被写成同一个值，「续播失败
+        # 看得见」就退化成「跟中断长得一样」，而上面那条（音不同）照样绿。
+        warn_cue = ENDING_FEEDBACK["interrupted"][0]
+        warn_screens = {ENDING_FEEDBACK[name][1]
+                        for name in ("interrupted", "resume_failed")
+                        if ENDING_FEEDBACK[name][0] == warn_cue}
+        add("warning_screens_are_distinguishable",
+            len(warn_screens) == len([n for n in ("interrupted", "resume_failed")
+                                      if ENDING_FEEDBACK[n][0] == warn_cue])
+            and "none" not in warn_screens,
+            "共用告警音的收场屏幕文案：" + ", ".join(
+                f"{n}={ENDING_FEEDBACK[n][1]}"
+                for n in ("interrupted", "resume_failed")))
 
         # 用户主动停止 / 换歌：绝不报故障音——也不能报「放完了」的喜庆音。
         noisy = [f"{f['feedback']['reason']}(sound={f['feedback']['sound']})"

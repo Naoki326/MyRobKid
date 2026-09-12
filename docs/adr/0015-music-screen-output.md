@@ -37,7 +37,7 @@ idle 分支不再无条件 `ClearChatMessages()`——音乐会话仍在（`IsMu
 同一个取舍：**曲目是用户唯一能看见的「它在放」凭据**（工具与日志他都看不见），不该因为无关的界面动作消失。
 
 **4. 四类写屏走同一个 helper，形态与遥测只有一个出口。**
-`ShowMusicScreen(action, text, owns, facts?)`：写消息区、置归属权、递增写屏序号、打锚点行。四个动作为 `now-playing`（起播/续播）、`repaint`（有东西要覆写/清空消息区而音乐还握着它 → 重画，决策 3 的四条路径）、`end-state`（收场文案，`#7` 的三种）、`skip`（无文案的清空 + 交还所有权）。#7 的结束态写屏改为经这个 helper——语义不变（仍是「写一次、位置在 `SetDeviceState` 之后」）。
+`ShowMusicScreen(action, text, owns, facts?)`：写消息区、置归属权、递增写屏序号、打锚点行。四个动作为 `now-playing`（起播/续播）、`repaint`（有东西要覆写/清空消息区而音乐还握着它 → 重画，决策 3 的四条路径）、`end-state`（收场文案，`#7` 的三种 + issue #12 的 `续播失败`）、`skip`（无文案的清空 + 交还所有权）。#7 的结束态写屏改为经这个 helper——语义不变（仍是「写一次、位置在 `SetDeviceState` 之后」）。
 
 决策 3 的四条路径经 `RepaintOrClearMusicScreen(clear_fn)` 收口：它们只贡献自己的**清屏动作**（回调），归属权判断与交还由 helper 统一做。为什么清屏动作不一起收进来——**清屏 API 因显示变体而异**：LCD 的 `SetChatMessage("", "")` 在气泡变体里会留残影，`ClearChatMessages()` 才是对的；而 OLED/Emote 根本没重写 `ClearChatMessages()`（基类是空实现），只有 `SetChatMessage("", "")` 有效。硬统一会在这两类屏上弄出残留或静默失效。
 

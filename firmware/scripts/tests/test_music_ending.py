@@ -56,6 +56,11 @@ static const char* CueName(MusicCue cue) {
     return "?";
 }
 
+/* 屏幕文案锚点的值 → 字面量（`Music feedback:` 的 screen= 字段）。 */
+static const char* ScreenName(MusicEndingScreen screen) {
+    return MusicEndingScreenName(screen);
+}
+
 /* 名字 → 结局的查表只属于测试：固件从不解析这个名字（它只输出）。 */
 static bool LookupEnding(const char* name, MusicEnding* out) {
     if (strcmp(name, "completed") == 0) *out = MusicEnding::kCompleted;
@@ -100,7 +105,15 @@ int main(int argc, char** argv) {
         WritePositionField(atof(argv[2]), strcmp(argv[3], "live") == 0,
                            have_position, buf, sizeof(buf));
         printf("%s", buf);
-    } else if (op == "cue" || op == "failure" || op == "name") {
+    } else if (op == "screens") {
+        printf("%s %s %s %s %s %s",
+               MusicEndingScreenName(MusicEndingScreenOf(MusicEnding::kCompleted)),
+               MusicEndingScreenName(MusicEndingScreenOf(MusicEnding::kInterrupted)),
+               MusicEndingScreenName(MusicEndingScreenOf(MusicEnding::kResumeFailed)),
+               MusicEndingScreenName(MusicEndingScreenOf(MusicEnding::kStopped)),
+               MusicEndingScreenName(MusicEndingScreenOf(MusicEnding::kReplaced)),
+               MusicEndingScreenName(MusicEndingScreenOf(MusicEnding::kStartFailed)));
+    } else if (op == "cue" || op == "failure" || op == "name" || op == "screen") {
         MusicEnding ending = MusicEnding::kCompleted;
         if (!LookupEnding(argc > 2 ? argv[2] : "", &ending)) {
             fprintf(stderr, "unknown ending: %s\n", argc > 2 ? argv[2] : "");
@@ -108,6 +121,7 @@ int main(int argc, char** argv) {
         }
         if (op == "cue") printf("%s", CueName(MusicEndingCue(ending)));
         else if (op == "failure") printf("%d", MusicEndingIsFailure(ending) ? 1 : 0);
+        else if (op == "screen") printf("%s", ScreenName(MusicEndingScreenOf(ending)));
         else printf("%s", MusicEndingName(ending));
     } else {
         fprintf(stderr, "unknown op: %s\n", op.c_str());
@@ -232,6 +246,48 @@ class MusicEndingHostTest(unittest.TestCase):
 
     def test_resume_failed_warns(self):
         self.assertEqual(self.run_op("cue", "resume_failed"), "warning")
+
+    # ── 屏幕文案锚点：issue #12「续播失败除提示音外还要有屏幕说明」──────
+    def test_resume_failed_has_its_own_screen_text(self):
+        """续播失败在屏幕上必须与链路中断可区分。
+
+        issue #12 的验收：续播失败走「提示音 + 屏幕说明」；父 spec 明确
+        「用户不应把续播失败听成歌放完了」，而可区分的下一步是——用户与
+        串口断言都要能分出「续播没接上」与「链路断了」。
+        """
+        self.assertNotEqual(self.run_op("screen", "resume_failed"),
+                            self.run_op("screen", "interrupted"))
+
+    def test_resume_failed_screen_differs_from_completed_too(self):
+        """对自然播完当然也要可分（issue 原文的「与自然播完都可区分」）。"""
+        self.assertNotEqual(self.run_op("screen", "resume_failed"),
+                            self.run_op("screen", "completed"))
+
+    def test_warning_endings_carry_distinct_screens(self):
+        """同一提示音（alert）的两个结局必须靠屏幕分开——音一样，屏不能一样。"""
+        screens = [self.run_op("screen", name)
+                   for name in ("interrupted", "resume_failed")]
+        self.assertEqual(len(set(screens)), 2, "两种告警收场的屏幕文案不得相同")
+        self.assertNotIn("none", screens)
+
+    def test_screen_silence_is_none_for_silent_endings(self):
+        """用户主动停止之外无声的收场不应凭空给屏幕文案。
+
+        stopped 有屏幕文案（用户要看见「已停止」），replaced/start_failed 没有
+        （屏幕归新会话 / 起播那一刻已报错）——三者与提示音分支一一对应。
+        """
+        self.assertEqual(self.run_op("screen", "replaced"), "none")
+        self.assertEqual(self.run_op("screen", "start_failed"), "none")
+        self.assertNotEqual(self.run_op("screen", "stopped"), "none")
+
+    def test_screen_names_are_stable_and_distinct(self):
+        """屏幕锚点值是遥测契约（`Music feedback: … screen=…`）：非空、无空格。"""
+        names = self.run_op("screens").split()
+        self.assertEqual(names, ["ended", "interrupted", "resume_failed",
+                                 "stopped", "none", "none"])
+        for name in names:
+            self.assertTrue(name)
+            self.assertNotIn(" ", name)
 
     def test_failure_flag_marks_real_failures_only(self):
         self.assertEqual(self.run_op("failure", "interrupted"), "1")

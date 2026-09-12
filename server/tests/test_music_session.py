@@ -109,6 +109,48 @@ class EventToState(unittest.TestCase):
                 self.assertIn("没有音乐在播放", prompt.text)
                 self.assertIn("晴天", prompt.text)
 
+    def test_resume_failed_never_reads_as_still_playing(self):
+        """续播失败后注入文本不得让模型以为「还在放」（issue #12 的硬判据）。
+
+        判别力：`_render_prompt` 若把 resume_failed 误归进 playing 分支，
+        模型就会回答「还在放着呢」——用户问「怎么没声了」得到一句假话。这里
+        正向断言「现在没有音乐在播放」出现，反向断言没有任何「正在播/已播放
+        约」这类**在播措辞**，两者缺一不可（只查「没在放」出现会被一句
+        「曾经在播」蒙过去）。
+        """
+        session = ms.MusicSession()
+        session.apply_event(event(event="started", state="playing", title="晴天",
+                                  author="周杰伦", position_s=0, duration_s=269))
+        session.apply_event(event(event="resume_failed", state="resume_failed",
+                                  title="晴天", author="周杰伦",
+                                  position_s=42, duration_s=269))
+        prompt = session.prompt()
+        self.assertEqual(prompt.state, "resume_failed")
+        self.assertIn("没有音乐在播放", prompt.text)
+        for playing_phrase in ("正在播放", "已播放约"):
+            self.assertNotIn(playing_phrase, prompt.text,
+                             f"续播失败后出现在播措辞「{playing_phrase}」——"
+                             "模型会据此说「还在放着呢」")
+        # 位点必须冻结在事件值，不得随挂钟推进（否则「越问越久」等于还在放）。
+        self.assertEqual(prompt.position_s, 42)
+        self.assertEqual(session.estimate_position(now=prompt.position_s + 999), 42)
+
+    def test_terminal_injection_texts_are_pairwise_distinct(self):
+        """四种收场的注入文本两两不同——模型据此分辨「播完/中断/续播失败/停止」。"""
+        def render(state):
+            session = ms.MusicSession()
+            session.apply_event(event(event="started", state="playing",
+                                      title="晴天", author="周杰伦",
+                                      position_s=0, duration_s=269))
+            session.apply_event(event(event=state, state=state, title="晴天",
+                                      author="周杰伦", position_s=42, duration_s=269))
+            return session.prompt().text
+        texts = {state: render(state)
+                 for state in ("completed", "interrupted", "resume_failed", "stopped")}
+        self.assertEqual(len(set(texts.values())), 4,
+                         f"收场注入文本撞了：{texts}")
+        self.assertIn("续播失败", texts["resume_failed"])
+
     def test_start_failed_has_no_playing_state(self):
         session = ms.MusicSession()
         session.apply_event(event(event="start_failed", state="start_failed",

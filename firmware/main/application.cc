@@ -1752,10 +1752,13 @@ void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result)
     // streaming to keep the TCP receive path responsive).
     audio_service_.EnableWakeWordDetection(true);
 
-    // ── 反馈（issue #7）────────────────────────────────────────
-    // 音效分支：自然播完 / 链路中断（含续播失败）各一个不同的音；用户主动
-    // 停止、换歌、起流失败都不出声。屏幕文案同理：用户主动停止要写在屏幕上
-    // 报出来，别让屏幕留着歌名（那正是读不出来的错）。
+    // ── 反馈（issue #7 / #12）─────────────────────────────────
+    // 音与屏是**两条独立的分辨轴**：提示音只分三种（放完了 / 出事了 / 安静），
+    // 屏幕分五种（issue #12 新增 `resume_failed`）。续播失败与链路中断共用
+    // 同一个故障音——用户听得出「出事了」，但分不出是哪一种；屏幕才是把两者
+    // 分开的地方（续播没接上是「再点一次」，链路断是「查网络」）。所以两个
+    // 映射各查各的，**不写成一个 switch**：合成一个就会退化成「音一样、屏也
+    // 一样」，那正是本票要消掉的事。
     const char* sound = "none";
     const char* screen_text = "none";
     const char* message = nullptr;
@@ -1767,27 +1770,45 @@ void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result)
     const std::string_view* sound_asset = nullptr;
     switch (MusicEndingCue(ending)) {
         case MusicCue::kSuccess:
-            // 自然播完：提示音 +「播放结束」。
+            // 自然播完：success.ogg。
             sound_asset = &Lang::Sounds::OGG_SUCCESS;
             sound = "success";
-            message = Lang::Strings::MUSIC_ENDED;
-            screen_text = "ended";
             break;
         case MusicCue::kWarning:
-            // 链路中断（含续播接不上）：提示音 +「播放中断」——用户不该把
-            // 「断了」听成「歌放完了」。
+            // 链路中断与续播接不上：exclamation.ogg——用户不该把「断了」听成
+            // 「歌放完了」。
             sound_asset = &Lang::Sounds::OGG_EXCLAMATION;
             sound = "alert";
-            message = Lang::Strings::MUSIC_INTERRUPTED;
-            screen_text = "interrupted";
             break;
         case MusicCue::kNone:
-            // 用户主动停止：不出声（用户自己按的，报故障音是打扰），但屏幕上
-            // 要报「已停止」——那时没有新会话接手屏幕。
-            if (ending == MusicEnding::kStopped) {
-                message = Lang::Strings::MUSIC_STOPPED;
-                screen_text = "stopped";
-            }
+            // 用户主动停止 / 换歌 / 起流失败：不出声（前两者是用户自己干的，
+            // 报故障音是打扰；起流失败在起播那一刻已报过错）。
+            break;
+    }
+    // 屏幕文案：同一张表推导（MusicEndingScreenOf），音与屏不会各自漂移。
+    // `screen_text=` 是遥测契约（`MusicEndingScreenName`），所以**从它取**，
+    // 不在这里手抄一份字面量——手抄的结局是同一个契约有两个维护点，改一处
+    // 另一处编译期不报错（由串口断言事后抓，太晚）。
+    screen_text = MusicEndingScreenName(MusicEndingScreenOf(ending));
+    switch (MusicEndingScreenOf(ending)) {
+        case MusicEndingScreen::kEnded:
+            message = Lang::Strings::MUSIC_ENDED;
+            break;
+        case MusicEndingScreen::kInterrupted:
+            // 链路中断：流没播空就断了。
+            message = Lang::Strings::MUSIC_INTERRUPTED;
+            break;
+        case MusicEndingScreen::kResumeFailed:
+            // 续播没接上（issue #12）：提示音与链路中断相同，但屏幕必须分开
+            // 说——用户听见告警音后看得见「续播失败」，知道重点一次即可；这
+            // 也让串口断言能把两个分支分开（screen=resume_failed）。
+            message = Lang::Strings::MUSIC_RESUME_FAILED;
+            break;
+        case MusicEndingScreen::kStopped:
+            // 用户主动停止：屏幕上要报「已停止」——那时没有新会话接手屏幕。
+            message = Lang::Strings::MUSIC_STOPPED;
+            break;
+        case MusicEndingScreen::kNone:
             // 换歌/起流失败：屏幕归新会话 / 起播那一刻已报过错，什么都不做。
             break;
     }

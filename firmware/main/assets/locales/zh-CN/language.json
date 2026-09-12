@@ -60,6 +60,7 @@
         "MUSIC_NOW_PLAYING": "正在播放：",
         "MUSIC_PAUSED_CONVERSATION": "已暂停（说完自动继续）：",
         "MUSIC_PAUSED_USER": "已暂停（说“继续”恢复）：",
-        "MUSIC_STOPPED": "已停止"
+        "MUSIC_STOPPED": "已停止",
+        "MUSIC_RESUME_FAILED": "续播失败"
     }
 }

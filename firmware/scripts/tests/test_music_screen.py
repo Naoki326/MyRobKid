@@ -499,5 +499,92 @@ class MusicScreenStateNameTest(MusicScreenHostTest):
                           f"{name} 不在 music_player.h 的 state_name() 里")
 
 
+class MusicEndingFeedbackStructureTest(unittest.TestCase):
+    """收场反馈的结构不变量（issue #12）：音与屏是**两条独立的分辨轴**。
+
+    为什么这条要用源码断言而不是普通行为测试：被它挡住的是「把屏幕文案重新
+    折回到 `switch (MusicEndingCue(ending))` 里」。一旦折回去，续播失败与链路
+    中断（共用同一个告警音）就会再次得到同一句屏幕文案——音不变、屏也一样，
+    两者用户与串口都分不开。而单看任一分支的行为测试都发现不了：两边「各自
+    工作正常」，缺陷在「两者是否相同」这一层，正是 ADR-0014 决策 3 折叠那次
+    留下的坑。
+
+    判据：屏幕文案的赋值必须落在以 `MusicEndingScreenOf` 为条件的 switch 内
+    （而不是 cue 的那个 switch）。
+    """
+
+    CC = Path(__file__).resolve().parents[2] / "main" / "application.cc"
+
+    def setUp(self):
+        self.source = self.CC.read_text(encoding="utf-8")
+        self.lines = self.source.splitlines()
+
+    def test_screen_text_comes_from_the_single_source(self):
+        """`screen_text` 必须取自 `MusicEndingScreenName`，不得手抄字面量。
+
+        为什么单钉这一条：``screen_text=`` 是遥测契约（``Music ended:`` /
+        ``Music feedback:`` 的 ``screen=`` 字段），而它已经有一份规范的映射。
+        在 switch 里手抄一份字面量，等于同一个契约两个维护点——改一处、另一
+        处在**编译期**不报错，只能靠串口断言事后抓。
+        """
+        assigns = [i for i, line in enumerate(self.lines)
+                   if line.strip().startswith("screen_text =")
+                   and "const char* screen_text" not in line]
+        self.assertEqual(
+            len(assigns), 1,
+            f"screen_text 应恰好一处赋值（取自唯一映射），实际 {assigns}")
+        line = self.lines[assigns[0]]
+        self.assertIn("MusicEndingScreenName(", line,
+                      "screen_text 必须取自 MusicEndingScreenName，而不是"
+                      f"手抄字面量：{line.strip()}")
+        self.assertIn("MusicEndingScreenOf(", line,
+                      "应从 ending 推导（同一张表），不要另接一条取值路径")
+
+    def test_screen_names_are_not_inlined_in_the_switch(self):
+        """屏幕 switch 体内不得出现 ``screen_text = "…"`` 字面量。
+
+        把选择器内联回每个 case 是最省事的退步写法（也是本票要防的「音一样、
+        屏也一样」的温床）；单源化之后这里应当一条都搜不到。
+        """
+        guard = [i for i, line in enumerate(self.lines)
+                 if "switch (MusicEndingScreenOf(ending))" in line]
+        self.assertEqual(len(guard), 1, f"应恰好一处屏幕 switch，实际 {guard}")
+        end = next(i for i in range(guard[0] + 1, len(self.lines))
+                   if self.lines[i].rstrip() == "    }")
+        body = "\n".join(self.lines[guard[0]:end])
+        self.assertNotIn(
+            'screen_text = "', body,
+            "屏幕 switch 里出现了手抄的 screen_text 字面量——应改走"
+            " MusicEndingScreenName（遥测契约只有一处维护点）")
+
+    def test_screen_text_is_chosen_by_ending_not_by_cue(self):
+        """屏幕 switch 必须排在提示音 switch 之后（两个轴各自成 switch）。"""
+        cue_switch = [i for i, line in enumerate(self.lines)
+                      if "switch (MusicEndingCue(ending))" in line]
+        self.assertEqual(len(cue_switch), 1, "应恰好一处按提示音挑分支的 switch")
+        screen_switch = [i for i, line in enumerate(self.lines)
+                         if "switch (MusicEndingScreenOf(ending))" in line]
+        self.assertEqual(len(screen_switch), 1, "应恰好一处按结局挑屏幕文案的 switch")
+        self.assertGreater(screen_switch[0], cue_switch[0],
+                           "屏幕文案应排在提示音 switch 之后（两个轴不合并）")
+
+    def test_cue_switch_assigns_no_screen_text(self):
+        """`case MusicCue::kWarning:` 里不得再出现屏幕文案赋值。
+
+        把两种告警收场的屏幕文案合成一条的最省事写法，就是在这个 case 里
+        顺手 `screen_text = "interrupted"`——这里会当场抓住。
+        """
+        lines = self.lines
+        cue_switch = next(i for i, line in enumerate(lines)
+                          if "switch (MusicEndingCue(ending))" in line)
+        # cue switch 体：从 guard 到下一个同级 `    }` 为止。
+        end = next(i for i in range(cue_switch + 1, len(lines))
+                   if lines[i].rstrip() == "    }")
+        body = "\n".join(lines[cue_switch:end])
+        self.assertNotIn("screen_text =", body,
+                         "提示音 switch 里不得挑屏幕文案——屏是另一条分辨轴，"
+                         "折回来会让续播失败与链路中断的屏幕文案再次相同")
+
+
 if __name__ == "__main__":
     unittest.main()

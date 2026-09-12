@@ -24,6 +24,8 @@
 **3. 提示音与屏幕文案按结局分派，三种收场各有其形。**
 自然播完 → `OGG_SUCCESS` + 「播放结束 / Playback finished」；链路中断与续播失败 → `OGG_EXCLAMATION` + 「播放中断 / Playback interrupted」；用户主动停止 → **无声** + 「已停止 / Stopped」；换歌与起流失败 → 无声无屏（屏幕归新会话 / 起播那一刻已报过错）。复用既有音效资源（`success.ogg` / `exclamation.ogg`），不新增。
 
+> **后续修订（issue #12）**：本决策把「链路中断」与「续播失败」的**屏幕文案**也折叠成同一条（都写「播放中断」）。issue #12 要求续播失败「走可辨提示音 + 屏幕说明」，并把它变成可断言的独立分支——两者已改为**音相同、屏分开**：续播失败写「续播失败 / Resume failed」（`MUSIC_RESUME_FAILED`），屏幕锚点值是 `screen=resume_failed`。理由：告警音只能告诉用户「出事了」，链路断是「查网络」、续播失败是「再点一次」，两者给用户的下一步不同；音一样的时候，屏幕是**唯一**的分辨出口。两张映射（`MusicEndingCue` / `MusicEndingScreenOf`）仍从同一张 `EndingTraits` 表推导，音与屏不会各自漂移。
+
 **4. 屏幕文案与提示音都在状态转换之后落地。**
 进 `kDeviceStateListening` 时两件事会吃掉先写的内容：`idle` 分支会 `ClearChatMessages()`（抹屏幕），Realtime 聆听模式下 `StartListeningAudio()` 会 `EnableVoiceProcessing(true)` → `ResetDecoder()`（清 decode 队列，连刚入队的提示音一起）。因此**发声与写屏都放在 `Schedule()` 的 lambda 里、`SetDeviceState` 之后**——主循环同一轮先处理 `STATE_CHANGED` 再处理 `SCHEDULE`；AutoStop 模式下转态本身还有 `IsPlaybackIdle()` 闸门，提示音先播完才开聆听，正是想要的顺序。
 
@@ -31,13 +33,13 @@
 `ending == kReplaced || IsMusicBusy()` → 打 `skipped=new_session` 后立即返回，不碰省电档、唤醒词与屏幕。（原实现仅靠 `!IsMusicBusy()`；有了 `kReplaced` 之后判断由原因给出，忙碌判据保留用于兜住旧 worker 的陈旧回调。）
 
 **6. 收场原因进遥测，声音分支不靠耳朵验。**
-播放器（`MusicPlayer`）：`Music ended: reason=<name> played=0|1 pos=<x.y>s|live url=…`（真故障走 `ESP_LOGE`）；应用（`Application`）：`Music feedback: reason=<name> pos=… sound=<success|alert|none> screen=<ended|interrupted|stopped|none> wake_word=<on|off> interactive=<scheduled|already|wake_word_only|none>`，换歌为 `Music feedback: reason=… pos=… skipped=new_session`。结局名（`completed/interrupted/resume_failed/stopped/replaced/start_failed`）是遥测契约，两两不同、非空、无空格。
+播放器（`MusicPlayer`）：`Music ended: reason=<name> played=0|1 pos=<x.y>s|live url=…`（真故障走 `ESP_LOGE`）；应用（`Application`）：`Music feedback: reason=<name> pos=… sound=<success|alert|none> screen=<ended|interrupted|resume_failed|stopped|none> wake_word=<on|off> interactive=<scheduled|already|wake_word_only|none>`，换歌为 `Music feedback: reason=… pos=… skipped=new_session`。结局名（`completed/interrupted/resume_failed/stopped/replaced/start_failed`）是遥测契约，两两不同、非空、无空格。
 
-`tools/serial_telemetry.py` 据此新增 `--expect-ending <reason>`（可重复/逗号分隔）与九条断言：`ending_reason_recorded`（原因在已知六种内）、`ending_played_flag_consistent`（`played=0` 只能是 `start_failed`）、`ending_has_feedback`、`ending_feedback_matches_reason`（逐条比对照表）、`ending_cues_are_distinguishable`（两种音必须不同且都不静音）、`user_stop_never_warns`（硬不变量）、`pause_is_not_an_ending`（暂停跨度内不得出现收场锚点）、`playback_returns_interactive`、`ending_expected_seen`（`--expect-ending` 时）。**这些断言只在抓到收场锚点时出现**——issue #3/#4 那套位点核验不受影响；反过来，一次根本没出声的抓取（起流失败：没有起流锚点也没有位点）会走 `position_checks_not_applicable` 提前收尾，不会用五条必然失败把真结论淹掉。
+`tools/serial_telemetry.py` 据此新增 `--expect-ending <reason>`（可重复/逗号分隔）与九条断言：`ending_reason_recorded`（原因在已知六种内）、`ending_played_flag_consistent`（`played=0` 只能是 `start_failed`）、`ending_has_feedback`、`ending_feedback_matches_reason`（逐条比对照表）、`ending_cues_are_distinguishable`（两种音必须不同且都不静音）、`warning_screens_are_distinguishable`（共用告警音的收场屏幕文案必须不同，issue #12 新增）、`user_stop_never_warns`（硬不变量）、`pause_is_not_an_ending`（暂停跨度内不得出现收场锚点）、`playback_returns_interactive`、`ending_expected_seen`（`--expect-ending` 时）。**这些断言只在抓到收场锚点时出现**——issue #3/#4 那套位点核验不受影响；反过来，一次根本没出声的抓取（起流失败：没有起流锚点也没有位点）会走 `position_checks_not_applicable` 提前收尾，不会用五条必然失败把真结论淹掉。
 
 ## 为什么把纯逻辑单独拆一个文件
 
-`music_ending.{h,cc}` 一个头文件都不引（连 `<cstddef>` 都不用），不含 ESP 头。收益是这条最容易错、又最只能靠耳朵发现的映射（音效分派）变成**宿主编译可测**的纯函数：`firmware/scripts/tests/test_music_ending.py` 把六个结局的推导、优先级边角（`replaced` 压过一切、`drained` 压过 `cancelled`、`cancelled` 压过 `attempted_restart`）、名字唯一性、以及「用户停永不报警」逐条钉住。Lang 字符串与屏幕输出留在 `application.cc`（依赖设备资源），不往这个文件里拉。
+`music_ending.{h,cc}` 一个头文件都不引（连 `<cstddef>` 都不用），不含 ESP 头。收益是这条最容易错、又最只能靠耳朵发现的映射（音效分派）变成**宿主编译可测**的纯函数：`firmware/scripts/tests/test_music_ending.py` 把六个结局的推导、优先级边角（`replaced` 压过一切、`drained` 压过 `cancelled`、`cancelled` 压过 `attempted_restart`）、名字唯一性、屏幕文案锚点值的唯一性（issue #12）、以及「用户停永不报警」逐条钉住。Lang 字符串与屏幕输出留在 `application.cc`（依赖设备资源），不往这个文件里拉。
 
 ## Consequences
 

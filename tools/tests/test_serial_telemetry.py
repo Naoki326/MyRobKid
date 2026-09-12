@@ -908,6 +908,37 @@ class EvaluateEndings(unittest.TestCase):
         self.assertTrue(self.result(done, "ending_feedback_matches_reason").ok)
         self.assertTrue(self.result(broken, "ending_feedback_matches_reason").ok)
 
+    def test_resume_failed_screen_is_distinguishable_from_interrupted(self):
+        """续播失败与链路中断：音相同，屏幕必须分开（issue #12 的核心）。
+
+        判别力：两者共用一个 `alert` 音（用户听得出「出事了」），所以「听得出来」
+        这句话对它们不成立——屏幕是唯一的分辨出口。若对照表把 resume_failed 的屏
+        幕写成 `interrupted`，这条必须变红。
+        """
+        self.assertNotEqual(serial_telemetry.ENDING_FEEDBACK["resume_failed"][1],
+                            serial_telemetry.ENDING_FEEDBACK["interrupted"][1],
+                            "两种告警收场的屏幕文案不得相同——音一样，屏再一样就分不开了")
+        ok = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("resume_failed", 1, 42.0, url="http://h/s"),
+            feedback_line("resume_failed", 42.0, "alert", "resume_failed")))
+        self.assert_all_ok(ok)
+        self.assertTrue(self.result(ok, "warning_screens_are_distinguishable").ok)
+
+    def test_resume_failed_with_interrupted_screen_text_fails(self):
+        """续播失败却写成 `interrupted`：屏幕看不出是哪一种，判为未核对上。
+
+        这是「有人把本票的改动回退、把两种收场的屏幕又合成一条」时会出现的真错。
+        """
+        results = serial_telemetry.evaluate_capture(ending_capture(
+            ending_line("resume_failed", 1, 42.0, url="http://h/s"),
+            feedback_line("resume_failed", 42.0, "alert", "interrupted")))
+        self.assertFalse(self.result(results, "ending_feedback_matches_reason").ok)
+
+    def test_resume_failed_keeps_the_shared_warning_tone(self):
+        """音仍与链路中断相同（issue #12 不要求它俩音不同）——免得有人顺手改音。"""
+        self.assertEqual(serial_telemetry.ENDING_FEEDBACK["resume_failed"][0],
+                         "alert")
+
     def test_wrong_tone_for_reason_fails(self):
         # 播完了却放故障音：逐条比对照表，不是只看「有反馈」。
         results = serial_telemetry.evaluate_capture(ending_capture(

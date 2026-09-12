@@ -28,6 +28,26 @@ enum class MusicCue {
     kWarning,  // 出故障了（exclamation.ogg）
 };
 
+/*
+ * 会话收场在屏幕上该写哪句（issue #12）。
+ *
+ * 为什么与 MusicCue 分开：音与屏是两条不同的分辨轴。链路中断与续播失败共用
+ * 同一个故障音（用户听得出「出事了」，但听不出是哪一种），屏幕才是把两者分开
+ * 的地方——续播没接上是「刚才那首接不上了，再点一次」，链路断是「网络/上游出
+ * 问题」，两种给用户的下一步不同。故提示音只有三态，屏幕文案有五种。
+ *
+ * kNone 表示「这次收场不写屏」：换歌（屏幕归新会话）与起流失败（起播那一刻已
+ * 经报过错）都不该在这里再写一句。用户主动停止（kStopped）**有**文案——那时
+ * 没有新会话接手屏幕，不报就会留着一个已经过时的歌名。
+ */
+enum class MusicEndingScreen {
+    kNone,          // 不写屏（换歌 / 起流失败）
+    kEnded,         // 「播放结束」
+    kInterrupted,   // 「播放中断」
+    kResumeFailed,  // 「续播失败」——与 kInterrupted 可区分（本票的核心）
+    kStopped,       // 「已停止」
+};
+
 // 会话结束时能观察到的事实。由播放器在 worker 退出前填好——那时会话状态还未
 // 被下一次 Start() 覆盖。
 struct MusicEndingFacts {
@@ -52,6 +72,15 @@ const char* MusicEndingName(MusicEnding ending);
 
 // 该不该出声、出哪个声。
 MusicCue MusicEndingCue(MusicEnding ending);
+
+// 该不该写屏、写哪一句（issue #12）。与 MusicEndingCue 同一张表推导——
+// 两个映射同源，不会各自漂移（「音说没事、屏说有事」在语法上不可能）。
+MusicEndingScreen MusicEndingScreenOf(MusicEnding ending);
+
+// 屏幕文案锚点的值（`Music feedback: … screen=…`）：
+// `ended|interrupted|resume_failed|stopped|none`。两两不同、非空、无空格；
+// 改动等于改遥测格式。
+const char* MusicEndingScreenName(MusicEndingScreen screen);
 
 // 把位点写进 `pos=` 字段。三种取值，缺一不可：
 //   live=true            → "live"（直播流没有「位点」这个概念）
