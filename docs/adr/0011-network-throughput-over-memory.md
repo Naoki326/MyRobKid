@@ -84,8 +84,11 @@ OTA 与内容下载时，屏幕上的进度数字封顶在 20KB/s 上下；音�
 ## 实施进度
 
 - **2026-09-12：配置层（第 1 项）已落地，等待设备实测验收。** 固件 2.4.24 构建通过，产物 3,491,328 字节。契约测试 `firmware/scripts/tests/test_network_throughput_defaults.py` 已随配置一起入库（5 个用例，纯逻辑、不碰设备）。组件层（第 2 项）与基线层（第 3 项）未动。
-- **配置层改动的取证口径**：`sdkconfig` 由 `scripts/build.py zhengchen/minicam --name zhengchen-minicam` 重新生成（**不可裸跑 `idf.py reconfigure`**——那会丢掉板卡身份与寻址，已实测会把 `CONFIG_OTA_URL` 掉回官方云地址）。重新生成后的语义 diff 只有两组：本次吞吐项，以及一组**预存漂移**——`CONFIG_EMOTE_DEF_BG_COLOR/FONT_COLOR` 入库值是黑底白字（`0x000000/0xFFFFFF`），重新生成后回到板卡预设的米色底黑字（`0xC2B280/0x000000`），与 `main/boards/zhengchen/minicam/config.json` 一致。该漂移先于本 ADR 存在，本次顺带修正，需在设备上确认屏幕配色符合预期。
+- **配置层改动的取证口径**：`sdkconfig` 由 `scripts/build.py zhengchen/minicam --name zhengchen-minicam` 重新生成（**不要裸跑 `idf.py reconfigure`**——详见 ADR-0002 的「2026-09-12：地址兜底与板卡身份归位」：真正的风险窗口是新 build 目录或 `fullclean` 之后，那里会同时丢掉板卡身份与寻址）。重新生成后的语义 diff 只有两组：本次吞吐项，以及一组**预存漂移**——`CONFIG_EMOTE_DEF_BG_COLOR/FONT_COLOR` 入库值是黑底白字（`0x000000/0xFFFFFF`），重新生成后回到板卡预设的米色底黑字（`0xC2B280/0x000000`），与 `main/boards/zhengchen/minicam/config.json` 一致。该漂移先于本 ADR 存在，本次顺带修正，需在设备上确认屏幕配色符合预期。
+- **2026-09-12 补充：Kconfig 兜底修复不改变 `sdkconfig` 内容。** 同日修掉的上游官方云兜底（`main/Kconfig.projbuild` 的 `OTA_URL` 默认值，见 ADR-0002）修改后重跑 `build.py`，生成的 `sdkconfig` 与修改前**逐字节一致**。原因是 `sdkconfig` 记录的是**已定值**而非默认值：板卡预设已把 `CONFIG_OTA_URL` 设成自建地址，解析结果与无论哪一种默认值都相同。**Kconfig 默认值只在预设缺席时才起作用**（新 build 目录、`fullclean` 之后）。这也意味着该修复的收益无法在 `sdkconfig` 的 diff 里看到，只能由 `test_device_addressing.py` 的断言与干净环境重配置验证（ADR-0002 已留表）。实施时不看到 diff 属于正常现象，不是修复没生效。
 - **待办**：配置层上机测吞吐；通过后再做组件层（收编上游网络组件），两层不得混在一次 OTA 里。
+
+- **待办**：配置层上机测吞吐；通过后再做组件层（收编上游网络组件），两层不得混在一次 OTA 里。验收用自测入口（基线层，尚未实现）取均值而非屏幕瞬时值。
 
 ## 附：术语
 
