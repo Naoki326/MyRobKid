@@ -158,15 +158,19 @@ details>div{padding:12px 14px}
   <button class="btn danger" onclick="restartServer()">♻️ 重启服务生效</button>
   <span class="info" id="saveInfo">暂无未保存修改</span>
 </div>
+<!-- 脏标记明细：按生效性分两组（父 spec §5.4），随选中实时重算 -->
+<div id="dirtyPanel" style="position:fixed;bottom:64px;left:220px;right:0;padding:0 32px 8px;font-size:12px;z-index:49"></div>
 
 <div id="toast"></div>
 
-<script>
-'use strict';
+<!-- type="module"：页面状态模型是外部 ES 模块（config_state_model.js，无 DOM 依赖，
+     用 node:test 单跑）。模块作用域默认严格模式，函数声明仍是全局可用的
+     （内联 onclick 能调到 switchGroup/saveAll 等）。 -->
+<script type="module">
 const $ = id => document.getElementById(id);
 let CONFIG = null;
 let state = {};
-let dirtyPaths = new Set();
+/** 当前脏条目（路径 → {kind, from, to}），由状态模型算出。 */
 const GROUPS = [
   { id:'server',   label:'服务器 / 连接', icon:'🌐' },
   { id:'role',     label:'角色与对话',   icon:'🎭' },
@@ -184,7 +188,6 @@ function toast(msg, type='') {
   clearTimeout(t._h); t._h = setTimeout(() => t.className = '', 2600);
 }
 function deepClone(o){ return JSON.parse(JSON.stringify(o)); }
-function deepEqual(a,b){ return JSON.stringify(a) === JSON.stringify(b); }
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function getPath(obj, path){ return path.split('.').reduce((o,k)=> o==null?undefined:o[k], obj); }
 function setPath(obj, path, val){
@@ -192,14 +195,73 @@ function setPath(obj, path, val){
   for (let i=0;i<parts.length-1;i++){ if (typeof cur[parts[i]]!=='object'||cur[parts[i]]===null) cur[parts[i]]={}; cur = cur[parts[i]]; }
   cur[parts[parts.length-1]] = val;
 }
-const SENSITIVE_RE = /^(api_key|access_token|secret_key|secret_id|app_secret|token|password|authorization|auth_key|personal_access_token|api_secret|private_key)$|(_key|_secret|_token)$/i;
-function isMasked(val){ return typeof val==='string' && /^.{0,4}\*{4}.{0,4}$/.test(val); }
+/* 敏感字段判定已移到状态模型（isSensitiveKey）——键名一把尺，
+   与元信息表共用。页面不再用正则猜掩码形态（那两个显示 bug 的根因）。 */
 
-/* 字段元信息：给自动渲染的引擎参数配上中文标签、说明与可选项 */
+/* ---------- 状态模型：无 DOM 依赖的纯模块（server/config/config_state_model.js） ----------
+ * 敏感判定 / 初始状态 / 脏计算 / 生效分组住在那边，用 node:test 单跑。
+ * 页面只做渲染 —— 把「显示值 ≠ 配置里存在的值」这条陷阱挡在状态模型里。
+ */
+import {
+  RUNTIME_DEFAULT_PATHS, computeDirty, dirtyLabel, effectiveDefault,
+  groupDirty, initialState, isSensitiveKey, placeholderText,
+  setSecretInput,
+} from './config_state_model.js';
+
+/* 服务端给的存在信号：路径 → {configured}。密钥三态的唯一判据来源，
+   绝不用正则猜掩码形态（那是两个同源显示 bug 的根因）。 */
+let CONFIG_STATE = {};
+/* 页面状态模型实例（初始状态 + 编辑动作）。 */
+let PAGE = null;
+
+/* 密钥控件的当前输入（路径 → 用户敲进去的新值；空串 = 保持原值）。 */
+const SECRET_INPUT = {};
+
+/* ---------- 声明式元信息表（键路径模式 → 元信息） ----------
+ * 与配置键**解耦**：树上有什么键就渲染什么，未知键默认文本框；
+ * 元信息只决定中文标签 / 说明 / 控件类型 / 可选项，决定不了「渲不渲染」。
+ * 新增引擎块（如本机自加的 Mlx*TTS）零成本获得渲染。
+ * 键格式：精确路径，或末段通配 `*.reasoning_effort`。
+ */
 const FIELD_META = {
-  reasoning_effort: {
+  // ── 通用 ──
+  'type':            { label:'类型',        hint:'引擎适配器类型，一般不用改' },
+  'model_name':      { label:'模型名' },
+  'model':           { label:'模型名' },
+  'base_url':        { label:'接口地址' },
+  'url':             { label:'接口地址' },
+  'api_url':         { label:'接口地址' },
+  'ws_url':          { label:'WebSocket 地址' },
+  'output_dir':      { label:'输出目录' },
+  'voice':           { label:'音色' },
+  'voice_id':        { label:'音色 ID' },
+  'speaker':         { label:'音色' },
+  'speed':           { label:'语速',        control:'number', step:'0.05' },
+  'temperature':     { label:'温度',        control:'number', step:'0.05' },
+  'max_tokens':      { label:'最大 token 数', control:'number' },
+  'top_p':           { label:'top_p',       control:'number', step:'0.05' },
+  'top_k':           { label:'top_k',       control:'number' },
+  'appid':           { label:'应用 ID' },
+  'app_id':          { label:'应用 ID' },
+  'appkey':          { label:'AppKey' },
+  'cluster':         { label:'集群' },
+  'region':          { label:'区域' },
+  'language':        { label:'语言' },
+  'tts_timeout':     { label:'TTS 超时(秒)', control:'number' },
+  'model_dir':       { label:'模型目录' },
+  'split_sentences': { label:'逐句合成',    hint:'开启 = 边合成边下发，首包不随回复长度增长' },
+  'enable_multilingual': { label:'多语言' },
+  'end_window_size': { label:'断句窗口(ms)', control:'number' },
+  'response_format': { label:'响应格式' },
+  'sample_rate':     { label:'采样率',      control:'number' },
+  'channels':        { label:'声道数',      control:'number' },
+  'frame_duration':  { label:'帧时长(ms)',  control:'number' },
+  'ref_audio':       { label:'参考音频路径' },
+  'ref_text':        { label:'参考音频文本', control:'textarea' },
+  'reasoning_effort': {
     label: '推理级别',
     hint: '默认中：档位越高思考越久，首句语音出声越晚（实测各档位差异不大）。思考 token 计入 max_tokens，档位高时建议把 max_tokens 调大，否则可能只思考不回答。选「关闭」= 不指定档位，平台不支持真关闭时仍会思考。',
+    control: 'select',
     options: [
       { value: 'low',    label: '低 · low（最快出声）' },
       { value: 'medium', label: '中 · medium（默认）' },
@@ -211,17 +273,60 @@ const FIELD_META = {
   },
 };
 
-/* 引擎默认值：openai 类型的 LLM 未配推理级别时补 medium（页面上可见可改）。 */
-function applyLlmDefaults(cfg){
-  const llm = cfg && cfg.LLM;
-  if (llm && typeof llm === 'object'){
-    for (const eng of Object.values(llm)){
-      if (eng && typeof eng === 'object' && eng.type === 'openai' && !eng.reasoning_effort){
-        eng.reasoning_effort = 'medium';
-      }
+/** 按路径取元信息：精确路径优先，再试末段通配（`*.字段名`）。 */
+function fieldMeta(path){
+  if (FIELD_META[path]) return FIELD_META[path];
+  const bare = String(path).split('.').pop();
+  if (FIELD_META['*.' + bare]) return FIELD_META['*.' + bare];
+  if (FIELD_META[bare]) return FIELD_META[bare];
+  return {};
+}
+
+/** 渲染一个引擎/插件块：**按配置树遍历**，再补上「运行时默认值」的注入槽。
+ *
+ * 两种路径合起来才是「不撒谎的完整呈现」：
+ *   - 树上有的键 → 照实渲染（未知键默认文本框，孤儿现身）；
+ *   - 树上有而运行时会给默认值的键（如 openai 引擎的 reasoning_effort）→
+ *     显空值 + 「未设置（运行时默认 X）」+ 注入标记。
+ * 两者都不把注入值写进配置树（父 spec §5.6 显式惰性）。
+ */
+function engineFields(obj, prefix){
+  let html = treeFields(obj, prefix);
+  for (const path of injectionSlots(prefix)) html += fld(path, fieldMeta(path).label);
+  return html;
+}
+
+/** 该引擎块上「树上没有、但运行时会有默认值」的字段路径。
+ *
+ * 默认值表里存的是**模式**（`LLM.*.reasoning_effort`），这里把它实例化成
+ * 具体路径（`LLM.DoubaoLLM.reasoning_effort`）：只有前缀段匹配（`*` 吃任意一段）
+ * 才补槽位。
+ */
+function injectionSlots(prefix){
+  if (!prefix) return [];
+  const prefixParts = String(prefix).split('.');
+  const slots = [];
+  for (const pattern of Object.keys(RUNTIME_DEFAULT_PATHS)) {
+    const pp = pattern.split('.');
+    // 模式必须与“前缀 + 至少一个字段段”对得上。
+    if (pp.length !== prefixParts.length + 1) continue;
+    let ok = true;
+    for (let i = 0; i < prefixParts.length; i++){
+      if (pp[i] !== '*' && pp[i] !== prefixParts[i]) { ok = false; break; }
     }
+    if (!ok) continue;
+    const path = prefix + '.' + pp[pp.length - 1];
+    if (getPath(state, path) !== undefined) continue;  // 树上已有就不补
+    slots.push(path);
   }
-  return cfg;
+  // 注入有条件（如 openai 型引擎才享 reasoning_effort 默认值）时，条件不成立就不补。
+  const owner = getPath(state, prefix);
+  const isOpenai = owner && typeof owner === 'object' && owner.type === 'openai';
+  return slots.filter(p => {
+    const d = effectiveDefault(p);
+    if (d && d.condition === 'type=openai') return isOpenai;
+    return true;
+  });
 }
 
 /* ---------- API ---------- */
@@ -239,15 +344,31 @@ async function api(path, opts={}){
 async function init(){
   try {
     $('svcStatus').textContent = '服务运行中';
-    const meta = await api('/xiaozhi/config/api/meta');
-    const d = await api('/xiaozhi/config/api/full');
-    CONFIG = applyLlmDefaults(d.config); state = deepClone(CONFIG);
+    await api('/xiaozhi/config/api/meta');
+    await loadConfig();
     buildNav(); buildGroups(); markChanged();
   } catch(e){
     $('svcStatus').textContent = '服务异常: ' + e.message;
     document.querySelector('.status .dot').style.background = 'var(--err)';
     toast('加载失败: '+e.message, 'err');
   }
+}
+
+/** 拉取配置树 + 存在信号，重置为页面的初始状态。
+ *
+ * 注意：**不再注入引擎默认值**（旧的 applyLlmDefaults）。注入值只活在
+ * 显示层（占位符「未设置（运行时默认 X）」+ 注入标记），配置树保持诚实。
+ */
+async function loadConfig(){
+  const d = await api('/xiaozhi/config/api/full');
+  CONFIG_STATE = d.config_state || {};
+  CONFIG = d.config || {};
+  state = deepClone(CONFIG);
+  PAGE = initialState({config: CONFIG, config_state: CONFIG_STATE});
+  PAGE.selection = deepClone(CONFIG.selected_module || {});
+  PAGE.origSelection = deepClone(PAGE.selection);
+  for (const k of Object.keys(SECRET_INPUT)) delete SECRET_INPUT[k];
+  DIRTY = {};
 }
 
 function buildNav(){
@@ -401,32 +522,49 @@ async function testLLM(){
   }
 }
 
-/* ---------- 变更跟踪 ---------- */
+/* ---------- 变更跟踪 ----------
+ * 脏计算全在状态模型里（server/config/config_state_model.js）。
+ * 页面只负责把脏计数画到顶栏 + 保存栏，以及把脏条目分成两个生效组。
+ */
+let DIRTY = {};
 function markChanged(){
-  dirtyPaths = new Set();
-  collectDirty('', state, CONFIG);
-  const n = dirtyPaths.size;
+  // 页面状态 = 配置树初值 + 当前编辑值 + 密钥输入。
+  PAGE.state = state;
+  PAGE.selection = currentSelection();
+  DIRTY = computeDirty(PAGE);
+  const n = Object.keys(DIRTY).length;
   $('dirtyChip').classList.toggle('show', n>0);
   $('dirtyCount').textContent = n;
   // 保存按钮：有改动才可用；重启按钮始终可用
   $('saveBtn').disabled = n === 0;
   $('saveInfo').textContent = n > 0 ? '保存后需重启服务使配置生效' : '暂无未保存修改';
+  renderDirtyPanel();
 }
-function collectDirty(base, cur, orig){
-  for (const k of Object.keys(cur)){
-    const path = base ? base+'.'+k : k;
-    const cv = cur[k], ov = orig?.[k];
-    if (cv && typeof cv==='object' && !Array.isArray(cv) && ov && typeof ov==='object' && !Array.isArray(ov)){
-      collectDirty(path, cv, ov);
-    } else {
-      // after 仍是掩码 → 未修改；掩码换成了新值 → 算变更（保存时后端只认 after）
-      if (isMasked(cv)) continue;
-      if (!deepEqual(cv, ov)) dirtyPaths.add(path);
-    }
+
+/** 当前选中模块（从页面上真实的下拉值算，不依赖内存）。 */
+function currentSelection(){
+  const sel = {};
+  for (const cat of ['VAD','ASR','LLM','VLLM','TTS','Memory']){
+    const v = getPath(state, 'selected_module.'+cat);
+    if (v !== undefined) sel[cat] = v;
   }
-  for (const k of Object.keys(orig||{})){
-    if (!(k in cur)) dirtyPaths.add(base ? base+'.'+k : k);
-  }
+  sel.Intent = getPath(state, 'selected_module.Intent');
+  return sel;
+}
+
+/** 脏列表展示：按生效性分两组（父 spec §5.4），条目永不显示密钥值。 */
+function renderDirtyPanel(){
+  const box = $('dirtyPanel');
+  if (!box) return;
+  const groups = groupDirty(DIRTY, currentSelection());
+  const n = Object.keys(DIRTY).length;
+  if (n === 0){ box.innerHTML = ''; return; }
+  const block = (title, items) => items.length ?
+    `<div style="margin-top:8px"><b>${title}</b> · ${items.length} 条
+      ${items.map(it=>`<div style="color:var(--dim);font-size:12px">${esc(dirtyLabel(it))}</div>`).join('')}
+     </div>` : '';
+  box.innerHTML = block('重启后生效', groups.active)
+    + block('仅提前配好 · 当前不生效', groups.staged);
 }
 
 /* ---------- 分组表单生成 ---------- */
@@ -440,34 +578,62 @@ function buildGroups(){
   bindInputs();
 }
 
-/* 简单值字段 */
+/* 字段控件：元信息表决定控件类型，配置树决定「渲染什么」。
+ *
+ * 三个关键改动（父 spec §5.5 / §5.6 / §9）：
+ *   1. 敏感判定看服务端存在信号（CONFIG_STATE），**不看掩码形态**；
+ *   2. 未配置的字段显空值 + 占位符（注入默认值只活在显示层）；
+ *   3. 密钥三态在控件上可见：未配置 / 已配置 / 待替换。
+ */
 function fld(path, label, hint='', opts={}){
-  const meta = FIELD_META[path.split('.').pop()] || {};
+  const meta = fieldMeta(path);
   if (meta.label) label = meta.label;
   if (meta.hint) hint = meta.hint;
   const val = getPath(state, path);
-  const orig = getPath(CONFIG, path);
-  const masked = isMasked(orig);
-  const isSens = SENSITIVE_RE.test(path.split('.').pop()) || masked;
+  const isSens = isSensitiveKey(path);
+  // 服务端信号是密钥三态的唯一判据；信号缺失时回落看原值（不看掩码形态）。
+  const sig = CONFIG_STATE[path];
+  const configured = sig ? !!sig.configured : (val !== undefined && val !== null && val !== '');
+  const control = meta.control || (opts.nolarge ? 'text' : null);
   let ctrl;
-  if (meta.options){
-    const cur = val === undefined || val === null || val === '' ? '' : String(val);
+  if (isSens){
+    const slot = SECRET_INPUT[path] || '';
+    const badge = configured
+      ? '<span class="badge" style="background:rgba(52,211,153,.15);color:var(--ok)">已配置</span>'
+      : '<span class="badge" style="background:rgba(139,152,179,.15);color:var(--dim)">未配置</span>';
+    const replacing = slot !== ''
+      ? '<span class="badge secret-replace-mark" style="background:rgba(251,191,36,.18);color:var(--warn)">将替换</span>' : '';
+    ctrl = `${badge}${replacing}<input type="password" data-path="${path}" data-sens="1" value="${esc(slot)}"
+      autocomplete="new-password"
+      placeholder="${configured ? '已配置 · 留空不变，输入新值覆盖' : '未配置 · 输入新值'}"
+      title="敏感字段：留空保持原值，输入新值保存后覆盖">`;
+  } else if (control === 'select' && meta.options){
+    const unset = val === undefined || val === null || val === '';
+    const cur = unset ? '' : String(val);
     const known = meta.options.some(o => o.value === cur);
-    const opts = meta.options.map(o=>`<option value="${esc(o.value)}" ${o.value===cur?'selected':''}>${esc(o.label)}</option>`).join('')
-      + (known ? '' : `<option value="${esc(cur)}" selected>${esc(cur || '（未设置）')}</option>`);
-    ctrl = `<select data-path="${path}">${opts}</select>`;
+    // 未配置 + 有运行时默认值：显式惰性 —— 选项框里不预选注入值，
+    // 面一条「（未设置）」占位选项（列表里不会把这个默认值当成已选值）。
+    const inj = unset ? effectiveDefault(path) : undefined;
+    const list = (unset ? `<option value="" selected>${esc(placeholderText(PAGE.cfg, path))}</option>` : '')
+      + meta.options.map(o=>`<option value="${esc(o.value)}" ${o.value===cur?'selected':''}>${esc(o.label)}</option>`).join('')
+      + (known || unset ? '' : `<option value="${esc(cur)}" selected>${esc(cur)}</option>`);
+    ctrl = `<select data-path="${path}">${list}</select>`;
+    if (inj) ctrl += `<span class="badge" style="background:rgba(251,191,36,.15);color:var(--warn);margin-left:8px">注入</span>`;
   } else if (typeof val === 'boolean'){
     ctrl = `<label class="switch-row"><span class="switch"><input type="checkbox" data-path="${path}" ${val?'checked':''}><span class="sl"></span></span><span class="sw-label">${val?'开启':'关闭'}</span></label>`;
   } else if (typeof val === 'number'){
-    ctrl = `<input type="number" data-path="${path}" value="${val}" ${opts.step?`step="${opts.step}"`:''}>`;
-  } else if (isSens){
-    ctrl = `<input type="password" data-path="${path}" data-sens="1" value="" autocomplete="new-password" placeholder="${masked ? '已配置（掩码）· 留空不变，输入新值覆盖' : '未设置 · 输入新值'}" title="敏感字段：留空保持原值，输入新值保存后覆盖">`;
-  } else if (val === undefined || val === null || val === ''){
-    ctrl = `<input type="text" data-path="${path}" value="" placeholder="（未设置）">`;
-  } else if (typeof val === 'string' && String(val).length > 80 && !opts.nolarge){
-    ctrl = `<textarea data-path="${path}" rows="4">${esc(val)}</textarea>`;
+    ctrl = `<input type="number" data-path="${path}" value="${val}" ${meta.step?`step="${meta.step}"`:''}>`;
+  } else if (control === 'textarea' || (typeof val === 'string' && String(val).length > 80 && !opts.nolarge)){
+    ctrl = `<textarea data-path="${path}" rows="4">${esc(val ?? '')}</textarea>`;
   } else {
-    ctrl = `<input type="text" data-path="${path}" value="${esc(val)}">`;
+    // 未配置 / 未知键：默认文本框。注入默认值显示为空值 + 「未设置（运行时默认 X）」。
+    const inj = meta.control === 'select' ? null : effectiveDefault(path);
+    const ph = (val === undefined || val === null || val === '')
+      ? placeholderText(PAGE.cfg, path) : '';
+    ctrl = `<input type="text" data-path="${path}" value="${esc(val ?? '')}" placeholder="${esc(ph)}">`;
+    if (inj && (val === undefined || val === null || val === '')){
+      ctrl += `<span class="badge" style="background:rgba(251,191,36,.15);color:var(--warn);margin-left:8px">注入</span>`;
+    }
   }
   return `<div class="row">
     <div class="meta"><div class="label">${label}</div>${hint?`<div class="hint">${hint}</div>`:''}</div>
@@ -499,21 +665,27 @@ function listFld(path, label, hint=''){
   </div>`;
 }
 
-/* 嵌套引擎/插件通用字段（非敏感） */
-function engFields(obj, prefix){
+/* 嵌套引擎/插件字段：**按配置树遍历**（父 spec §9 规则 1）。
+ * 树上有什么键就渲染什么；未知键默认文本框 → 注入孤儿现身。
+ * 数组值渲染为列表编辑，对象值折叠展开。
+ */
+function treeFields(obj, prefix){
   if (!obj || typeof obj!=='object') return '';
   let html = '';
   for (const [k,v] of Object.entries(obj)){
+    const path = prefix ? prefix+'.'+k : k;
     if (v && typeof v==='object' && !Array.isArray(v)){
-      html += `<details><summary>📂 ${esc(k)}</summary><div>${engFields(v, prefix+'.'+k)}</div></details>`;
+      html += `<details><summary>📂 ${esc(k)}</summary><div>${treeFields(v, path)}</div></details>`;
     } else if (Array.isArray(v)){
-      html += listFld(prefix+'.'+k, k);
+      html += listFld(path, fieldMeta(path).label || k);
     } else {
-      html += fld(prefix+'.'+k, k);
+      html += fld(path, fieldMeta(path).label || k);
     }
   }
   return html;
 }
+/* 兼容旧调用名。 */
+const engFields = engineFields;
 
 /* 分组内容 */
 function buildGroupBody(gid){
@@ -659,10 +831,16 @@ function buildGroupBody(gid){
   return '';
 }
 
-/* 高级：全部 JSON */
+/* ---------- 高级：全部 JSON ----------
+ * 只读逃生口：显示当前页面的编辑态（含未保存改动）。敏感字段已掩码。
+ */
 function buildAdvanced(){
   return `<div class="group"><h2>📦 完整配置</h2><div class="desc">当前生效的完整配置（敏感字段已掩码）。修改请在对应分组；此处只读。</div>
     <div class="jsonbox" id="jsonView">${esc(JSON.stringify(state, null, 2))}</div></div>`;
+}
+function refreshAdvanced(){
+  const box = $('jsonView');
+  if (box) box.textContent = JSON.stringify(state, null, 2);
 }
 
 /* ---------- 交互 ---------- */
@@ -709,6 +887,28 @@ function bindInputs(){
     const path = el.dataset.path;
     const evt = el.type==='checkbox' ? 'change' : 'input';
     el.addEventListener(evt, ()=>{
+      // 敏感字段：输入不落配置树，只进密钥槽（第三态的载体）。
+      // 留空 = 保持原值，不产生任何改动。
+      if (el.dataset.sens==='1'){
+        SECRET_INPUT[path] = el.value;
+        PAGE = setSecretInput(PAGE, path, el.value);
+        // 「将替换」标记就地翻转（不重建分组，否则输入框会失焦）。
+        const slot = el.parentElement;
+        let mark = slot && slot.querySelector('.secret-replace-mark');
+        if (el.value !== ''){
+          if (!mark && slot){
+            mark = document.createElement('span');
+            mark.className = 'badge secret-replace-mark';
+            mark.style.cssText = 'background:rgba(251,191,36,.18);color:var(--warn);margin-left:6px';
+            mark.textContent = '将替换';
+            slot.insertBefore(mark, el);
+          }
+        } else if (mark){
+          mark.remove();
+        }
+        markChanged();
+        return;
+      }
       let val;
       if (el.type==='checkbox') val = el.checked;
       else if (el.type==='number') val = el.value==='' ? null : Number(el.value);
@@ -717,12 +917,14 @@ function bindInputs(){
         const lb = el.closest('.switch-row')?.querySelector('.sw-label');
         if (lb) lb.textContent = val ? '开启' : '关闭';
       }
-      // 敏感字段：清空 = 保持原值（还原为掩码/未设置），不产生变更
-      if (el.dataset.sens==='1' && val==='') val = getPath(CONFIG, path) ?? null;
       if (val === null) { const parts=path.split('.'); const p=getPath(state, parts.slice(0,-1)); delete p[parts.at(-1)]; }
+      else if (val === '') { const parts=path.split('.'); const p=getPath(state, parts.slice(0,-1)); delete p[parts.at(-1)]; }
       else setPath(state, path, val);
       markChanged();
-      if ($('jsonView')) $('jsonView').textContent = JSON.stringify(state, null, 2);
+      refreshAdvanced();
+      // 切换选中模块会改变引擎参数块的归属（脏分组也随选中实时重算），
+      // 所以要重建当前分组——否则页面显示的仍是旧选中的引擎，与脏标记矛盾。
+      if (path.startsWith('selected_module.')) rebuildGroup(currentGroup());
     });
   });
   document.querySelectorAll('[data-list]').forEach(el=>{
@@ -730,6 +932,7 @@ function bindInputs(){
       const items = getPath(state, el.dataset.list);
       items[Number(el.dataset.idx)] = el.value;
       markChanged();
+      refreshAdvanced();
     });
   });
 }
@@ -770,16 +973,23 @@ function addFunc(){
   toggleFunc(v);
 }
 
-/* ---------- 保存 ---------- */
+/* ---------- 保存 ----------
+ * 保存协议不变：仍是端到端整树 diff（before/after）。
+ * 差异是 before/after 都不再带引擎注入值（注入只活在显示层）——
+ * 未配置的 reasoning_effort 不会被当作已改值写回。
+ */
 async function saveAll(){
   try {
+    // 密钥输入：写进 after 树（服务端只认 after；掩码占位被跳过）。
+    for (const [path, val] of Object.entries(SECRET_INPUT)){
+      if (val !== '') setPath(state, path, val);
+    }
     const r = await api('/xiaozhi/config/api/save', {method:'POST', body:JSON.stringify({before:CONFIG, after:state})});
     toast(`已保存 ${r.changed||0} 处修改`, 'ok');
-    const d = await api('/xiaozhi/config/api/full');
-    CONFIG = applyLlmDefaults(d.config); state = deepClone(CONFIG);
+    await loadConfig();
     markChanged();
     rebuildGroup(currentGroup());
-    if ($('jsonView')) $('jsonView').textContent = JSON.stringify(state, null, 2);
+    refreshAdvanced();
     toast('保存成功，点击「重启服务生效」使配置生效', 'ok');
   } catch(e){ toast('保存失败: '+e.message, 'err'); }
 }
@@ -796,6 +1006,16 @@ async function restartServer(){
     }, 3000);
   } catch(e){ toast('重启失败: '+e.message, 'err'); }
 }
+
+/* ---------- 内联 onclick 的显式桥 ----------
+ * ES 模块的顶层函数声明不会自动挂到 window，而渲染出的 HTML 里用了内联
+ * onclick。这里**显式**把被引用的函数挂上去，一目了然、不靠隐式行为。
+ */
+Object.assign(window, {
+  switchGroup, saveAll, restartServer, refreshOta, rebootDevice,
+  uploadFirmware, deleteFirmware, testLLM, sendSmartConfig, autofillWifi,
+  addItem, delItem, toggleFunc, addFunc,
+});
 
 /* 首次进入 */
 (async function(){

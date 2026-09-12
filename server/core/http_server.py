@@ -93,6 +93,11 @@ class SimpleHttpServer:
                 app.add_routes(
                     [
                         web.get("/xiaozhi/config/", self.config_handler.handle_page),
+                        # 页面状态模型（无 DOM 依赖的 ES 模块，配置页 <script type="module"> 引入）
+                        web.get(
+                            "/xiaozhi/config/config_state_model.js",
+                            self.config_handler.handle_state_model,
+                        ),
                         web.post(
                             "/xiaozhi/config/api/auth",
                             self.config_handler.handle_auth,

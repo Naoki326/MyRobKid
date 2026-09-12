@@ -36,6 +36,45 @@ SENSITIVE_KEYS = {
     "api_secret", "private_key", "config_pin",
 }
 
+
+def _is_sensitive_key(key) -> bool:
+    """键名是否敏感（掩码与存在信号共用同一把尺）。
+
+    大小写不敏感：``headers.Authorization`` 与 ``authorization`` 是同一个东西，
+    漏掉大写形态会让该键在页面上从密码框降级为普通文本框。
+    """
+    if not isinstance(key, str):
+        return False
+    lowered = key.lower()
+    return (
+        lowered in SENSITIVE_KEYS
+        or lowered.endswith("_key")
+        or lowered.endswith("_secret")
+        or lowered.endswith("_token")
+    )
+
+
+def _is_placeholder_secret(value) -> bool:
+    """模板占位符（``你的xxx``）：形如密钥，但不是真值。
+
+    这是「全库密钥误判已配置」那个 bug 的根因所在：占位符与真实密钥在掩码后
+    长得一样（``********``），所以「有掩码 = 已配置」这条推理必然把占位符判成
+    已配置。存在信号必须绕开掩码形态、直接看原值。
+    """
+    return isinstance(value, str) and "你" in value
+
+
+def _is_configured_secret(value) -> bool:
+    """这个敏感键在配置里**真的有值**吗（未配置 / 占位符都算没有）。"""
+    if value is None:
+        return False
+    if not isinstance(value, str):
+        return True
+    if value == "":
+        return False
+    return not _is_placeholder_secret(value)
+
+
 # 掩码规则：保留前 4 位 + *** + 后 4 位（短值整体打码）
 def _mask_value(value):
     if not isinstance(value, str) or not value:
@@ -54,12 +93,39 @@ def _mask_tree(node):
                 out[k], _ = _mask_tree(v)
             elif isinstance(v, list):
                 out[k] = [_mask_tree(i)[0] for i in v]
-            elif k in SENSITIVE_KEYS or k.endswith("_key") or k.endswith("_secret") or k.endswith("_token"):
+            elif _is_sensitive_key(k):
                 out[k] = _mask_value(v)
             else:
                 out[k] = v
         return out, True
     return node, False
+
+
+def _secret_state(node, prefix="", out=None):
+    """遍历配置树，收集**敏感键的存在信号**（路径 → {"configured": bool}）。
+
+    与 ``_mask_tree`` 输出分离，是本票（父 spec §5.5 / §9 规则 3）的核心：
+    「配置里是否存在该键」与「掩码后的显示值」是两件事，页面判定只许用前者。
+
+    ``configured`` 的判据是**原值**（非空且非模板占位符），不是掩码形态 ——
+    这正是「密钥误判已配置」与「注入值伪装已配置」两个 bug 的修法。
+    """
+    if out is None:
+        out = {}
+    if isinstance(node, dict):
+        for k, v in node.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                _secret_state(v, path, out)
+            elif isinstance(v, list):
+                # 与 _mask_tree 保持同一遍历口径，且路径用**页面 getPath 认识的点号语义**
+                # （``context_providers.0.headers.Authorization``，不是 ``[0]``）：
+                # 信号必须能被消费方真的查到，否则等于没给。
+                for i, item in enumerate(v):
+                    _secret_state(item, f"{path}.{i}", out)
+            elif _is_sensitive_key(k):
+                out[path] = {"configured": _is_configured_secret(v)}
+    return out
 
 
 class ConfigHandler(BaseHandler):
@@ -210,7 +276,7 @@ class ConfigHandler(BaseHandler):
     # ---------------- 路由处理 ----------------
 
     async def handle_page(self, request):
-        """配置页 HTML（单文件，无外部依赖）。"""
+        """配置页 HTML（自包含，仅外链一个 ES 模块 config_state_model.js）。"""
         html_path = Path(self.project_dir) / "config" / "config_page.html"
         if not html_path.exists():
             return web.Response(text="config_page.html not found", status=404)
@@ -220,18 +286,45 @@ class ConfigHandler(BaseHandler):
             charset="utf-8",
         )
 
+    async def handle_state_model(self, request):
+        """页面状态模型（无 DOM 依赖的 ES 模块）。
+
+        页面以 ``<script type="module">`` 引入它，所以必须用 ``text/javascript``
+        返回（浏览器对模块脚本的 MIME 类型是硬校验的）。
+        """
+        js_path = Path(self.project_dir) / "config" / "config_state_model.js"
+        if not js_path.exists():
+            return web.Response(text="config_state_model.js not found", status=404)
+        return web.Response(
+            text=js_path.read_text(encoding="utf-8"),
+            content_type="text/javascript",
+            charset="utf-8",
+        )
+
     async def handle_auth(self, request):
         """兼容接口：PIN 已移除，直接放行（前端登录逻辑保留，避免改动）。"""
         return web.json_response({"ok": True})
 
     async def handle_full(self, request):
-        """完整生效配置（敏感字段掩码）。"""
+        """完整生效配置：掩码值 + 敏感字段的显式存在信号（二者分离）。
+
+        - ``config``：合并后的完整配置，敏感字段掩码（向后兼容）。
+        - ``config_state``：``{路径: {"configured": bool}}``，只对敏感键给出，
+          判据是「配置里真的有值」而不是「掩码长什么样」。
+
+        页面据此判定密钥三态（未配置 / 已配置 / 已配置但要替换），
+        不再用正则猜掩码形态 —— 那是两个同源显示 bug 的根因。
+        """
         denied = self._require_session(request)
         if denied:
             return denied
         merged = self._merged_config()
         masked, _ = _mask_tree(merged)
-        return web.json_response({"ok": True, "config": masked})
+        return web.json_response({
+            "ok": True,
+            "config": masked,
+            "config_state": _secret_state(merged),
+        })
 
     async def handle_meta(self, request):
         """元信息：用户配置路径等（无需登录）。"""
@@ -248,6 +341,9 @@ class ConfigHandler(BaseHandler):
         服务端递归对比：
         - 敏感字段掩码占位（******** 或 xxxx****）不视为变化（保留原值）；
         - 值相同不写；值不同写入 data/.config.yaml（深度合并）。
+
+        注意 ``config_state`` 只是读侧信号，保存协议不变（仍只认 before/after
+        两棵树）——保存是端到端整树 diff，不因这次改动而改变往返语义。
         """
         denied = self._require_session(request)
         if denied:
