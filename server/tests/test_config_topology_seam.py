@@ -45,9 +45,10 @@ from config import page_domains as domains  # noqa: E402
 DOMAIN_SLUGS = ["dialogue", "engine", "tools", "devices", "system"]
 ESCAPE_SLUG = "raw"
 
-#: 本票交付内容的两个域（其余三域是占位页，#27/#28/#29 交付内容）。
-IMPLEMENTED_SLUGS = ["dialogue", "system"]
-PLACEHOLDER_SLUGS = ["engine", "tools", "devices"]
+#: 本票已交付内容的域（其余两域是占位页，#28/#29 交付内容）。
+#: #26 交付 dialogue / system，#27 把 engine 从占位转正（450 字段全量可达）。
+IMPLEMENTED_SLUGS = ["dialogue", "engine", "system"]
+PLACEHOLDER_SLUGS = ["tools", "devices"]
 
 
 class DomainTopologyContract(AioHTTPTestCase):
@@ -197,12 +198,16 @@ class DomainTopologyContract(AioHTTPTestCase):
                               f"{slug} 页的侧栏缺 {target} 的入口")
             self.assertIn(f'href="/xiaozhi/config/{ESCAPE_SLUG}/"', html)
 
-    async def test_unlaunched_domains_are_marked_in_the_sidebar(self):
+    async def test_sidebar_marks_only_the_still_unlaunched_domains(self):
         html = await (await self._get("/xiaozhi/config/dialogue/")).text()
         self.assertIn("未上线", html)
-        # 标签只在侧栏里出现，恰好在三个未上线域的条目上——多一个少一个都是谎。
+        # 标签只在侧栏里出现，恰好在**仍未上线**的域条目上——多一个少一个都是谎。
+        # #27 之后 engine 已上线，它的标注必须消失；tools / devices 仍在。
         self.assertEqual(html.count('<span class="pending-tag">未上线</span>'),
                          len(PLACEHOLDER_SLUGS))
+        self.assertNotIn('data-domain="engine"><span class="ic">🤖</span>'
+                         '<span class="lbl">引擎</span><span class="pending-tag">',
+                         html, "引擎域已上线，侧栏不得再挂「未上线」标注")
 
     # ── 5. 28 个字段（对话与角色 15 + 系统 13） ──────────────────
     #

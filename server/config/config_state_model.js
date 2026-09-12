@@ -23,6 +23,17 @@ export const SENSITIVE_KEYS = [
   'api_secret', 'private_key', 'config_pin',
 ];
 
+/** 引擎域类目（六族）——**单一事实源**的前端副本。
+ *
+ * ``classifyDirty`` 靠它把「真在引擎域里的三段路径」与「域内散字段」分开：
+ * 只有真的在类目集合里的首段（``LLM.x.y``），才谈得上「选中 / 未选中」。
+ *
+ * 与 python 侧 ``page_domains.ENGINE_CATEGORIES`` 必须一致；两边不可自动化
+ * 对账（一个在浏览器、一个在服务端），所以由 HTTP 契约缝钉住：域表注入时
+ * 带上 ``engine_categories``，域页脚本把它传给状态模型——页面不自己写第三份。
+ */
+export const ENGINE_CATEGORIES = ['VAD', 'ASR', 'LLM', 'VLLM', 'TTS', 'Memory'];
+
 /** 键名是否敏感。页面与元信息表共用这把尺，不允许各自另立一套。
  *
  * 判据看**末段键名**：页面有时传完整路径（``LLM.X.api_key``）、有时传裸键名

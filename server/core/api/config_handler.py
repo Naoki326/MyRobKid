@@ -428,6 +428,11 @@ class ConfigHandler(BaseHandler):
         savebar = ""
         page_desc = domain["blurb"]
         page_icon = domain["icon"]
+        # 引擎类目（六族）随域表一起注入：``classifyDirty`` 靠它把「真在引擎域里的
+        # 路径」与「域内散字段」分开（非引擎散字段归「重启后生效」而不是「仅提前
+        # 配好」）。类目清单的单一事实源在 ``page_domains.ENGINE_CATEGORIES``，
+        # 页面不写第二份（页面里两份类目字面量就是两把尺子）。
+        engine_categories = list(page_domains.ENGINE_CATEGORIES)
         if schema is not None:
             body = ""  # 正文由 config_domain_page.js 按注入的域表渲染
             actions = (
@@ -439,13 +444,16 @@ class ConfigHandler(BaseHandler):
                 '<div class="savebar"><span class="info" id="saveInfo">'
                 '暂无未保存修改</span></div>'
             )
-            schema_json = json.dumps(asdict(schema), ensure_ascii=False)
+            schema_json = json.dumps(
+                dict(asdict(schema), engine_categories=engine_categories),
+                ensure_ascii=False)
         else:
             # 未上线域：占位正文，且**动作区不渲染**（没有可保存的对象）。
             body = shell.render_placeholder(domain)
             # 占位页不需要域表驱动的编辑，但脚本仍以空表启动（骨架同一副）。
             schema_json = json.dumps(
-                {"slug": slug, "label": domain["label"], "groups": []},
+                {"slug": slug, "label": domain["label"], "groups": [],
+                 "engine_categories": engine_categories},
                 ensure_ascii=False)
 
         html = self._fill_skeleton(
@@ -468,7 +476,8 @@ class ConfigHandler(BaseHandler):
             '<div class="jsonbox" id="rawView">正在加载…</div></section>'
         )
         schema_json = json.dumps(
-            {"slug": self._RAW_SLUG, "label": shell.RAW_ESCAPE["label"], "groups": []},
+            {"slug": self._RAW_SLUG, "label": shell.RAW_ESCAPE["label"],
+             "groups": [], "engine_categories": list(page_domains.ENGINE_CATEGORIES)},
             ensure_ascii=False)
         html = self._fill_skeleton(
             skeleton, title="小智 · 原始配置", active=self._RAW_SLUG,

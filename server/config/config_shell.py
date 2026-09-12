@@ -27,7 +27,7 @@
 DOMAINS = [
     {"slug": "dialogue", "label": "对话与角色", "icon": "🎭", "implemented": True,
      "blurb": "提示词系、唤醒/退出词、声纹身份、上下文源"},
-    {"slug": "engine", "label": "引擎", "icon": "🤖", "implemented": False,
+    {"slug": "engine", "label": "引擎", "icon": "🤖", "implemented": True,
      "blurb": "VAD/ASR/LLM/VLLM/TTS/Memory 六族 + 选择器 + 引擎全局参数"},
     {"slug": "tools", "label": "插件与工具", "icon": "🧩", "implemented": False,
      "blurb": "Intent 子树、plugins.*、外部 MCP、工具调用参数"},

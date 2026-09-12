@@ -495,3 +495,159 @@ test('系统域的改动全部落进「重启后生效」组', () => {
   assert.equal(g.active.length, 2);
   assert.equal(g.staged.length, 0, '系统域不该出现「当前不生效」的条目');
 });
+
+/* ---------------------------------------------------------------------------
+ * 10. 引擎库（issue #27，#17 原型 34/34 断言的直搬）
+ *
+ * 被钉住的是 §5.4 的一句话：**分组随 selected_module 实时重算**——切选中时
+ * 旧改动要升降级，不是保存时定死的标签。同组还钉住三条：
+ *   - `[选择]` 前缀（切换选中单独成组，它是意图陈述不是参数调整）；
+ *   - 切回原值 → 该条脏自动消失（与整树 diff 天然相容，不需要特判）；
+ *   - 未选中引擎的改动计入脏标记（§5.2：可编辑、可保存、**计入未保存修改**）。
+ *
+ * 判别力（本组最易糊弄处）：
+ *   1. 「升降级」不能只测一个方向——只测升（staged→active）会漏掉降级，而
+ *      降级才是「我改了备用引擎但没保存」那个现场；
+ *   2. 密钥三态在引擎卡上同样是三态，未配置引擎的密钥替换也必须算脏（否则
+ *      「提前配好密钥」这件事存不下来）。
+ * ------------------------------------------------------------------------ */
+
+/** 引擎库夹具：选中 ThirkingLLM，另有两条未选中的引擎（一条已配密钥，一条没配）。 */
+function engineFixture() {
+  return {
+    config: {
+      selected_module: { VAD: 'SileroVAD', ASR: 'FunASR', LLM: 'ThirkingLLM',
+                         VLLM: 'ThirkingVLLM', TTS: 'MlxKafeiStreamTTS',
+                         Memory: 'nomem' },
+      VAD: { SileroVAD: { type: 'silero', threshold: 0.5 } },
+      ASR: { FunASR: { type: 'fun_local', language: 'auto' } },
+      LLM: {
+        ThirkingLLM: { type: 'openai', max_tokens: 1024, temperature: 0.7,
+                       api_key: 'sk-a****7890' },
+        DoubaoLLM: { type: 'openai', api_key: '你的doubao web key' },
+      },
+      TTS: {
+        MlxKafeiStreamTTS: { type: 'mlx', speed: 0.75, tts_timeout: 20 },
+        EdgeTTS: { type: 'edge', voice: 'zh-CN-XiaoxiaoNeural' },
+      },
+      Memory: { nomem: { type: 'nomem' } },
+    },
+    config_state: {
+      'LLM.ThirkingLLM.api_key': { configured: true },
+      'LLM.DoubaoLLM.api_key': { configured: false },
+    },
+  };
+}
+
+/** 引擎库的起点页面。 */
+function enginePage() {
+  const p = initialState(engineFixture());
+  return { ...p,
+    selection: { ...p.cfg.selected_module },
+    origSelection: { ...p.cfg.selected_module } };
+}
+
+/** 引擎域的脏分桶器：域页把它透传给 groupDirty（类目集合来自服务端域表）。 */
+const inEngine = (path) => ENGINE_CATEGORIES.includes(path.split('.')[0])
+  || path.startsWith('selected_module.');
+
+test('同时改选中与未选中引擎：脏列表分两组，各归其位（§5.4）', () => {
+  let p = setValue(enginePage(), 'LLM.ThirkingLLM.max_tokens', 2048);
+  p = setValue(p, 'LLM.DoubaoLLM.temperature', 0.9);
+  const g = groupDirty(computeDirty(p), p.selection, ENGINE_CATEGORIES);
+
+  assert.deepEqual(g.active.map(e => e.path), ['LLM.ThirkingLLM.max_tokens'],
+    '当前选中引擎的字段 → 重启后生效');
+  assert.deepEqual(g.staged.map(e => e.path), ['LLM.DoubaoLLM.temperature'],
+    '未选中引擎的字段 → 仅提前配好 · 当前不生效');
+});
+
+test('切换选中：旧改动升入「重启后生效」，原选中引擎的改动降级（§5.4）', () => {
+  // 一边一条脏：ThirkingLLM（选中）与 DoubaoLLM（未选中）。
+  let p = setValue(enginePage(), 'LLM.ThirkingLLM.max_tokens', 2048);
+  p = setValue(p, 'LLM.DoubaoLLM.temperature', 0.9);
+  const dirty = computeDirty(p);
+  const before = groupDirty(dirty, { LLM: 'ThirkingLLM' }, ENGINE_CATEGORIES);
+  assert.deepEqual(before.staged.map(e => e.path), ['LLM.DoubaoLLM.temperature']);
+
+  // 切到 DoubaoLLM：**同一条脏在两个方向上都动了**——升一条、降一条。
+  const after = groupDirty(dirty, { LLM: 'DoubaoLLM' }, ENGINE_CATEGORIES);
+  assert.deepEqual(after.active.map(e => e.path), ['LLM.DoubaoLLM.temperature'],
+    '原「提前配好」的引擎变成选中，其改动升入「重启后生效」');
+  assert.deepEqual(after.staged.map(e => e.path), ['LLM.ThirkingLLM.max_tokens'],
+    '原选中的引擎变成未选中，其改动降级为「仅提前配好」（只测升会漏掉这一半）');
+});
+
+test('切换选中本身进 [选择] 组，前缀是 [选择]（§5.3）', () => {
+  const p = setSelection(enginePage(), 'LLM', 'DoubaoLLM');
+  const dirty = computeDirty(p);
+  const entry = dirty['selected_module.LLM'];
+  assert.ok(entry, '切换选中必须算一次脏——否则改了存不下去');
+  assert.equal(entry.kind, 'select');
+  assert.equal(dirtyLabel(entry), '[选择] ThirkingLLM → DoubaoLLM');
+  // 它同时永远是「重启后生效」组（它本身就在改写「谁生效」）。
+  const g = groupDirty(dirty, { LLM: 'DoubaoLLM' }, ENGINE_CATEGORIES);
+  assert.deepEqual(g.active.map(e => e.path), ['selected_module.LLM']);
+  assert.equal(g.staged.length, 0, '切换选中不得掉进「当前不生效」组');
+});
+
+test('切回原值：该条脏自动消失（与整树 diff 天然相容）', () => {
+  let p = setSelection(enginePage(), 'LLM', 'DoubaoLLM');
+  assert.ok(computeDirty(p)['selected_module.LLM'], '先确认它进过脏');
+  p = setSelection(p, 'LLM', 'ThirkingLLM');
+  assert.ok(!computeDirty(p)['selected_module.LLM'],
+    '切回原值 = 没改，脏条目自动消失（不需要特判「撤销」）');
+  assert.deepEqual(dirtySummary(computeDirty(p)).paths, []);
+});
+
+test('切换选中与参数改动同时在：两组各含其条，互不吞并', () => {
+  let p = setValue(enginePage(), 'TTS.EdgeTTS.voice', 'zh-CN-YunxiNeural');
+  p = setSelection(p, 'TTS', 'EdgeTTS');
+  const g = groupDirty(computeDirty(p), p.selection, ENGINE_CATEGORIES);
+  // EdgeTTS 现在既是「刚被选中」又是「刚被改了」：它的参数改动升入第一组。
+  assert.deepEqual(g.active.map(e => e.path).sort(),
+    ['TTS.EdgeTTS.voice', 'selected_module.TTS']);
+  assert.equal(g.staged.length, 0);
+});
+
+test('未选中引擎的三态密钥替换同样算脏（§5.2 + §5.5 相交处）', () => {
+  // 未配置的引擎（DoubaoLLM）填新密钥：从无到有，必须算脏，否则「提前配好
+  // 密钥」这件事存不下来——那正是「假解耦」的形状。
+  let p = setSecretInput(enginePage(), 'LLM.DoubaoLLM.api_key', 'sk-brand-new');
+  let d = computeDirty(p);
+  assert.ok(d['LLM.DoubaoLLM.api_key']);
+  assert.equal(d['LLM.DoubaoLLM.api_key'].kind, 'secret');
+  assert.equal(d['LLM.DoubaoLLM.api_key'].from, '未配置');
+  assert.equal(d['LLM.DoubaoLLM.api_key'].to, '替换为新值');
+  // 它在「仅提前配好」组（未选中引擎），但**照样在脏列表里**。
+  let g = groupDirty(d, p.selection, ENGINE_CATEGORIES);
+  assert.deepEqual(g.staged.map(e => e.path), ['LLM.DoubaoLLM.api_key']);
+
+  // 切到那条引擎：同一条脏升入「重启后生效」，仍然算脏。
+  p = setSelection(p, 'LLM', 'DoubaoLLM');
+  g = groupDirty(computeDirty(p), p.selection, ENGINE_CATEGORIES);
+  assert.ok(g.active.some(e => e.path === 'LLM.DoubaoLLM.api_key'));
+});
+
+test('引擎卡上的密钥条目永不显示值（三态都要守住）', () => {
+  const SECRET = 'sk-never-print-me-9f3a';
+  // 三态之一：未配置不动。
+  assert.equal(computeDirty(enginePage())['LLM.DoubaoLLM.api_key'], undefined);
+  // 三态之二：已配置不动。
+  assert.equal(computeDirty(enginePage())['LLM.ThirkingLLM.api_key'], undefined);
+  // 三态之三：已配置但要替换 → 算脏且不显示值。
+  const p = setSecretInput(enginePage(), 'LLM.ThirkingLLM.api_key', SECRET);
+  const entry = computeDirty(p)['LLM.ThirkingLLM.api_key'];
+  assert.equal(entry.from, '已配置（掩码）');
+  assert.ok(!JSON.stringify(entry).includes(SECRET),
+    '脏条目里出现了密钥新值——密钥永不显示值，脏列表与摘要都一样');
+  assert.ok(!JSON.stringify(dirtySummary(computeDirty(p))).includes(SECRET));
+});
+
+test('引擎域的分组重算对类目集合敏感：非引擎路径不受选中影响', () => {
+  // 引擎域页必须传类目集合；不传时 `selected_module` 之外的散字段会被旧口径
+  // 扫进 staged（那是旧页面的行为）。引擎域里散字段（tts_timeout）属 active。
+  const dirty = { tts_timeout: { kind: 'param', from: 15, to: 30 } };
+  assert.equal(classifyDirty('tts_timeout', { TTS: 'MlxTTS' }, ENGINE_CATEGORIES),
+    'active', '引擎全局参数不受某条引擎的选中影响');
+});
