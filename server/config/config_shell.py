@@ -22,14 +22,14 @@
 
 #: 五个页面域 + 逃生口（父 spec §8.1 定案的 slug）。
 #:
-#: ``implemented`` 为 False 的域本票只交付**占位页**（#27/#28/#29 才实现内容）；
+#: ``implemented`` 为 False 的域本票只交付**占位页**（#29 才实现内容）；
 #: ``raw`` 是逃生口，不出现在五域序列里，单独挂在侧栏底部横线之下。
 DOMAINS = [
     {"slug": "dialogue", "label": "对话与角色", "icon": "🎭", "implemented": True,
      "blurb": "提示词系、唤醒/退出词、声纹身份、上下文源"},
     {"slug": "engine", "label": "引擎", "icon": "🤖", "implemented": True,
      "blurb": "VAD/ASR/LLM/VLLM/TTS/Memory 六族 + 选择器 + 引擎全局参数"},
-    {"slug": "tools", "label": "插件与工具", "icon": "🧩", "implemented": False,
+    {"slug": "tools", "label": "插件与工具", "icon": "🧩", "implemented": True,
      "blurb": "Intent 子树、plugins.*、外部 MCP、工具调用参数"},
     {"slug": "devices", "label": "设备", "icon": "📟", "implemented": False,
      "blurb": "下发给设备的连接载荷、设备认证、hello 协商、摄像头入口"},

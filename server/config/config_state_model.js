@@ -7,7 +7,10 @@
  *   2. 初始状态（initialState）——api/full 的 {config, config_state} 变成页面
  *      编辑状态；默认值注入是**显式惰性**的（effectiveDefault 只活在显示层）；
  *   3. 脏计算（computeDirty）——密钥三态、选择切换单独成组、加入/删除；
- *   4. 生效分组（classifyDirty）——重启后生效 / 仅提前配好，随选中实时重算。
+ *   4. 生效分组（classifyDirty）——重启后生效 / 仅提前配好，随选中实时重算；
+ *      组件轴有两类：引擎六族（`ENGINE_CATEGORIES`）与意图分支
+ *      （`INTENT_BRANCHES`），插件的生效性则由选中分支的 `functions` 清单给出
+ *      （`toolsScope`）。三处都是「可选中/可启用组件」的同一种形状。
  *
  * 为什么抽成无 DOM 模块：父 spec §5.6 的教训是「页面显示值 ≠ 配置里存在的值」。
  * 这条陷阱只能靠**状态模型**挡住，不能靠在渲染代码里小心。模块无 DOM 依赖，
@@ -33,6 +36,14 @@ export const SENSITIVE_KEYS = [
  * 带上 ``engine_categories``，域页脚本把它传给状态模型——页面不自己写第三份。
  */
 export const ENGINE_CATEGORIES = ['VAD', 'ASR', 'LLM', 'VLLM', 'TTS', 'Memory'];
+
+/** 意图分支（`Intent.*` 的键）——**单一事实源**的前端副本。
+ *
+ * 与 python 侧 ``page_domains.INTENT_BRANCHES`` 必须一致，理由与引擎类目同源：
+ * 域表注入时带上 ``intent_branches``，域页把它交给 ``classifyDirty``。
+ * 这里的三条是空层防御（域表缺键时的回落）。
+ */
+export const INTENT_BRANCHES = ['function_call', 'nointent', 'intent_llm'];
 
 /** 键名是否敏感。页面与元信息表共用这把尺，不允许各自另立一套。
  *
@@ -312,40 +323,103 @@ function collectRemoved(orig, cur, base, out) {
  * - ``selected_module.*``             → active（它本身就在改写「谁生效」）
  * - ``CAT.name.field``，name 当前选中 → active
  * - ``CAT.name.field``，name 未选中   → staged（只是提前配好）
- * - 非引擎域的散字段（系统域 ``log.*`` / ``server.*``、对话与角色域
- *   ``prompt`` / ``voiceprint.*``…）  → active
+ * - ``Intent.<分支>.<字段>``，分支选中 → active（意图分支是「引擎」的同构物）
+ * - ``Intent.<分支>.<字段>``，分支未选中 → staged
+ * - ``plugins.<插件>.<字段>``，插件在选中分支的 functions 里 → active
+ * - ``plugins.<插件>.<字段>``，不在清单里 → staged（「未启用插件」就是这一组）
+ * - 其余散字段（系统域 ``log.*`` / ``server.*``、对话与角色域
+ *   ``prompt`` / ``voiceprint.*``、工具域 ``tool_call_timeout``…）  → active
  *
  * 最后一条不是新裁决，而是同一句话的推论：#17 把脏分两组是为了区分「重启后
- * 生效」与「仅提前配好·当前不生效」——**后者专指未选中引擎**（配好了但当前
- * 不生效的那类）。域内散字段不存在「不生效」这回事：它们没有「选中」这个状态，
- * 改了就重启生效。把它们一律扫进 staged 会让系统域的每一次修改都被标成
+ * 生效」与「仅提前配好·当前不生效」——**后者专指未被激活的可替换组件**（配好了
+ * 但当前不生效的那类）。域内散字段不存在「不生效」这回事：它们没有「选中」这个
+ * 状态，改了就重启生效。把它们一律扫进 staged 会让系统域的每一次修改都被标成
  * 「当前不生效」——那是分类在说谎，不是保守。
  *
  * 分类**随当前选中动态变化**：改了 A 引擎后又把选中切到 B，A 的改动就从
  * 「重启后生效」降级为「仅提前配好」。这是有意为之，且必须可见（§5.4）。
+ * 工具域的 ``plugins.*`` / ``Intent.*`` 同理——它们**不是引擎**，靠第三、四个
+ * 参数里的组件范围判定（见 ``toolsScope``）。
+ *
+ * @param {string} path
+ * @param {object} selection ``selected_module`` 的选中值（含 ``Intent``）
+ * @param {string[]} [engineCategories] 引擎六族；不传 = 旧页面口径
+ * @param {{intentBranches?: string[], enabledPlugins?: string[]}} [tools]
+ *   工具域的组件范围（``toolsScope`` 的产物）。**不传时不存在「未启用插件」
+ *   这个概念**——故 ``plugins.*`` 会落进散字段口径（active），而不是被三段
+ *   路径的旧判据误判成「未选中引擎」。
  */
-export function classifyDirty(path, selection, engineCategories) {
+export function classifyDirty(path, selection, engineCategories, tools) {
+  // ⚠️ 本条已经是第四个位置参数（selection → engineCategories → tools）。
+  // 下一次扩展请改成**单一 context 对象**（如 ``classifyDirty(path, ctx)``），
+  // 并把下面「两个可选范围都没传 = 旧页面口径」的双条件收成单条件判定，
+  // 不再继续追加位置参数。
   if (String(path).startsWith('selected_module.')) return 'active';
   const parts = String(path).split('.');
-  // 引擎块路径的形状是 ``<类目>.<引擎名>.<字段>``。只有类目名真的在引擎域
-  // 类目集合里（VAD/ASR/LLM/VLLM/TTS/Memory），才谈得上「选中 / 未选中」。
-  //
-  // 不传类目集合时**逐字保持旧口径**：任何三段路径都当引擎块，其余一律
+  if (tools) {
+    // 意图分支：``Intent.<分支>.<字段>``——分支是「可替换组件」，
+    // ``selected_module.Intent`` 就是它的选择器（与 ``selected_module.LLM``
+    // 之于 LLM 引擎完全同构）。未选中分支 = 提前配好。
+    if (parts[0] === 'Intent' && parts.length >= 3
+        && (tools.intentBranches || INTENT_BRANCHES).includes(parts[1])) {
+      return (selection && selection.Intent === parts[1]) ? 'active' : 'staged';
+    }
+    // 插件：``plugins.<插件>.<字段>``。生效性由**选中分支的 functions 清单**
+    // 决定——在清单里就是启用的（active），不在就是「未启用插件」（staged）。
+    // §7 的旧归属列正是按这条线分的：「意图与插件·已启用」/「·未启用折叠」。
+    //
+    // 必须**先于**三段的旧判据处理：``plugins.get_weather.api_key`` 是三段，
+    // 沿用「三段 = 引擎块」会把它当成「未选中引擎的字段」——它不是引擎。
+    if (parts[0] === 'plugins' && parts.length >= 3) {
+      const enabled = tools.enabledPlugins || [];
+      return enabled.includes(parts[1]) ? 'active' : 'staged';
+    }
+  }
+  // 不传任何范围时**逐字保持旧口径**：任何三段路径都当引擎块，其余一律
   // 归 ``staged``（旧页面 config_page.html 的调用形态，不允许静默改行为）。
-  // 传了类目集合才按「是否真在引擎域类目里」细化，非引擎域散字段归 ``active``
+  // 传了范围才按「是否真在该域的组件集合里」细化，散字段归 ``active``
   // ——它们没有「选中」状态，「仅提前配好」对它不成立。
-  if (!engineCategories) {
+  if (!engineCategories && !tools) {
     const isEnginePath = parts.length >= 3;
     if (isEnginePath) {
       return (selection && selection[parts[0]] === parts[1]) ? 'active' : 'staged';
     }
     return 'staged';
   }
-  const isEnginePath = parts.length >= 3 && engineCategories.includes(parts[0]);
+  // 引擎块路径的形状是 ``<类目>.<引擎名>.<字段>``。只有类目名真的在引擎域
+  // 类目集合里（VAD/ASR/LLM/VLLM/TTS/Memory），才谈得上「选中 / 未选中」。
+  const isEnginePath = parts.length >= 3
+    && Boolean(engineCategories) && engineCategories.includes(parts[0]);
   if (isEnginePath) {
     return (selection && selection[parts[0]] === parts[1]) ? 'active' : 'staged';
   }
   return 'active';
+}
+
+/**
+ * 工具域的分组范围：当前哪些「组件」真的生效。
+ *
+ *   - ``intentBranches``：``Intent.*`` 的键——`selected_module.Intent` 选中谁，
+ *     谁就是生效的那个（与引擎六族同构）；
+ *   - ``enabledPlugins``：**选中分支**的 ``functions`` 清单。插件不是靠
+ *     ``selected_module`` 选的，而是靠出现在这份清单里——这就是「启用」的定义。
+ *     所以切 ``selected_module.Intent`` 时，两份清单里插件的生效性跟着重算
+ *     （§5.4「分组随选中实时重算」）。
+ *
+ * ``intentBranches`` 优先用**注入的域表**那一份（``cells.__intentBranches``
+ * 由域页塞进来），只在缺失时回落到常量：树上只有配置过的分支（本机没有
+ * ``intent_llm``），少一条就会让那条分支的字段落进散字段口径而不是「未选中」。
+ *
+ * @param {object} cells 配置树（``page.state``）
+ * @param {string[]} [branches] 注入的分支清单
+ */
+export function toolsScope(cells, branches) {
+  const selected = getPath(cells, 'selected_module.Intent');
+  const functions = getPath(cells, `Intent.${selected}.functions`);
+  return {
+    intentBranches: (branches && branches.length ? branches : INTENT_BRANCHES),
+    enabledPlugins: Array.isArray(functions) ? functions : [],
+  };
 }
 
 /** 两个生效分组（组名沿用父 spec §5.4 的措辞）。 */
@@ -355,10 +429,10 @@ export const DIRTY_GROUPS = {
 };
 
 /** 按生效性把脏条目分组（供侧栏/保存栏渲染）。 */
-export function groupDirty(dirty, selection, engineCategories) {
+export function groupDirty(dirty, selection, engineCategories, tools) {
   const groups = { active: [], staged: [] };
   for (const [path, entry] of Object.entries(dirty)) {
-    const bucket = classifyDirty(path, selection, engineCategories);
+    const bucket = classifyDirty(path, selection, engineCategories, tools);
     groups[bucket].push({ path, ...entry });
   }
   return groups;

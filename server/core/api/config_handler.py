@@ -433,6 +433,11 @@ class ConfigHandler(BaseHandler):
         # 配好」）。类目清单的单一事实源在 ``page_domains.ENGINE_CATEGORIES``，
         # 页面不写第二份（页面里两份类目字面量就是两把尺子）。
         engine_categories = list(page_domains.ENGINE_CATEGORIES)
+        # 意图分支（`Intent.*` 的键）也随域表注入：工具域的 `classifyDirty` 靠它
+        # 把「选中 / 未选中分支」分开（未选中分支 = 仅提前配好）。分支清单的
+        # 单一事实源在 `page_domains.INTENT_BRANCHES`——树上只有配过的分支，
+        # 少一条就会让那条分支的字段归错组（不能从配置树反推）。
+        intent_branches = list(page_domains.INTENT_BRANCHES)
         if schema is not None:
             body = ""  # 正文由 config_domain_page.js 按注入的域表渲染
             actions = (
@@ -445,7 +450,8 @@ class ConfigHandler(BaseHandler):
                 '暂无未保存修改</span></div>'
             )
             schema_json = json.dumps(
-                dict(asdict(schema), engine_categories=engine_categories),
+                dict(asdict(schema), engine_categories=engine_categories,
+                     intent_branches=intent_branches),
                 ensure_ascii=False)
         else:
             # 未上线域：占位正文，且**动作区不渲染**（没有可保存的对象）。
@@ -453,7 +459,8 @@ class ConfigHandler(BaseHandler):
             # 占位页不需要域表驱动的编辑，但脚本仍以空表启动（骨架同一副）。
             schema_json = json.dumps(
                 {"slug": slug, "label": domain["label"], "groups": [],
-                 "engine_categories": engine_categories},
+                 "engine_categories": engine_categories,
+                 "intent_branches": intent_branches},
                 ensure_ascii=False)
 
         html = self._fill_skeleton(
@@ -477,7 +484,8 @@ class ConfigHandler(BaseHandler):
         )
         schema_json = json.dumps(
             {"slug": self._RAW_SLUG, "label": shell.RAW_ESCAPE["label"],
-             "groups": [], "engine_categories": list(page_domains.ENGINE_CATEGORIES)},
+             "groups": [], "engine_categories": list(page_domains.ENGINE_CATEGORIES),
+             "intent_branches": list(page_domains.INTENT_BRANCHES)},
             ensure_ascii=False)
         html = self._fill_skeleton(
             skeleton, title="小智 · 原始配置", active=self._RAW_SLUG,

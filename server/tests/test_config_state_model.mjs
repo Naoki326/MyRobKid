@@ -42,6 +42,7 @@ import {
   setSecretInput,
   setSelection,
   setValue,
+  toolsScope,
 } from '../config/config_state_model.js';
 
 /* ---------------------------------------------------------------------------
@@ -650,4 +651,141 @@ test('引擎域的分组重算对类目集合敏感：非引擎路径不受选�
   const dirty = { tts_timeout: { kind: 'param', from: 15, to: 30 } };
   assert.equal(classifyDirty('tts_timeout', { TTS: 'MlxTTS' }, ENGINE_CATEGORIES),
     'active', '引擎全局参数不受某条引擎的选中影响');
+});
+
+/* ---------------------------------------------------------------------------
+ * 11. 插件与工具域（issue #28）：Intent 分支与插件都是「可选中组件」
+ *
+ * 本票的核心裁决：`plugins.get_weather.api_key` 与 `Intent.function_call.functions`
+ * **都是三段路径**。若沿用「三段 = 引擎块」的旧判据，它们会被误判成「未选中
+ * 引擎的字段」而落进「仅提前配好 · 当前不生效」组——而它们根本不是引擎。
+ *
+ * 正确的裁决（§5.3/§5.4 + §7 旧归属列）：
+ *
+ *   1. **Intent 分支**是「引擎」的同构物：`selected_module.Intent` 就是它的选择器
+ *      ——选中分支 `active`，未选中分支 `staged`（§7 把 `Intent.nointent` /
+ *      `Intent.intent_llm` 记为「无归宿（非选中）」，与未选中引擎同一口径）。
+ *   2. **插件**的生效性由**选中分支的 `functions` 清单**决定（§7 旧归属列把它
+ *      分成「意图与插件·已启用」与「意图与插件·未启用折叠」两组）——在清单里
+ *      就是 `active`，不在就是 `staged`（「未启用插件」正是这一组）。
+ *   3. 工具域的**散字段**（`tool_call_timeout` / `mcp_endpoint`）改了就重启生效
+ *      ——它们没有「选中」这个状态（与系统域同理）。
+ * ------------------------------------------------------------------------ */
+const TOOLS_SCOPE = {
+  intentBranches: ['function_call', 'nointent', 'intent_llm'],
+  enabledPlugins: ['get_weather'],
+};
+
+test('Intent 分支是「可选中组件」：选中分支生效、未选中分支只算提前配好', () => {
+  const selection = { Intent: 'function_call' };
+  assert.equal(classifyDirty('Intent.function_call.functions', selection,
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'active');
+  assert.equal(classifyDirty('Intent.intent_llm.llm', selection,
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'staged',
+    '未选中的意图分支 = 提前配好（与未被选中的引擎同组）');
+  assert.equal(classifyDirty('Intent.nointent.type', selection,
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'staged');
+});
+
+test('插件是否生效取决于**选中分支**的 functions 清单，不是「是不是三段」', () => {
+  const selection = { Intent: 'function_call' };
+  assert.equal(classifyDirty('plugins.get_weather.api_key', selection,
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'active',
+    '启用的插件不算「当前不生效」——它不是引擎，三段不是引擎块的判据');
+  assert.equal(classifyDirty('plugins.web_search.api_key', selection,
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'staged',
+    '未启用的插件正是「仅提前配好 · 当前不生效」那一组');
+});
+
+test('切换意图引擎后两份清单的生效性实时重算（不是保存时定死的标签）', () => {
+  const dirty = {
+    'Intent.function_call.functions': { kind: 'param', from: [], to: ['get_weather'] },
+    'Intent.intent_llm.functions': { kind: 'param', from: [], to: ['web_search'] },
+    'plugins.get_weather.api_key': { kind: 'secret', from: '未配置', to: '替换为新值' },
+    'plugins.web_search.api_key': { kind: 'secret', from: '未配置', to: '替换为新值' },
+  };
+  const scope = {
+    intentBranches: ['function_call', 'nointent', 'intent_llm'],
+    enabledPlugins: ['get_weather'],
+  };
+  let g = groupDirty(dirty, { Intent: 'function_call' }, ENGINE_CATEGORIES, scope);
+  assert.deepEqual(g.active.map(e => e.path).sort(),
+    ['Intent.function_call.functions', 'plugins.get_weather.api_key']);
+  assert.deepEqual(g.staged.map(e => e.path).sort(),
+    ['Intent.intent_llm.functions', 'plugins.web_search.api_key']);
+
+  // 切到 intent_llm（且它启用了 web_search）：整组升降级。
+  const scope2 = {
+    intentBranches: scope.intentBranches,
+    enabledPlugins: ['web_search'],
+  };
+  g = groupDirty(dirty, { Intent: 'intent_llm' }, ENGINE_CATEGORIES, scope2);
+  assert.deepEqual(g.active.map(e => e.path).sort(),
+    ['Intent.intent_llm.functions', 'plugins.web_search.api_key']);
+  assert.deepEqual(g.staged.map(e => e.path).sort(),
+    ['Intent.function_call.functions', 'plugins.get_weather.api_key']);
+});
+
+test('工具域的散字段恒为「重启后生效」——它们没有选中状态', () => {
+  assert.equal(classifyDirty('tool_call_timeout', { Intent: 'function_call' },
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'active');
+  assert.equal(classifyDirty('mcp_endpoint', { Intent: 'function_call' },
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'active');
+});
+
+test('selected_module.Intent 本身是「选择」，永远生效（与六行 selected_module 同组）', () => {
+  assert.equal(classifyDirty('selected_module.Intent', { Intent: 'nointent' },
+    ENGINE_CATEGORIES, TOOLS_SCOPE), 'active');
+});
+
+test('不传工具域范围时逐字保持旧口径（引擎域页的调用形态不得静默改行为）', () => {
+  // 引擎域页只传 ENGINE_CATEGORIES：Intent / plugins 不在引擎类目里，按新口径
+  // 归 active。这与旧口径（三段路径一律当引擎块）确实不同——所以**必须靠
+  // 传参区分**：不传 tools 范围就没有「未启用插件」这个概念可用。
+  const engineOnly = classifyDirty('plugins.get_weather.api_key', {}, ENGINE_CATEGORIES);
+  assert.equal(engineOnly, 'active',
+    '不传 tools 范围时不存在「插件未启用」的分组，散字段归 active');
+  assert.equal(classifyDirty('Intent.function_call.functions', {}, ENGINE_CATEGORIES),
+    'active');
+  // 旧页面口径（两个范围都不传）仍是逐字的老行为。
+  assert.equal(classifyDirty('plugins.get_weather.api_key', {}), 'staged');
+  assert.equal(classifyDirty('Intent.function_call.functions', {}), 'staged');
+});
+
+test('toolsScope 从配置树算出「选中分支 + 该分支启用的插件」', () => {
+  const scope = toolsScope({
+    selected_module: { Intent: 'intent_llm' },
+    Intent: {
+      function_call: { type: 'function_call', functions: ['get_weather'] },
+      intent_llm: { type: 'intent_llm', llm: 'ChatGLMLLM', functions: ['web_search'] },
+      nointent: { type: 'nointent' },
+    },
+  });
+  assert.deepEqual(scope.enabledPlugins, ['web_search'],
+    '插件生效性读的是**选中分支**的 functions，不是随便哪个分支');
+  assert.ok(scope.intentBranches.includes('nointent'),
+    '分支清单是注入的那一份，不是从树上猜的（树上可能少一条未配置的分支）');
+});
+
+test('toolsScope 在分支没有 functions 键时给出空清单（不炸、不撒谎）', () => {
+  const scope = toolsScope({ selected_module: { Intent: 'nointent' },
+    Intent: { nointent: { type: 'nointent' } } });
+  assert.deepEqual(scope.enabledPlugins, [],
+    'nointent 分支没有 functions：全部插件都算「未启用」而不是抛异常');
+  assert.deepEqual(toolsScope({}).enabledPlugins, []);
+});
+
+test('工具域的双清单脏摘要只含路径（密钥值不落地）', () => {
+  const SECRET = 'sk-tools-never-print-me';
+  const p = {
+    cfg: { plugins: { get_weather: { api_key: 'x' } } },
+    state: { plugins: { get_weather: { api_key: 'x' } } },
+    origState: { 'plugins.get_weather.api_key': { configured: true } },
+    secrets: { 'plugins.get_weather.api_key': { kind: 'secret', configured: true, input: SECRET } },
+  };
+  const d = computeDirty(p);
+  const summary = dirtySummary(d);
+  assert.deepEqual(summary.paths, ['plugins.get_weather.api_key']);
+  assert.ok(!JSON.stringify(summary).includes(SECRET),
+    '摘要里出现了密钥新值——localStorage 只许存路径与计数');
 });

@@ -45,10 +45,11 @@ from config import page_domains as domains  # noqa: E402
 DOMAIN_SLUGS = ["dialogue", "engine", "tools", "devices", "system"]
 ESCAPE_SLUG = "raw"
 
-#: 本票已交付内容的域（其余两域是占位页，#28/#29 交付内容）。
-#: #26 交付 dialogue / system，#27 把 engine 从占位转正（450 字段全量可达）。
-IMPLEMENTED_SLUGS = ["dialogue", "engine", "system"]
-PLACEHOLDER_SLUGS = ["tools", "devices"]
+#: 本票已交付内容的域（其余一域是占位页，#29 交付内容）。
+#: #26 交付 dialogue / system，#27 把 engine 从占位转正（450 字段全量可达），
+#: #28 把 tools 从占位转正（32 字段全量可达）。
+IMPLEMENTED_SLUGS = ["dialogue", "engine", "tools", "system"]
+PLACEHOLDER_SLUGS = ["devices"]
 
 
 class DomainTopologyContract(AioHTTPTestCase):

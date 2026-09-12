@@ -248,17 +248,27 @@ class EngineLibraryContract(AioHTTPTestCase):
             "GET", "/xiaozhi/config/config_domain_page.js")).text())
         self.assertIn("catpill", js, "命中项必须有类目标签（catpill）")
         self.assertIn("ENGINE_CATEGORIES", js, "搜索必须遍历**全部**类目")
-        # 跨类目遍历的证据：搜索分支在 for (cat of ENGINE_CATEGORIES) 里。
+        # 跨类目遍历的证据：搜索分支在 "for (const group of groups)" 里逐组
+        # 遍历，而引擎库的 ``groups`` 就是 ``ENGINE_CATEGORIES``（spec 参数化，
+        # #28 把引擎库与插件库并成了同一份实现——两段像样的代码不算同构）。
         self.assertRegex(
-            js, r"for \(const cat of ENGINE_CATEGORIES\)\s*\{[^}]*enginesOf\(cat\)",
-            "搜索必须逐个类目遍历（跨类目），不是只查当前 tab")
+            js, r"for \(const group of groups\)\s*\{[^}]*spec\.namesOf\(group\)",
+            "搜索必须逐个组遍历（跨类目），不是只查当前 tab")
+        self.assertRegex(
+            js, r"groups: ENGINE_CATEGORIES",
+            "引擎库的组轴就是全部六个类目（搜索因而是跨类目的）")
         html = await self._html()
         # 搜索框在页面脚本里动态生成（HTML 只有骨架），所以断言 JS 本身。
-        self.assertIn('id="engSearch"', js,
-                      "搜索框必须存在（没有搜索框就没有跨类目搜索）")
+        # #28 之后搜索框由库的 spec 驱动（引擎库与插件库共用一份实现），
+        # 所以这里钉的是「引擎库的 spec 声明了一个搜索框」——两库的搜索框
+        # 形状因而是同一个模板，不会慢慢长得不一样。
+        self.assertRegex(js, r"searchId: 'engSearch'",
+                         "搜索框必须存在（没有搜索框就没有跨类目搜索）")
+        self.assertIn('id="${esc(spec.searchId)}"', js,
+                      "搜索框由 spec 驱动渲染（两库同一份模板）")
         # 命中项的**类目标签**必须带类别名：没有它，搜出来的 TTS 引擎会被当成
         # LLM 的（这正是「在 LLM 下搜 mlx 得 0 条」那个痛点的另一半）。
-        self.assertRegex(js, r"catpill[^`]*\$\{esc\(cat\)\}",
+        self.assertRegex(js, r"catpill[^`]*\$\{esc\(opts\.tag\)\}",
                          "类目标签要真的把类目名渲染出来")
 
     async def test_engine_page_renders_a_category_tab_bar(self):
@@ -266,8 +276,8 @@ class EngineLibraryContract(AioHTTPTestCase):
         js = await (await self.client.request(
             "GET", "/xiaozhi/config/config_domain_page.js")).text()
         self.assertIn("cattab", js, "类目 tab 必须存在")
-        # tab 的数据源就是注入的类目清单，不是页面里另写的一份。
-        self.assertRegex(js, r"ENGINE_CATEGORIES\.map\(\(cat\)")
+        # tab 的数据源是库的 spec 组轴，引擎库那一份就是注入的类目清单。
+        self.assertRegex(js, r"groups: ENGINE_CATEGORIES")
 
     # ── 3. 折叠：折叠态 DOM 字段数 = 0 的实现前提 ───────────────
     async def test_engine_list_comes_from_the_tree_not_the_table(self):

@@ -8,8 +8,10 @@
  *      两者各管一段，谁也不替谁撒谎；
  *   2. **域内两层**（§2.5）：常用平铺、更多设置折进 ``<details>``——**折叠态 DOM
  *      字段数 = 0**，这是「深度 ≤3」成立的依据；
- *   3. **引擎库**（§5，仅 engine 域）：上方「当前生效」六行下拉，下方「全部
- *      引擎」按类目 tab × **跨类目搜索** × 折叠展开；
+ *   3. **组件库**（§5 / §7，engine 与 tools 两域）：上方「当前生效」选择器，
+ *      下方「全部…」按组轴 tab × **跨组搜索** × 折叠展开。引擎库（六类目）
+ *      与插件库（单组，无 tab 栏）**共用同一份实现**，差异参数化在 spec 里——
+ *      §7 移交注记 2 说的「同构」在代码上就是这句话；
  *   4. **脏计算复用状态模型**：``computeDirty`` / ``groupDirty`` /
  *      ``dirtySummary`` / ``domainDirty`` 全来自 config_state_model.js（#25 的
  *      地基）。页面里**没有第二套脏计算**——这是 #17 那两个同源显示 bug 的教训；
@@ -23,14 +25,35 @@
 
 import {
   ENGINE_CATEGORIES as ENGINE_CATEGORIES_FALLBACK,
+  INTENT_BRANCHES as INTENT_BRANCHES_FALLBACK,
   computeDirty, dirtySummary, domainDirty, groupDirty, dirtyLabel,
   getPath, initialState, isSensitiveKey, placeholderText, setPath,
-  setSecretInput,
+  setSecretInput, toolsScope,
 } from './config_state_model.js';
 
 const SCHEMA = JSON.parse(document.getElementById('domain-schema').textContent);
 const SLUG = SCHEMA.slug;
 const STORAGE_KEY = 'config-dirty/' + SLUG;
+
+/* 域表里 list 字段写的是**元素形态**（§7 的计数口径：``wakeup_words`` 与
+ * ``devices[i]`` 各记 1 个字段），但页面控件要的是**数组本身**的路径：
+ * ``devices[i]`` 这个点号路径解不出来，硬渲染就是一个永远空白的输入框——
+ * 「可编辑」当场失效，而且看不出是哪里错。
+ *
+ * 所以在入口处归一一次：``X[i]`` → ``X``，控件形状定为 ``list``。这样 §7 表的
+ * 写法与 ``api/full`` 的 ``config_state`` 信号路径（点号形态、数组用下标
+ * ``devices.0``）各归其位，两者不再相互委屈。
+ *
+ * 归一放在**入口**而不是每个消费点：字段路径被控件、脏前缀、域归属三处消费，
+ * 每处各解一次就是三把尺子。
+ */
+for (const g of SCHEMA.groups) {
+  for (const f of g.fields) {
+    if (!f.path.includes('[i]')) continue;
+    f.path = f.path.replace(/\[i\]$/, '');
+    if (f.kind === 'list' || f.kind === 'text' || f.kind === 'auto') f.kind = 'list';
+  }
+}
 
 /** 引擎域类目（六族）——**单一事实源是服务端注入的域表**。
  *
@@ -47,6 +70,21 @@ const ENGINE_CATEGORIES = SCHEMA.engine_categories || ENGINE_CATEGORIES_FALLBACK
 
 /** 引擎库（§5）只在引擎域上渲染。判据是**域 slug**，不是「有没有 lib 容器」。 */
 const IS_ENGINE_DOMAIN = SLUG === 'engine';
+
+/** 意图分支清单（`Intent.*` 的键）——**单一事实源是服务端注入的域表**。
+ *
+ * 理由与 ``ENGINE_CATEGORIES`` 逐字同源：分支清单一旦分叉，「切换意图引擎」的
+ * 候选就会少一条，而少的那条恰好是本机没配的那条（`nointent`），表现为
+ * 「切过去之后就切不回来了」。唯一的一份在 ``page_domains.INTENT_BRANCHES``。
+ */
+const INTENT_BRANCHES = SCHEMA.intent_branches || INTENT_BRANCHES_FALLBACK;
+
+/** 插件与工具域（§7）——插件库与引擎库**同构**（§5.1 / §7 移交注记 2）。
+ *
+ * 形态差一处：引擎按类目 tab 切六块，插件没有天然的组轴（七个插件就是七个），
+ * 所以**无 tab 栏**；搜索与真折叠逐条相同（AC 明写「同构」）。
+ */
+const IS_TOOLS_DOMAIN = SLUG === 'tools';
 
 /** 配置里真实存在的值（脏计算的基准）+ 服务端存在信号。 */
 let PAGE = null;
@@ -186,6 +224,23 @@ function control(f) {
       data-sens="1" value="${esc(slot)}" autocomplete="new-password"
       placeholder="${configured ? '已配置 · 留空不变，输入新值覆盖' : '未配置 · 输入新值'}">`;
   }
+  // 下拉：候选来自**注入的域表**（意图分支）而不是页面里的字面量。
+  // 写错一个名字 = 意图引擎静默失效，所以只能是下拉（与引擎页六行同理）。
+  if (kind === 'select') {
+    const choices = f.options || [];
+    const known = choices.includes(val);
+    const extra = (val !== undefined && val !== null && val !== '' && !known)
+      ? `<option value="${esc(val)}" selected>${esc(val)}（未配置）</option>` : '';
+    const opts = choices.map((c) =>
+      `<option value="${esc(c)}" ${c === val ? 'selected' : ''}>${esc(c)}</option>`).join('');
+    const d = DIRTY[f.path];
+    // 选择器控件统一用 ``data-selcat``（引擎页六行与意图分支同一把尺），
+    // 它不是普通文本输入：选了就走 setPath + markChanged，与 ``data-path`` 同一条路。
+    return `<div class="slot"><div class="selc"><select data-selcat="${esc(f.selcat || f.path)}">`
+      + opts + extra + '</select></div>'
+      + (d ? `<span class="badge" style="background:rgba(124,92,255,.18);color:#a78bfa">[选择] 改自 ${esc(d.from ?? '（无）')}</span>` : '')
+      + '</div>';
+  }
   if (kind === 'bool') {
     const on = val === true;
     return `<label class="switch-row"><span class="switch"><input type="checkbox"
@@ -237,12 +292,16 @@ function row(f) {
  * 系统域就是这条规则的实例：它 13 个字段全是 more，若还折一层，整页只有一个
  * 空壳，字段一个也看不见。
  */
-function groupCard(g, domainHasCommon) {
-  const common = g.fields.filter((f) => f.layer === 'common');
-  const more = g.fields.filter((f) => f.layer === 'more');
+function groupCard(g, domainHasCommon, transform) {
+  // ``transform``：个别分组需要在渲染前改写字段（如意图选择器要补
+  // ``options``）。默认为恒等——**不允许**为了这一个特例另写一张分组卡：
+  // 「更多设置」的折叠口径只许有一份（两把尺子的老毛病）。
+  const fields = transform ? transform(g.fields) : g.fields;
+  const common = fields.filter((f) => f.layer === 'common');
+  const more = fields.filter((f) => f.layer === 'more');
   // 常用层为空 → 平铺（把所有字段当 common 渲染，不生成折叠容器）。
   const fold = domainHasCommon && more.length > 0;
-  const flat = domainHasCommon ? common : g.fields;
+  const flat = domainHasCommon ? common : fields;
   const moreBlock = fold
     ? `<details class="more-settings"><summary>更多设置 · ${more.length} 项</summary>
         <div>${more.map(row).join('')}</div></details>`
@@ -271,40 +330,76 @@ function groupCard(g, domainHasCommon) {
  *     而不是先渲染再藏。
  * ------------------------------------------------------------------------ */
 
-/** 表：``<类目>.<引擎名>`` → [{path, layer}]（方案裁决过的字段）。
+/** 表：**组件根路径** → [{path, layer}]（方案裁决过的字段）。
  *
- * 引擎名与类目**不靠这张表枚举**（见下），表只回答「这条引擎的字段怎么分层」。
+ * 组件（引擎 / 插件 / 意图分支）的字段在域表里是一条条**完整路径**：
+ *   - 引擎：``<类目>.<引擎名>.<字段>``     → 根 ``<类目>.<引擎名>``
+ *   - 插件：``plugins.<插件名>.<字段>``     → 根 ``plugins.<插件名>``
+ *   - 分支：``Intent.<分支>.<字段>``       → 根 ``Intent.<分支>``
+ *
+ * 组件名**不靠这张表枚举**（见下），表只回答「这条组件的字段怎么分层」。
  * 存的是一条**完整路径**而不是「末段」：嵌套字段（``llm.config.api_key``）
- * 的末段（``api_key``）在同一个引擎里可能出现在两个嵌套层下，只留末段会分不清。
+ * 的末段（``api_key``）在同一个组件里可能出现在两个嵌套层下，只留末段会分不清。
+ *
+ * **一张表服务两个库**：``fieldsOf(root)`` 只认根路径，引擎卡与插件卡
+ * 走的是同一个函数——这就是「同构」在代码上的落点。
  */
-const ENTRY_FIELDS = {};
+const DECLARED_FIELDS = {};
 for (const g of SCHEMA.groups) {
   for (const f of g.fields) {
-    const parts = f.path.split('.');
-    if (parts.length < 3 || !ENGINE_CATEGORIES.includes(parts[0])) continue;
-    const key = parts[0] + '.' + parts[1];
-    (ENTRY_FIELDS[key] = ENTRY_FIELDS[key] || []).push({ path: f.path, layer: f.layer });
+    const root = componentRootOf(f.path);
+    if (!root) continue;
+    (DECLARED_FIELDS[root] = DECLARED_FIELDS[root] || []).push({ path: f.path, layer: f.layer });
   }
 }
 
-/** 一条引擎的字段清单：**表里的层 + 树上的键**（§9 规则 1）。
+/** 一条组件字段路径的**组件根**（引擎 ``CAT.Name`` / 插件 ``plugins.Name`` /
+ *  意图分支 ``Intent.Branch``）；不属于任何组件时返回 null。
+ *
+ * 判据是**路径形状 + 法定的组件首段**，不是「三段就算组件」：
+ * ``tool_call_timeout``（一段）、``mcp_endpoint``（一段）、
+ * ``selected_module.Intent``（两段，是选择器不是组件）都不属于组件，
+ * 它们由域内普通分组渲染。
+ */
+function componentRootOf(path) {
+  const parts = String(path).split('.');
+  if (parts.length < 3) return null;
+  if (parts[0] === 'plugins' || parts[0] === 'Intent') return parts[0] + '.' + parts[1];
+  if (ENGINE_CATEGORIES.includes(parts[0])) return parts[0] + '.' + parts[1];
+  return null;
+}
+
+/** 引擎域的组件根清单（``<类目>.<引擎名>``），供枚举类目的引擎名用。
+ *
+ * 引擎域的组件根形如 ``CAT.Name``；这里只取一遍作为名字回落来源。
+ */
+const ENTRY_FIELDS = {};
+for (const [root, fields] of Object.entries(DECLARED_FIELDS)) {
+  if (ENGINE_CATEGORIES.includes(root.split('.')[0])) ENTRY_FIELDS[root] = fields;
+}
+
+/** 一条组件（引擎 / 插件 / 意图分支）的字段清单：**表里的层 + 树上的键**
+ * （§9 规则 1）。
  *
  * 两个来源各管一段：表说「这个键属于常用还是更多设置」，树说「这个键存不存在」。
  * 树上有而表里没列的键（本机自加引擎的新字段、上游新增的键）照样渲染——
  * 控件形状由 ``kindFor`` 按值推。反之表里有而树上没有的键**不渲染**：
- * 引擎库必须看见的是「这个引擎实际装成了什么样」，不是「方案列过什么」。
+ * 组件库必须看见的是「这个组件实际装成了什么样」，不是「方案列过什么」。
  *
  * 嵌套块（``Memory.powermem.llm.config.api_key``、``TTS.CustomTTS.params.speed``）：
  * 表里的路径是全路径，这里按「**表层里最长前缀 + 剩余段**」把它展平——
  * 展平是必须的，不然 ``powermem`` 的 11 个字段一个都看不见，而「450 全量可达」
  * 的验收就只剩一句口号。
+ *
+ * ``root`` 是组件根路径（``LLM.ThirkingLLM`` / ``plugins.get_weather`` /
+ * ``Intent.intent_llm``）——引擎卡与插件卡共用一个实现，这就是同构。
  */
-function fieldsOf(cat, name) {
-  const declared = ENTRY_FIELDS[cat + '.' + name] || [];
-  const owner = getPath(state, cat + '.' + name);
+function fieldsOf(root) {
+  const declared = DECLARED_FIELDS[root] || [];
+  const owner = getPath(state, root);
   const out = [];
   if (owner && typeof owner === 'object' && !Array.isArray(owner)) {
-    collectFields(owner, `${cat}.${name}`, `${cat}.${name}`, declared, out);
+    collectFields(owner, root, root, declared, out);
   }
   return out;
 }
@@ -341,39 +436,60 @@ function collectFields(node, prefix, root, declared, out) {
   }
 }
 
-/** 一条引擎卡（``<details>``）。
+/** 一条组件的卡片（``<details>``）——**引擎库与插件库共用**。
  *
  * 折叠态 DOM 字段数 = 0：体在 ``toggle`` 时构建，初始展开的（当前生效那条）
  * 才立即构建。这不是优化，是「深度 ≤3」验收判据的实现前提。
+ *
+ * ``root`` 是组件根路径（``LLM.ThirkingLLM`` / ``plugins.get_weather``）；
+ * ``opts`` 里的差异只有两处：``fieldAttr`` 命名（引擎 ``data-engine`` /
+ * 插件 ``data-plugin``，各自是 hash 深链的锚点）与类目标签。其余逐字相同。
  */
-function engineCard(cat, name, opts) {
+function componentCard(root, opts) {
   opts = opts || {};
-  const live = getPath(state, 'selected_module.' + cat) === name;
-  const owner = getPath(state, cat + '.' + name) || {};
-  const fields = fieldsOf(cat, name);
-  const engineDirty = Object.keys(DIRTY).some(
-    (p) => p === `${cat}.${name}` || p.startsWith(`${cat}.${name}.`));
-  const catPill = opts.showCat
-    ? `<span class="catpill" data-cat="${esc(cat)}">${esc(cat)}</span>` : '';
-  const id = `eng-${cat}-${name}`;
-  return `<details class="engine${live ? ' live' : ''}${engineDirty ? ' dirty' : ''}"
-    id="${esc(id)}" data-engine="${esc(cat)}.${esc(name)}" ${live ? 'open' : ''}>
+  const parts = root.split('.');
+  const group = parts[0];
+  const name = parts.slice(1).join('.');
+  const live = opts.live === undefined ? false : opts.live;
+  const owner = getPath(state, root) || {};
+  const fields = fieldsOf(root);
+  const componentDirty = Object.keys(DIRTY).some(
+    (p) => p === root || p.startsWith(root + '.'));
+  const catPill = opts.tag
+    ? `<span class="catpill" data-cat="${esc(opts.tag)}">${esc(opts.tag)}</span>` : '';
+  const id = `${opts.idPrefix}-${group}-${name}`;
+  // 两个锚点属性：``data-engine`` / ``data-plugin`` 是**域特定的深链锚点**
+  // （§4.5 只承诺这一类），``data-lib-root`` 是**两个库共用的**根路径锚点
+  // ——重建时保持折叠状态、脏前缀匹配这类跨库逻辑只认后者，不必知道
+  // 当前是哪个域（写两套选择器就是两把尺子）。
+  return `<details class="engine${live ? ' live' : ''}${componentDirty ? ' dirty' : ''}"
+    id="${esc(id)}" ${opts.fieldAttr}="${esc(root)}" data-lib-root="${esc(root)}"
+    ${live ? 'open' : ''}>
     <summary>${catPill}<span class="nm">${esc(name)}</span>
       <span class="ty">${esc(owner.type ?? '?')}</span>
       <span class="nf">${fields.length} 字段</span>
-      ${live ? '<span class="live-tag">● 生效中</span>' : ''}
-      <span class="dirtydot" ${engineDirty ? '' : 'hidden'}></span></summary>
-    <div class="engbody" data-built="0" data-cat="${esc(cat)}"
-      data-name="${esc(name)}"></div>
+      ${live ? '<span class="live-tag">● ' + esc(opts.liveLabel || '生效中') + '</span>'
+        : `<span class="live-tag" hidden>● ${esc(opts.liveLabel || '生效中')}</span>`}
+      <span class="dirtydot" ${componentDirty ? '' : 'hidden'}></span></summary>
+    <div class="engbody" data-built="0" data-root="${esc(root)}"></div>
   </details>`;
 }
 
-/** 填一个引擎体的控件（延迟到 ``toggle``）。 */
+/** 引擎域的一条引擎卡（``cat.name``，当前选中则展开并标「生效中」）。 */
+function engineCard(cat, name, opts) {
+  opts = opts || {};
+  return componentCard(cat + '.' + name, {
+    idPrefix: 'eng', fieldAttr: 'data-engine',
+    tag: opts.showCat ? cat : '',
+    live: getPath(state, 'selected_module.' + cat) === name,
+    liveLabel: '生效中',
+  });
+}
+
+/** 填一个组件体的控件（延迟到 ``toggle``）。 */
 function fillEngineBody(box) {
   if (box.dataset.built === '1') return;
-  const cat = box.dataset.cat;
-  const name = box.dataset.name;
-  const fields = fieldsOf(cat, name);
+  const fields = fieldsOf(box.dataset.root);
   const common = fields.filter((f) => f.layer !== 'more');
   const more = fields.filter((f) => f.layer === 'more');
   const moreBlock = more.length
@@ -381,7 +497,7 @@ function fillEngineBody(box) {
         <div>${more.map(row).join('')}</div></details>`
     : '';
   box.innerHTML = (common.length ? common.map(row).join('')
-    : (more.length ? '' : '<div class="hint">这条引擎在配置里没有字段。</div>'))
+    : (more.length ? '' : '<div class="hint">这条组件在配置里没有字段。</div>'))
     + moreBlock;
   box.dataset.built = '1';
   bindInputs(box);
@@ -418,11 +534,11 @@ function enginesOf(cat) {
   return names;
 }
 
-/** 重建引擎库的**外框**（tab 栏 + 当前卡列表）。卡体是按需填充的。 */
+/** 重建引擎库的**外框**（tab 栏 + 当前卡列表）。卡体是按需填充的。
+ *
+ * 上方「当前生效」与引擎全局参数由引擎域自己给；库本身是共用的（见下）。
+ */
 function renderEngineLibrary() {
-  const body = $('domainBody');
-  body.classList.remove('placeholder');
-
   // ---- 上方：当前生效六行（selected_module.* 的编辑控件，§5） ----
   const selectors = SCHEMA.groups.find((g) => g.id === 'selectors');
   const globals = SCHEMA.groups.find((g) => g.id === 'globals');
@@ -437,53 +553,186 @@ function renderEngineLibrary() {
         <div class="desc">${esc(globals.desc)}</div>
         ${globals.fields.map(row).join('')}</details>`
     : '';
+  renderLibrary(ENGINE_LIBRARY, slots + globalsBlock);
+}
 
-  // ---- 下方：全部引擎（类目 tab + 跨类目搜索 + 折叠） ----
+/* ---------------------------------------------------------------------------
+ * 组件库（引擎库 / 插件库共用）
+ *
+ * 父 spec §5.1 给引擎库定的承载形态（**类目 tab + 跨类目搜索 + ``<details>``
+ * 真折叠**）与 §7 移交注记 2 给插件库定的「与引擎库同构」，指的是**同一套**
+ * 机制。两个域各抄一份实现就是第二把尺子：搜索的跨度、折叠的时机、命中项的
+ * 标签会在两边慢慢长不一样，而用户看到的是「同一个库两种脾气」。
+ *
+ * 差异参数化在 ``spec`` 里，只有三处：
+ *
+ *   - **组轴**：引擎按类目切六块（有 tab 栏）；插件没有天然的组轴
+ *     （七个插件就是七个），故无 tab 栏、单组全列；
+ *   - **锚点属性**：``data-engine`` / ``data-plugin``（各自是 hash 深链锚点）；
+ *   - **文案**：名词与搜索框提示。
+ *
+ * 搜索**必须跨组**（§5.1）：类目内搜索在 LLM 下搜 ``mlx`` 得 0 条，而 TTS
+ * 实有 5 条——这是「找不到」痛点的直接成因。
+ * ------------------------------------------------------------------------ */
+
+/** 引擎库的 spec。 */
+const ENGINE_LIBRARY = {
+  id: 'all-engines',
+  title: '📚 全部引擎',
+  desc: '按类目浏览，或搜索（搜索**跨全部类目**，命中项带类目标签）。',
+  noun: '引擎',
+  groups: ENGINE_CATEGORIES,
+  searchId: 'engSearch',
+  searchPlaceholder: '🔍 搜索引擎名或 type…（例：mlx、doubao、openai）',
+  catLabel: '类目',
+  namesOf: (cat) => enginesOf(cat),
+  rootOf: (cat, name) => `${cat}.${name}`,
+  typeOf: (cat, name) => getPath(state, `${cat}.${name}.type`),
+  cardOf: (cat, name, opts) => engineCard(cat, name, opts),
+  tagOf: (cat) => cat,
+  emptyText: '这个类目下没有引擎。',
+  missingText: (n) => `无匹配引擎（全部 ${n} 条引擎里都找不到）`,
+};
+
+/** 插件库的 spec——与引擎库**共用** ``renderLibrary``。
+ *
+ * 与引擎库唯一的形状差异是**没有组轴**（``groups: [PLUGIN_GROUP]`` 单组，
+ * ``renderLibrary`` 据此不画 tab 栏）：插件名之间没有类目那样的天然分块，
+ * 硬造一个「插件类目」就是凭空多一层。搜索、真折叠、卡内两层、脏标记
+ * 逐条相同。
+ *
+ * 插件名清单**从配置树读**（与引擎名清单同理）：``api/full`` 给的是模板与
+ * 用户配置的**合并树**，所以模板里列过的七个插件都在——包括本机没启用的
+ * 六个。它们的参数不再折进 ``<details>`` 黑洞（本票的 AC）。
+ */
+const PLUGIN_GROUP = 'plugins';
+const PLUGIN_LIBRARY = {
+  id: 'all-plugins',
+  title: '🧩 全部插件',
+  desc: '每个插件的接入参数。未启用的插件同样可见、可编、可保存'
+    + '（与引擎库同构：搜索 + 真折叠，不折进黑洞）。',
+  noun: '插件',
+  groups: [PLUGIN_GROUP],
+  searchId: 'plugSearch',
+  searchPlaceholder: '🔍 搜索插件名…（例：weather、news、music）',
+  catLabel: '组',
+  namesOf: () => pluginNames(),
+  rootOf: (cat, name) => `plugins.${name}`,
+  typeOf: (cat, name) => getPath(state, `plugins.${name}.provider`),
+  cardOf: (cat, name, opts) => pluginCard(name, opts),
+  tagOf: () => '',
+  emptyText: '配置里没有插件。',
+  missingText: (n) => `无匹配插件（在全部 ${n} 个插件里都找不到）`,
+};
+
+/** 插件名清单：**从配置树读**（与引擎库的「从树读」同理，§9 规则 1）。
+ *
+ * 不从域表里的 ``plugins.*`` 字段枚举反推：域表只说「这些字段怎么分层」，
+ * 配置树才说「装了哪些插件」。一个在树上存在、域表里没列过的插件（上游新增）
+ * 必须照样可达——这与本机自加的 ``Mlx*TTS`` 是同一条规则。
+ *
+ * 排序按插件名（配置树键序），让两张库的卡片顺序稳定。
+ */
+function pluginNames() {
+  const names = [];
+  const push = (n) => { if (n && !names.includes(n)) names.push(n); };
+  const tree = getPath(state, 'plugins');
+  if (tree && typeof tree === 'object' && !Array.isArray(tree)) {
+    for (const [k, v] of Object.entries(tree)) {
+      if (v && typeof v === 'object' && !Array.isArray(v)) push(k);
+    }
+  }
+  // 树上有而表里有的名字都算；域表里列过但树上没有的（未装）也补上——
+  // 与引擎库同理：库是「可配的全部」，不是「此刻存在的全部」。
+  for (const root of Object.keys(DECLARED_FIELDS)) {
+    if (root.startsWith('plugins.')) push(root.slice('plugins.'.length));
+  }
+  return names;
+}
+
+/** 一条插件卡（``plugins.<插件名>``）。
+ *
+ * 「启用中」的判据与脏分组的判据**同一把尺**：插件名在**选中意图分支**的
+ * ``functions`` 清单里。同理不做第二把尺子。
+ */
+function pluginCard(name, opts) {
+  const scope = currentToolsScope();
+  return componentCard('plugins.' + name, {
+    idPrefix: 'plug', fieldAttr: 'data-plugin',
+    tag: '',
+    live: scope.enabledPlugins.includes(name),
+    liveLabel: '已启用',
+  });
+}
+
+/** 库的外框（tab 栏 + 搜索 + 卡列表）。卡体按需填充（折叠态 DOM 字段数 = 0）。 */
+function renderLibrary(spec, before) {
+  const body = $('domainBody');
+  body.classList.remove('placeholder');
+  const groups = spec.groups;
   const q = QUERY.trim().toLowerCase();
   // 命中谓词只许有一份：命中数与「分布在 X / Y」文案共用它，写两遍就会
   // 出现「匹配 3 条 —— 分布在 0 个类目」这种自相矛盾的输出（两把尺子）。
-  const hitOf = (cat, name) => {
-    const ty = String(getPath(state, `${cat}.${name}.type`) ?? '');
+  const hitOf = (group, name) => {
+    const ty = String(spec.typeOf(group, name) ?? '');
     return name.toLowerCase().includes(q) || ty.toLowerCase().includes(q);
   };
+  // 库里总共有多少个条目：搜索无果时的文案要说准数量（说组数就变成了
+  // 「在全部 1 个插件里都找不到」这种废话）。
+  const totalItems = groups.reduce((n, g) => n + spec.namesOf(g).length, 0);
   let cards = '';
   let note = '';
   if (q) {
-    // 搜索**必须跨类目**（§5.1）。命中项带类目标签。
+    // 搜索**必须跨组**（§5.1）。命中项带组标签。
     const hits = [];
-    const hitCats = [];
-    for (const cat of ENGINE_CATEGORIES) {
-      const matched = enginesOf(cat).filter((n) => hitOf(cat, n));
-      if (matched.length) hitCats.push(cat);
-      for (const name of matched) hits.push(engineCard(cat, name, { showCat: true }));
+    const hitGroups = [];
+    for (const group of groups) {
+      const matched = spec.namesOf(group).filter((n) => hitOf(group, n));
+      if (matched.length) hitGroups.push(group);
+      for (const name of matched) {
+        hits.push(spec.cardOf(group, name, { showCat: true }));
+      }
     }
-    cards = hits.length ? hits.join('')
-      : `<div class="hint" style="padding:15px 0">无匹配引擎（全部 ${ENGINE_CATEGORIES.length} 个类目里都找不到）</div>`;
-    note = `搜索态（<b>跨全部 ${ENGINE_CATEGORIES.length} 个类目</b>）：匹配 <b>${hits.length}</b> 条`
-      + (hitCats.length ? ` —— 分布在 ${hitCats.join(' / ')}` : '') + '。';
+    cards = hits.length ? hits.join('') : `<div class="hint" style="padding:15px 0">${esc(spec.missingText(totalItems))}</div>`;
+    note = `搜索态（<b>跨全部 ${groups.length > 1 ? `${groups.length} 个${esc(spec.catLabel)}` : `${totalItems} 个${esc(spec.noun)}`}</b>）：匹配 <b>${hits.length}</b> 条`
+      + (hitGroups.length && groups.length > 1
+        ? ` —— 分布在 ${hitGroups.join(' / ')}` : '') + '。';
   } else {
-    if (!CUR_CAT) CUR_CAT = ENGINE_CATEGORIES[0];
-    cards = enginesOf(CUR_CAT).map((n) => engineCard(CUR_CAT, n)).join('')
-      || '<div class="hint" style="padding:15px 0">这个类目下没有引擎。</div>';
-    const nEntries = enginesOf(CUR_CAT).length;
-    const nFields = enginesOf(CUR_CAT)
-      .reduce((n, name) => n + fieldsOf(CUR_CAT, name).length, 0);
-    note = `类目 <b>${esc(CUR_CAT)}</b>：<b>${nEntries}</b> 条引擎、`
-      + `<b>${nFields}</b> 个字段。折叠态下 DOM 里字段数 = 0，展开才渲染。`;
+    if (groups.length > 1) {
+      if (!CUR_CAT || !groups.includes(CUR_CAT)) CUR_CAT = groups[0];
+      cards = spec.namesOf(CUR_CAT).map((n) => spec.cardOf(CUR_CAT, n)).join('')
+        || `<div class="hint" style="padding:15px 0">${esc(spec.emptyText)}</div>`;
+      const nEntries = spec.namesOf(CUR_CAT).length;
+      const nFields = spec.namesOf(CUR_CAT)
+        .reduce((n, name) => n + fieldsOf(spec.rootOf(CUR_CAT, name)).length, 0);
+      note = `${esc(spec.catLabel)} <b>${esc(CUR_CAT)}</b>：<b>${nEntries}</b> 条${esc(spec.noun)}、`
+        + `<b>${nFields}</b> 个字段。折叠态下 DOM 里字段数 = 0，展开才渲染。`;
+    } else {
+      const group = groups[0];
+      cards = spec.namesOf(group).map((n) => spec.cardOf(group, n)).join('')
+        || `<div class="hint" style="padding:15px 0">${esc(spec.emptyText)}</div>`;
+      const nEntries = spec.namesOf(group).length;
+      const nFields = spec.namesOf(group)
+        .reduce((n, name) => n + fieldsOf(spec.rootOf(group, name)).length, 0);
+      note = `共 <b>${nEntries}</b> 个${esc(spec.noun)}、<b>${nFields}</b> 个字段。`
+        + '折叠态下 DOM 里字段数 = 0，展开才渲染。';
+    }
   }
-
-  body.innerHTML = slots + globalsBlock
-    + `<section class="group" id="all-engines"><h2>📚 全部引擎</h2>
-        <div class="desc">按类目浏览，或搜索（搜索**跨全部类目**，命中项带类目标签）。</div>
-        <div class="catbar" id="catbar">${ENGINE_CATEGORIES.map((cat) =>
-          `<button type="button" class="cattab${cat === CUR_CAT && !q ? ' on' : ''}"
-            data-cat="${esc(cat)}">${esc(cat)}</button>`).join('')}</div>
-        <input class="search" id="engSearch" type="search" value="${esc(QUERY)}"
-          placeholder="🔍 搜索引擎名或 type…（例：mlx、doubao、openai）">
+  const tabs = groups.length > 1
+    ? `<div class="catbar" id="catbar">${groups.map((cat) =>
+      `<button type="button" class="cattab${cat === CUR_CAT && !q ? ' on' : ''}"
+        data-cat="${esc(cat)}">${esc(cat)}</button>`).join('')}</div>`
+    : '';
+  body.innerHTML = (before || '')
+    + `<section class="group" id="${esc(spec.id)}"><h2>${esc(spec.title)}</h2>
+        <div class="desc">${esc(spec.desc)}</div>
+        ${tabs}
+        <input class="search" id="${esc(spec.searchId)}" type="search" value="${esc(QUERY)}"
+          placeholder="${esc(spec.searchPlaceholder)}">
         <div class="libnote">${note}</div>
         <div class="lib" id="lib">${cards}</div>
       </section>`;
-  bindEngineLibrary();
+  bindLibrary(spec);
   // 初始展开的卡（当前生效那一条）要立即填体；其余保持空壳（折叠态字段数 = 0）。
   document.querySelectorAll('.engine[open] .engbody').forEach(fillEngineBody);
   bindInputs(body);
@@ -504,27 +753,28 @@ function slotRow(cat) {
   return `<div class="slot" id="slot-${esc(cat)}">
     <div class="cat">${esc(cat)}</div>
     <div class="selc"><select data-selcat="${esc(cat)}">${opts}${extra}</select></div>
-    <div class="meta">${esc((owner && owner.type) ?? '?')} · ${fieldsOf(cat, cur).length} 字段</div>
+    <div class="meta">${esc((owner && owner.type) ?? '?')} · ${fieldsOf(cat + '.' + cur).length} 字段</div>
     ${d ? `<span class="badge" style="background:rgba(124,92,255,.18);color:#a78bfa">[选择] 改自 ${esc(d.from ?? '（无）')}</span>` : ''}
   </div>`;
 }
 
-function bindEngineLibrary() {
+/** 一个库的交互：tab 切换、搜索（保持焦点）、``<details>`` 按需填体。 */
+function bindLibrary(spec) {
   document.querySelectorAll('.cattab').forEach((btn) => {
     btn.addEventListener('click', () => {
       CUR_CAT = btn.dataset.cat;
       QUERY = '';
-      renderEngineLibrary();
+      rerenderLibrary(spec);
       applyHash();
     });
   });
-  const search = $('engSearch');
+  const search = $(spec.searchId);
   if (search) {
     search.addEventListener('input', () => {
       QUERY = search.value;
-      renderEngineLibrary();
+      rerenderLibrary(spec);
       // 重建会把焦点弄丢；搜索框是连续输入的控件，焦点必须留在原地。
-      const again = $('engSearch');
+      const again = $(spec.searchId);
       if (again) { again.focus(); again.setSelectionRange(QUERY.length, QUERY.length); }
     });
   }
@@ -538,9 +788,60 @@ function bindEngineLibrary() {
     sel.addEventListener('change', () => {
       setPath(state, 'selected_module.' + sel.dataset.selcat, sel.value);
       markChanged();
-      renderEngineLibrary();
+      rerenderLibrary(spec);
     });
   });
+}
+
+/** 重画当前库（tab / 搜索 / 下拉变化时）。
+ *
+ * 引擎库的重画会连带重画上方的「当前生效」与全局参数（它们在同一段
+ * ``before`` 里）；工具域的重画同理带上散字段卡与意图分支卡。
+ */
+function rerenderLibrary(spec) {
+  if (spec === ENGINE_LIBRARY) renderEngineLibrary();
+  else renderToolsLibrary();
+}
+
+/* ---------------------------------------------------------------------------
+ * 工具域（§7）
+ *
+ * 形状：三个部分，逐条照 §7 表与移交注记：
+ *
+ *   1. **当前生效意图引擎** + **工具调用**（散字段）：域内普通卡片，
+ *      ``selected_module.Intent`` 是选择器（与引擎页六行同构）；
+ *   2. **意图分支卡**（§7 移交注记 1）：``function_call`` / ``nointent`` /
+ *      ``intent_llm`` 各一张——**两份 functions 清单同时可见**，切换
+ *      ``selected_module.Intent`` 不再让清单消失；
+ *   3. **插件库**（§7 移交注记 2）：与引擎库同构（搜索 + 真折叠），
+ *      未启用插件的参数不再折进 ``<details>`` 黑洞。
+ *
+ * 为什么意图分支也做成卡而不是塞进「当前生效」那一块：§7 把每一条分支的字段
+ * 当成一个独立条目计数（``Intent.function_call`` 2 / ``nointent`` 1 /
+ * ``intent_llm`` 3），分成三张卡才能让 32 这个数在页面上数得出来。
+ */
+function renderToolsLibrary() {
+  // 域内普通分组（选择器 / 工具调用 / 三条分支）与插件库分开渲染：分组卡的
+  // 折叠规则（§2.5）与库的折叠规则（真折叠 + 懒构建）是两件事。
+  const domainHasCommon = SCHEMA.groups.some(
+    (g) => g.fields.some((f) => f.layer === 'common'));
+  const plain = SCHEMA.groups.filter((g) => g.id !== 'plugins');
+  const before = plain.map((g) => toolsGroupCard(g, domainHasCommon)).join('');
+  renderLibrary(PLUGIN_LIBRARY, before);
+}
+
+/** 工具域的一张普通分组卡。
+ *
+ * ``intent-selector`` 是特例：``selected_module.Intent`` 的控件是**下拉**
+ * （候选 = ``INTENT_BRANCHES``），不是文本框——写错一个名字就是「意图引擎
+ * 静默失效」，而它没有下拉之外的防呆手段（与引擎页的六行同理）。
+ */
+function toolsGroupCard(g, domainHasCommon) {
+  // 与 ``groupCard`` 是同一实现，差异只在意图选择器要补候选项。
+  return groupCard(g, domainHasCommon, g.id === 'intent-selector'
+    ? (fs) => fs.map((f) => ({ ...f, kind: 'select', options: INTENT_BRANCHES,
+        selcat: 'Intent' }))
+    : null);
 }
 
 /* ---------------------------------------------------------------------------
@@ -549,6 +850,7 @@ function bindEngineLibrary() {
 
 function render() {
   if (IS_ENGINE_DOMAIN) { renderEngineLibrary(); return; }
+  if (IS_TOOLS_DOMAIN) { renderToolsLibrary(); return; }
   const body = $('domainBody');
   // §2.5：域内常用层为空时折叠区不渲染、全部字段平铺（系统域就是这样）。
   const domainHasCommon = SCHEMA.groups.some(
@@ -562,13 +864,29 @@ function render() {
  * 脏状态（跨页摘要写在 localStorage，只含路径与计数）
  * ------------------------------------------------------------------------ */
 
+/** 当前选中（``selected_module.*``）：引擎六族 + 意图分支。
+ *
+ * ``Intent`` 必须一起收：工具域的两份 functions 清单靠它判生效性（§5.4 的分组
+ * 随选中实时重算），漏了它就变成「所有意图分支都算未选中」——分类在说谎。
+ */
 function currentSelection() {
   const sel = {};
   for (const cat of ENGINE_CATEGORIES) {
     const v = getPath(state, 'selected_module.' + cat);
     if (v !== undefined) sel[cat] = v;
   }
+  const intent = getPath(state, 'selected_module.Intent');
+  if (intent !== undefined) sel.Intent = intent;
   return sel;
+}
+
+/** 工具域的分组范围：选中分支 + 它的 functions 清单（同一份状态模型函数）。
+ *
+ * **与 ``currentSelection`` 同一时刻重算**，所以「切意图引擎 → 两份清单的生效性
+ * 升降级」是同一帧里的事，不存在缓存不一致的窗口。
+ */
+function currentToolsScope() {
+  return toolsScope(state, INTENT_BRANCHES);
 }
 
 /** 本域脏条目（域表之外的脏不属于本页，不显示也不写摘要）。 */
@@ -616,9 +934,11 @@ function markChanged() {
  * （``.row.dirty``）同样就地改——行级标记与卡级圆点是两处不同的视觉提示。
  */
 function refreshEngineMarks() {
-  if (!IS_ENGINE_DOMAIN) return;
+  if (!IS_ENGINE_DOMAIN && !IS_TOOLS_DOMAIN) return;
   document.querySelectorAll('details.engine').forEach((det) => {
-    const key = det.dataset.engine || '';
+    // 卡上的锚点属性按域不同（``data-engine`` / ``data-plugin``），但都是
+    // **组件根路径**——脏前缀匹配与深链用的是同一个值（两处同源）。
+    const key = det.dataset.libRoot || '';
     const dirty = Object.keys(DIRTY).some(
       (p) => p === key || p.startsWith(key + '.'));
     det.classList.toggle('dirty', dirty);
@@ -629,8 +949,19 @@ function refreshEngineMarks() {
       const path = input ? (input.dataset.path || input.dataset.list) : '';
       rowEl.classList.toggle('dirty', Boolean(DIRTY[path]));
     });
+    // 插件的「已启用」标记同样随 functions 清单实时重画（切意图引擎时
+    // 整库的启用态会变）——它也是「一行小节点」，不需要重建 DOM。
+    if (IS_TOOLS_DOMAIN && det.dataset.plugin) {
+      const name = det.dataset.plugin.slice('plugins.'.length);
+      const live = currentToolsScope().enabledPlugins.includes(name);
+      det.classList.toggle('live', live);
+      const tag = det.querySelector('.live-tag');
+      if (tag) tag.hidden = !live;
+    }
   });
-  for (const cat of ENGINE_CATEGORIES) {
+  // 选择器（引擎六族 + 意图分支）的 DOM 值与状态对齐。
+  const selCats = IS_TOOLS_DOMAIN ? ['Intent'] : ENGINE_CATEGORIES;
+  for (const cat of selCats) {
     const sel = document.querySelector(`select[data-selcat="${cat}"]`);
     const cur = getPath(state, 'selected_module.' + cat);
     if (sel && cur !== undefined && sel.value !== cur) sel.value = cur;
@@ -659,7 +990,11 @@ function renderDirtyPanel() {
   if (!box) return;
   const n = Object.keys(DIRTY).length;
   if (n === 0) { box.innerHTML = ''; return; }
-  const groups = groupDirty(DIRTY, currentSelection(), ENGINE_CATEGORIES);
+  // 工具域多传一层「组件范围」：`Intent` 分支与插件都是可选中/可启用的组件，
+  // 不传这一层的话 `plugins.get_weather.api_key` 这种三段路径会被当成散字段。
+  // 两种域传不同的范围，但用的是**同一个** `groupDirty`（不是两份分组实现）。
+  const tools = IS_TOOLS_DOMAIN ? currentToolsScope() : undefined;
+  const groups = groupDirty(DIRTY, currentSelection(), ENGINE_CATEGORIES, tools);
   const block = (title, items) => items.length
     ? `<div><b>${title}</b> · ${items.length} 条${items.map((it) =>
       `<div class="dirty-item">${esc(dirtyLabel(it))}</div>`).join('')}</div>`
@@ -752,20 +1087,20 @@ function bindInputs(root) {
 function rerenderKeepingFoldState() {
   const openCards = [];
   document.querySelectorAll('details.engine[open]').forEach((d) => {
-    openCards.push(d.dataset.engine);
+    openCards.push(d.dataset.libRoot);
   });
   const openMore = [];
   document.querySelectorAll('details.more-settings[open]').forEach((d) => {
     const card = d.closest('details.engine');
-    if (card) openMore.push(card.dataset.engine);
+    if (card) openMore.push(card.dataset.libRoot);
   });
   render();
   for (const key of openCards) {
-    const det = document.querySelector(`details.engine[data-engine="${key}"]`);
+    const det = document.querySelector(`details.engine[data-lib-root="${cssEscape(key)}"]`);
     if (det) det.open = true;
   }
   for (const key of openMore) {
-    const det = document.querySelector(`details.engine[data-engine="${key}"]`);
+    const det = document.querySelector(`details.engine[data-lib-root="${cssEscape(key)}"]`);
     if (det) det.querySelectorAll('details.more-settings').forEach((m) => { m.open = true; });
   }
 }
@@ -882,6 +1217,25 @@ function applyHash() {
       renderEngineLibrary();
       const tab = document.querySelector(`.cattab[data-cat="${cssEscape(known)}"]`);
       if (tab) tab.scrollIntoView({ block: 'start' });
+      return;
+    }
+  }
+
+  // ---- 工具域：``#<插件名>`` 直达插件卡（§4.5 的 ``#<分组id>`` 延伸） ----
+  // 插件卡与分组卡都是域内的锚点目标，但插件名可能恰好与某个分组 id 同名
+  // （都是 ASCII），所以先试插件卡、再回落分组 id（顺序写死，不许两边都查）。
+  if (IS_TOOLS_DOMAIN) {
+    // 按**锚点属性**查（与引擎页同一把尺），不按元素 id 拼字符串：
+    // id 的模板（``plug-plugins-<名>``）与这里探的名字不同源，拼 id 会
+    // 得到一个永远不存在的值——分支看似在、其实永不进入。
+    const plug = document.querySelector(
+      `details.engine[data-plugin="${cssEscape('plugins.' + id)}"]`);
+    if (plug) {
+      plug.open = true;
+      fillEngineBody(plug.querySelector('.engbody'));
+      plug.scrollIntoView({ block: 'start' });
+      plug.classList.add('hash-flash');
+      setTimeout(() => plug.classList.remove('hash-flash'), 1500);
       return;
     }
   }

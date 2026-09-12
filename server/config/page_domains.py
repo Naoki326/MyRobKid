@@ -1,8 +1,9 @@
 """page_domains.py — 页面域的字段归属表（父 spec §7 的机械复算）。
 
 方案文档 §2 的三条规则（R1 求属主 / R2 定分层 / 接入字段名字集）机械算出了
-§7 的五张映射表（527 字段）。本模块把**已上线的三个域**——对话与角色（15）、
-引擎（450）、系统（13）——搬进代码，成为渲染与计数的单一事实源。
+§7 的五张映射表（527 字段）。本模块把**已上线的四个域**——对话与角色（15）、
+引擎（450）、插件与工具（32）、系统（13）——搬进代码，成为渲染与计数的单一
+事实源。
 
 为什么字段归属要写在 Python 侧而不是页面里：
 
@@ -11,11 +12,16 @@
    只能靠正则抓 HTML，脆且验不到计数。
 2. **零字段丢失可复算**（§10.1）。字段总数与分层计数是方案的一条验收判据，
    逐条渲染的页面 HTML 里数不出来，表里可以。
-3. **后续域（插件/设备）照抄形状**：加一个 ``Domain`` 只是往表里加条目，
+3. **后续域（设备）照抄形状**：加一个 ``Domain`` 只是往表里加条目，
    渲染器、脏计数、占位页都不用改。
 
-表里**只放已裁决的域**。其余两域（tools / devices）只交付占位页，它们的字段
-归属是 #28/#29 的事——在这里预留空表反而会把「未实现」装成「已裁决」。
+表里**只放已裁决的域**。剩下的一域（devices）只交付占位页，它的字段归属是
+#29 的事——在这里预留空表反而会把「未实现」装成「已裁决」。
+
+除了五张字段表，本模块还持有两个**组件轴**（§5.1 / §7 移交注记 2）：
+``ENGINE_CATEGORIES``（六族）与 ``INTENT_BRANCHES``（三条意图分支）。它们是
+「哪些组件可被选中/启用」的单一事实源，既喂页面下拉的候选，也喂 ``classifyDirty``
+的生效性分组——页面与状态模型两边都不再各写一份。
 """
 
 from dataclasses import dataclass, field
@@ -235,6 +241,17 @@ SYSTEM = DomainSchema(
 #: 分叉的后果是「某类目下改了字段却归错组」——静默且难查。
 #: `selected_module.Intent` **不在其中**：它属插件与工具域（#28）。
 ENGINE_CATEGORIES = ('VAD', 'ASR', 'LLM', 'VLLM', 'TTS', 'Memory')
+
+#: 意图分支（`Intent.*` 的键）——**单一事实源**。
+#:
+#: 与 ``ENGINE_CATEGORIES`` 完全同构：`selected_module.Intent` 是它的选择器，
+#: 选中分支的字段「重启后生效」，未选中分支是「仅提前配好」（§5.3/§5.4）。
+#: 消费者三处：工具域页的意图分支卡、`classifyDirty` 的「是否真在意图域」判据、
+#: `selected_module.Intent` 下拉的候选。
+#:
+#: 三条分支**不来自配置树**：``nointent`` 这类分支在本机可能没配（树上没有），
+#: 但「切换意图引擎」的候选必须有它，否则用户切不回来。
+INTENT_BRANCHES = ('function_call', 'nointent', 'intent_llm')
 
 #: 引擎全局参数（§7 引擎表头两组）——不属于任何一条引擎。
 ENGINE_GLOBALS = [
@@ -851,6 +868,157 @@ CATEGORY_DESC = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 插件与工具（32 字段；§7 表逐行照抄）
+#
+# R1：意图编排与工具面——Intent 子树（意图即工具编排器）、plugins.*、
+# 外部 MCP、工具调用参数。分层：27 常用 / 5 更多设置（§3 合计表）。
+#
+# 为什么插件库与**引擎库同构**（§5.1 / §7 移交注记 2）：
+#
+# 1. 两者形状相同——都是一组「可替换组件」，每个组件有一堆字段、有启用/未选
+#    中的差别。旧页面的痛点也相同：未启用插件的参数被折进 `<details>` 黑洞，
+#    与「未选中引擎看不见」是同一个病。
+# 2. 卡内分层的机械依据也相同：§7 末尾的**接入字段名字集**（`api_key` /
+#    `base_url` / `provider` / `functions`…）已经被下表吸收——表里的「层」列
+#    就是最终裁决，页面不再自己算一遍名字集。
+#
+# 三个字段的落位说明：
+#
+# - `selected_module.Intent` 属**本域**而非引擎域（§7 表头行；
+#   `ENGINE_CATEGORIES` 里没有 Intent）。它是意图分支的选择器。
+# - `tool_call_timeout` / `mcp_endpoint` 是**域内散字段**（更多设置）：改了就
+#   重启生效，没有「选中」这个状态（§5.3 的口径）。
+# - **意图分支各自成卡**（§7 移交注记 1）：`function_call` 与 `intent_llm`
+#   两份启用清单同时可见、各在自己的卡里，切换 `selected_module.Intent`
+#   不再有「清单消失」的问题。`nointent` 分支没有 functions，只有 type。
+# ---------------------------------------------------------------------------
+TOOLS = DomainSchema(
+    slug="tools",
+    label="插件与工具",
+    groups=[
+        Group(
+            id="intent-selector",
+            title="🎯 当前生效意图引擎",
+            desc="意图即工具编排器：它决定设备用哪条路挑插件。切换即改 "
+                 "selected_module.Intent，会进脏列表的 [选择] 组；两份启用清单"
+                 "都可见（在下面的分支卡里），切走不会让清单消失。",
+            fields=[
+                Field("selected_module.Intent", "当前生效意图引擎", "select",
+                      LAYER_COMMON,
+                      ""),
+            ],
+        ),
+        Group(
+            id="tool-calls",
+            title="🔧 工具调用",
+            desc="与选哪条意图路无关的公共参数：超时与外部 MCP 接入点。",
+            fields=[
+                Field("tool_call_timeout", "工具调用超时(秒)", "number",
+                      LAYER_MORE, "插件/工具单次调用的等待上限"),
+                Field("mcp_endpoint", "外部 MCP 接入点", "text", LAYER_MORE,
+                      "接入外部 MCP 服务的地址（WebSocket）"),
+            ],
+        ),
+        Group(
+            id="intent-function-call",
+            title="⚡ function_call 分支",
+            desc="把插件清单直接交给 LLM 做函数调用：模型自己决定调哪个插件。"
+                 "启用的插件在「全部插件」库里算生效（重启后生效）。",
+            fields=[
+                Field("Intent.function_call.type", "类型", "text", LAYER_COMMON),
+                Field("Intent.function_call.functions", "启用的插件清单", "list",
+                      LAYER_COMMON,
+                      "每项一个插件名；这就是「插件已启用」的定义"),
+            ],
+        ),
+        Group(
+            id="intent-nointent",
+            title="🚫 nointent 分支",
+            desc="不做意图识别，也不调插件：纯聊天。",
+            fields=[
+                Field("Intent.nointent.type", "类型", "text", LAYER_COMMON),
+            ],
+        ),
+        Group(
+            id="intent-intent-llm",
+            title="🤖 intent_llm 分支",
+            desc="先用一条 LLM 判定意图、再从清单里挑插件：比函数调用省 token。"
+                 "它与 function_call 的清单**同时可见**，切换不影响。",
+            fields=[
+                Field("Intent.intent_llm.type", "类型", "text", LAYER_COMMON),
+                Field("Intent.intent_llm.llm", "意图识别 LLM", "text",
+                      LAYER_COMMON,
+                      "做意图判定的引擎名（按名字引用 LLM 引擎）"),
+                Field("Intent.intent_llm.functions", "启用的插件清单", "list",
+                      LAYER_COMMON, "每项一个插件名"),
+            ],
+        ),
+        Group(
+            id="plugins",
+            title="🧩 全部插件",
+            desc="每个插件的接入参数。卡片列表与引擎库同构：跨插件搜索、真折叠，"
+                 "未启用插件的参数不再折进黑洞——它和已启用的一样可编、可存。",
+            fields=[
+                # plugins.get_weather（3；旧归属：意图与插件·已启用）
+                Field("plugins.get_weather.api_host", "天气接口域名", "text",
+                      LAYER_COMMON, "和风天气 API 的域名"),
+                Field("plugins.get_weather.api_key", "天气 API 密钥", "text",
+                      LAYER_COMMON),
+                Field("plugins.get_weather.default_location", "默认城市", "text",
+                      LAYER_COMMON, "用户没说城市时用这个"),
+                # plugins.get_news_from_chinanews（4；旧归属：意图与插件·未启用折叠）
+                Field("plugins.get_news_from_chinanews.default_rss_url", "默认 RSS",
+                      "text", LAYER_COMMON),
+                Field("plugins.get_news_from_chinanews.society_rss_url", "社会新闻 RSS",
+                      "text", LAYER_COMMON),
+                Field("plugins.get_news_from_chinanews.world_rss_url", "国际新闻 RSS",
+                      "text", LAYER_COMMON),
+                Field("plugins.get_news_from_chinanews.finance_rss_url", "财经新闻 RSS",
+                      "text", LAYER_COMMON),
+                # plugins.get_news_from_newsnow（2；旧归属：意图与插件·未启用折叠）
+                Field("plugins.get_news_from_newsnow.url", "接口地址", "text",
+                      LAYER_COMMON),
+                Field("plugins.get_news_from_newsnow.news_sources", "新闻源", "text",
+                      LAYER_COMMON, "分号分隔的源名列表"),
+                # plugins.home_assistant（3；旧归属：意图与插件·未启用折叠）
+                Field("plugins.home_assistant.devices[i]", "设备列表", "list",
+                      LAYER_COMMON, "每项格式：房间,名称,实体 ID"),
+                Field("plugins.home_assistant.base_url", "HA 地址", "text",
+                      LAYER_COMMON, "Home Assistant 的访问地址"),
+                Field("plugins.home_assistant.api_key", "HA 访问令牌", "text",
+                      LAYER_COMMON),
+                # plugins.play_music（3；旧归属：意图与插件·未启用折叠）
+                Field("plugins.play_music.music_dir", "音乐目录", "text",
+                      LAYER_COMMON, "./music"),
+                Field("plugins.play_music.music_ext[i]", "音频扩展名", "list",
+                      LAYER_MORE, "每项如 .mp3"),
+                Field("plugins.play_music.refresh_time", "刷新间隔(秒)", "number",
+                      LAYER_MORE, "扫描音乐目录的周期"),
+                # plugins.search_from_ragflow（4；旧归属：意图与插件·未启用折叠）
+                Field("plugins.search_from_ragflow.description", "用途描述", "text",
+                      LAYER_COMMON, "写给模型看的：什么时候该用这个插件"),
+                Field("plugins.search_from_ragflow.base_url", "RAGFlow 地址", "text",
+                      LAYER_COMMON),
+                Field("plugins.search_from_ragflow.api_key", "RAGFlow 密钥", "text",
+                      LAYER_COMMON),
+                Field("plugins.search_from_ragflow.dataset_ids[i]", "知识库 ID", "list",
+                      LAYER_COMMON, "每项一个 dataset id"),
+                # plugins.web_search（4；旧归属：意图与插件·未启用折叠）
+                Field("plugins.web_search.provider", "搜索提供方", "text",
+                      LAYER_COMMON, "metaso / tavily 等"),
+                Field("plugins.web_search.description", "用途描述", "text",
+                      LAYER_COMMON, "写给模型看的：什么时候该用这个插件"),
+                Field("plugins.web_search.max_results", "最大结果数", "number",
+                      LAYER_MORE),
+                Field("plugins.web_search.api_key", "搜索 API 密钥", "text",
+                      LAYER_COMMON),
+            ],
+        ),
+    ],
+)
+
+
 def _engine_groups():
     """引擎域的六个类目卡：卡内是该族**全部引擎**的字段并集（点号全路径）。
 
@@ -900,7 +1068,7 @@ ENGINE = DomainSchema(
     ] + _engine_groups(),
 )
 
-#: 本票落地的域表（slug → schema）。未上线的两域（tools / devices）**不在**这里
-#: ——它们没有归属表，只有占位页（#28/#29）；伪造一张空表会把「未裁决」装成
+#: 本票落地的域表（slug → schema）。未上线的域（devices）**不在**这里
+#: ——它没有归属表，只有占位页（#29）；伪造一张空表会把「未裁决」装成
 #: 「已裁决」。
-DOMAIN_SCHEMAS = {d.slug: d for d in (DIALOGUE, ENGINE, SYSTEM)}
+DOMAIN_SCHEMAS = {d.slug: d for d in (DIALOGUE, ENGINE, TOOLS, SYSTEM)}
