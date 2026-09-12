@@ -42,6 +42,7 @@ from core.providers.tts.dto.dto import ContentType, TTSMessageDTO, SentenceType
 from config.logger import setup_logging, build_module_string, create_connection_logger
 from config.manage_api_client import DeviceNotFoundException, DeviceBindException, generate_and_save_chat_title
 from core.utils.prompt_manager import PromptManager
+from core.utils.music_session import MusicSession, MUSIC_SESSION_METHOD
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
@@ -165,6 +166,11 @@ class ConnectionHandler:
 
         # llm相关变量
         self.dialogue = Dialogue()
+
+        # 当前音乐会话（issue #9）：设备经既有 MCP 消息通路推来状态变更，服务端
+        # 在这里维护一份，并在每次调用模型前注入系统提示（见 music_prompt / log_music_injection）。
+        # 与对话历史无关——那条通道只服务意图识别，回答那次调用看不到它。
+        self.music_session = MusicSession()
 
         # tts相关变量
         self.sentence_id = None
@@ -1054,6 +1060,51 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
+    def music_prompt(self):
+        """本次模型调用要注入的音乐状态（没有音乐会话时返回 None）。
+
+        每次调用前现取（不是缓存）：换歌后再问，注入的必须是新曲目；暂停后
+        位点冻结，播放中位点随时钟推进。
+        """
+        try:
+            return self.music_session.prompt()
+        except Exception as e:
+            # 注入是只读的旁路：它坏了不该把对话一起带走。
+            self.logger.bind(tag=TAG).error(f"读取音乐会话状态失败: {e}")
+            return None
+
+    def log_music_injection(self, llm_dialogue, music_prompt) -> None:
+        """注入路径锚点（issue #9 的验收缝）。
+
+        判据取「**真的进了**送给模型的那份系统提示」，而不是「读了快照」：
+        占位符被写错、拼装回归、用户自定义模板里没有 ``<music_status>``
+        ——这三种情形下状态读到了却没进提示，而「看起来做了、实际一半失效」
+        正是 issue #9 要防的（那张实测表就是同一个坑）。
+
+        所以锚点跟在拼装**之后**、且以「注入文本是否真出现在系统提示里」
+        为准报 ``injected=yes|no``；断言缝据此能抓住注入失效。
+        """
+        if music_prompt is None:
+            return
+        system_prompt = ""
+        for message in llm_dialogue:
+            if isinstance(message, dict) and message.get("role") == "system":
+                system_prompt = message.get("content") or ""
+                break
+        injected = bool(music_prompt.text) and music_prompt.text in system_prompt
+        self.logger.bind(tag=TAG).info(
+            "Music inject: injected=%s state=%s title='%s' author='%s' form=%s pos=%s"
+            % (
+                "yes" if injected else "no",
+                music_prompt.state,
+                music_prompt.title,
+                music_prompt.author,
+                "live" if music_prompt.live else "finite",
+                "none" if music_prompt.position_s is None
+                else "%.1fs" % music_prompt.position_s,
+            )
+        )
+
     def chat(self, query, depth=0):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
@@ -1135,21 +1186,32 @@ class ConnectionHandler:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
+            # 音乐状态注入（issue #9）：**每次调用模型前**现取一次快照。
+            # 已实测：写在历史里的 system 事件对「开口说话那次调用」不可见
+            # （那一次收到的 system 只有基础提示一条），所以这条注入是必需的
+            # ——只有意图识别那次能看到历史里的事件，缺了这一处就有一半失效。
+            #
+            # 对话只拼一次（两条分支原本各拼一份，是同一份东西），拼完立刻打
+            # 注入锚点——那时才知道注入文本有没有真的落进系统提示。
+            music_prompt = self.music_prompt()
+            music_status = music_prompt.text if music_prompt is not None else ""
+            llm_dialogue = self.dialogue.get_llm_dialogue_with_memory(
+                memory_str, self.config.get("voiceprint", {}), speaker_for_system,
+                music_status,
+            )
+            self.log_music_injection(llm_dialogue, music_prompt)
+
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                     functions=functions,
                 )
             else:
                 llm_responses = self.llm.response(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                 )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")

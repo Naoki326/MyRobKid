@@ -53,8 +53,11 @@ const char* MusicEndingName(MusicEnding ending);
 // 该不该出声、出哪个声。
 MusicCue MusicEndingCue(MusicEnding ending);
 
-// 把位点写进 `pos=` 字段：直播流写 "live"（位点对它无意义），有限内容写
-// 一位小数的秒数。
+// 把位点写进 `pos=` 字段。三种取值，缺一不可：
+//   live=true            → "live"（直播流没有「位点」这个概念）
+//   have_position=false  → "none"（有限内容但位点真不知道；写 0.0 就是撒谎
+//                           —— 会被读成「刚开始放」）
+//   其余                  → 一位小数秒数
 //
 // 为什么收在这里：这段形状原本在三个地方各写一遍——播放器的收场锚点、应用
 // 层的跳过分支与反馈锚点。三处必须同口径（串口断言拿它们互相比对），而其中
@@ -65,8 +68,9 @@ MusicCue MusicEndingCue(MusicEnding ending);
 // 而 size_t 需要 <cstddef>。调用处 snprintf 接受隐式转换，不损失什么。
 //
 // 注意与 pipe: 周期行的区别：那种 2 秒一拍的遥测用整秒（不伪造精度），
-// 收场/pause/resume 这类锚点行才用一位小数（spec 的 ±0.5s 验收缝要得）。
-void WritePositionField(double position_s, bool live, char* out, unsigned out_size);
+// 收场/pause/resume/session 这类锚点行才用一位小数（spec 的 ±0.5s 验收缝要得）。
+void WritePositionField(double position_s, bool live, bool have_position,
+                        char* out, unsigned out_size);
 
 // true = 真故障（落日志时用 ESP_LOGE）。用户主动停止与换歌为 false。
 bool MusicEndingIsFailure(MusicEnding ending);

@@ -1325,6 +1325,10 @@ bool Application::StartMusicNow(const std::string& url) {
     // 先前的对话结束路径过来），而 StartMusicNow 在**任意**任务上运行；写屏
     // 必须在主循环，与 idle 分支的重画同线程、有确定先后。
     ScheduleMusicNowPlaying();
+    // 推送通道（issue #9）：**首帧已解码**（Start 已返回 true）才推 started
+    // ——旧会话若有，其收场归新会话（replaced 不推），这里报的就是新曲目。
+    // SendMcpMessage 内部已 Schedule，从本任务调安全。
+    PushMusicSessionFromSnapshot(music_session_event::kStarted);
     return true;
 }
 
@@ -1336,6 +1340,10 @@ bool Application::PauseMusic(PauseKind kind) {
     if (!music_player_.Pause(kind)) {
         return false;
     }
+    // 推送通道（issue #9）：暂停必须推——服务端要答得出「暂停了吗」，位点
+    // 估算也靠它冻结（否则暂停期间会虚涨）。种类现读播放器（用户暂停降不下来
+    // 那条规矩在播放器里），快照此刻已是 paused_*。
+    PushMusicSessionFromSnapshot(music_session_event::kPaused);
     // 暂停 = 用户已不在播放态：唤醒词/聆听必须恢复，否则暂停成了「半死」
     // 状态（唤醒不了、也停不掉）。续播时再关。答复进行中（speaking）是个例外
     // ——那时的唤醒词口径与 HandleStateChangedEvent 一致（只有 AFE 唤醒词
@@ -1404,6 +1412,10 @@ bool Application::ResumeMusicNow() {
     // idle 分支可能刚重画过消息区（“说完话再播”这条路的清屏在前、写曲目在
     // 后），次序不能靠运气。
     ScheduleMusicNowPlaying();
+    // 推送通道（issue #9）：这里才是「真的又出声了」（Resume() 已置位、解码器
+    // 已复位）。deferred 的那条路在 tts stop 之后的真实续播点会再走到这里，
+    // 由它推 resumed——延后的那一次不算出声，不推假话。
+    PushMusicSessionFromSnapshot(music_session_event::kResumed);
     return true;
 }
 
@@ -1591,6 +1603,71 @@ void Application::ScheduleMusicNowPlaying() {
     Schedule([this]() { WriteMusicNowPlaying("now-playing"); });
 }
 
+void Application::PushMusicSessionEvent(const char* event, const char* state) {
+    // 快照现取：曲目/作者/形态一律来自播放器（issue #3 的唯一事实源），
+    // 不另存副本（副本会与播放器分叉）。
+    const MusicPlaybackStatus status = music_player_.GetPlaybackStatus();
+    MusicSessionEventFacts facts;
+    facts.event = event;
+    facts.state = state;
+    facts.title = status.title;
+    facts.author = status.author;
+    // 内容形态的单一判据是 seekable（live == !seekable），与屏幕出口同一口径。
+    facts.live = !status.seekable;
+    facts.duration_s = status.duration_s;
+    // 位点：在播/暂停快照给出冻结或实时的位点；终态由收场结果传入（那时 worker
+    // 已退出、快照不再有该会话的位点）。直播流两者都不写（硬约束）。
+    if (!facts.live) {
+        facts.have_position = true;
+        facts.position_s = status.position_s;
+    }
+    SendMusicSessionFacts(facts);
+}
+
+void Application::PushMusicSessionFromSnapshot(const char* event) {
+    // 会话活着时走这条：state 直接取快照（playing/paused_conversation/
+    // paused_user），位点也取快照。空闲时（快照为 kIdle）没有可推的东西——
+    // 那是「没有会话」，不是一次状态变更。
+    const MusicPlaybackStatus status = music_player_.GetPlaybackStatus();
+    if (status.state == MusicPlaybackStatus::State::kIdle) {
+        return;
+    }
+    PushMusicSessionEvent(event, status.state_name());
+}
+
+void Application::PushMusicSessionEnding(const MusicPlayer::FinishedResult& result,
+                                         const char* event, const char* state) {
+    // 收场之后播放器快照已空闲、不再带曲目——曲目与形态取自收场结果（它由
+    // worker 在会话结束前填好，与 ending/位点同一条线程）。
+    MusicSessionEventFacts facts;
+    facts.event = event;
+    facts.state = state;
+    facts.title = result.title;
+    facts.author = result.author;
+    facts.live = result.live;
+    facts.duration_s = result.duration_s;
+    // 收场位点：非直播时是有效的「断在哪」；直播不带位点与总量。
+    if (!result.live) {
+        facts.have_position = true;
+        facts.position_s = result.position_s;
+    }
+    SendMusicSessionFacts(facts);
+}
+
+void Application::SendMusicSessionFacts(const MusicSessionEventFacts& facts) {
+    const std::string payload = BuildMusicSessionNotification(facts);
+    // 载荷形状在串口上可断言，不必真跑一次服务端才知道设备说了什么。
+    // 位点字段走与收场/pause/resume 锚点同一个 `WritePositionField`（硬约束：
+    // 直播不带位点、位点未知不冒充 0.0）——四处锚点必须同口径，抄一份就会漂。
+    char pos_field[32];
+    WritePositionField(facts.position_s, facts.live, facts.have_position,
+                       pos_field, sizeof(pos_field));
+    ESP_LOGI(TAG, "Music session: event=%s state=%s title='%s' form=%s pos=%s",
+             facts.event.c_str(), facts.state.c_str(), facts.title.c_str(),
+             facts.live ? "live" : "finite", pos_field);
+    SendMcpMessage(payload);
+}
+
 void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result) {
     // 收场分类是本次会话自己产出的（回调与结果同线程一起交上来），不靠共享
     // 状态反推——「用户按停」与「链路中断」从前都是同一种 Bool 组合，那次混作
@@ -1603,11 +1680,18 @@ void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result)
     // 同一判据、同一处理的跳过分支。
     if (ending == MusicEnding::kReplaced || IsMusicBusy()) {
         char pos_field[32];
-        WritePositionField(result.position_s, result.live, pos_field, sizeof(pos_field));
+        WritePositionField(result.position_s, result.live, /*have_position=*/true, pos_field, sizeof(pos_field));
         ESP_LOGI(TAG, "Music feedback: reason=%s pos=%s skipped=new_session",
                  MusicEndingName(ending), pos_field);
         return;
     }
+
+    // 推送通道（issue #9）：终态经收场分类推给服务端——**它是播放器 worker
+    // 的结论**（已验证的完成条件），不是工具返回值（硬约束）。kReplaced 到此
+    // 已被上面挡掉（旧会话的收场归新会话，不推）；kStartFailed 从来没出过声，
+    // 但服务端需要知道「现在没有音乐在播放」，也推（event=start_failed）。
+    // 位点显式传入：worker 已退出，此刻的快照已不可用。
+    PushMusicSessionEnding(result, MusicEndingName(ending), MusicEndingName(ending));
 
     // 会话已经结束：撤掉自动续播与暂停记账。
     CancelPauseAutoResume();
@@ -1697,7 +1781,7 @@ void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result)
     // 反馈锚点（issue #7 的串口断言）：原因 → 提示音/屏幕 + 是否回到可交互。
     // 位点一位小数（与 pause/resume/ended 锚点同口径）；直播流报 live。
     char pos_field[32];
-    WritePositionField(result.position_s, result.live, pos_field, sizeof(pos_field));
+    WritePositionField(result.position_s, result.live, /*have_position=*/true, pos_field, sizeof(pos_field));
     ESP_LOGI(TAG,
              "Music feedback: reason=%s pos=%s sound=%s screen=%s wake_word=%s "
              "interactive=%s",

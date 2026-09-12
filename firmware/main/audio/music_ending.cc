@@ -67,9 +67,12 @@ bool MusicEndingIsFailure(MusicEnding ending) {
     return traits != nullptr && traits->failure;
 }
 
-void WritePositionField(double position_s, bool live, char* out, unsigned out_size) {
+void WritePositionField(double position_s, bool live, bool have_position,
+                        char* out, unsigned out_size) {
     if (live) {
         snprintf(out, out_size, "live");
+    } else if (!have_position) {
+        snprintf(out, out_size, "none");
     } else {
         snprintf(out, out_size, "%.1fs", position_s);
     }

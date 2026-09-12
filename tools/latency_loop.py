@@ -1,13 +1,159 @@
 #!/usr/bin/env python3
 """对话延迟反馈回路(模拟设备:WS握手→发Opus音频→测各段延迟)
-用法: server/.venv/bin/python tools/latency_loop.py [问题] [--realtime]
+
+用法:
+  server/.venv/bin/python tools/latency_loop.py [问题] [--realtime]
+  server/.venv/bin/python tools/latency_loop.py 这歌谁唱的 --music started \
+      --server-log /tmp/xiaozhi_server.log
+
+--music 扩展（issue #9 的验收缝二）：假设备在说话**之前**先经既有 MCP 消息通路
+推一条 ``music.session`` JSON-RPC 通知（无 id，不期待响应），让服务端知道「现在
+在放什么」；然后照常说话，让模型在一次真实调用里读到注入的音乐状态。
+
+断言的对象是**注入是否发生**，不是模型的措辞（模型输出不确定，不能当回归判据）
+——服务端在注入路径上打一行锚点（``Music inject: injected=yes|no state=… title='…' form=… pos=…``），
+本脚本在 ``--server-log``（或环境变量 ``LOOP_SERVER_LOG``）指向的服务端日志里找它：
+  - 找到且 ``injected=yes``、state 与推送的一致 → 注入真的进了送给模型的内容（绿）；
+  - 一行都没有，或 ``injected=no``  → 事件没到 / 没注入 / 占位符没展开（红）。
+这条判据抓的是「注入没生效」——脚本自造的数据不会让它变绿，因为绿的条件是
+**服务端日志里出现了注入锚点**。
+
+--music 后跟的状态（见 server/core/utils/music_session.py 的线协议）：
+  started | paused | resumed | completed | interrupted | resume_failed | stopped |
+  start_failed，外加 ``--music-live`` 走直播流（不带位点）、``--music-title`` /
+  ``--music-author`` / ``--music-pos`` / ``--music-duration`` 覆盖默认字段。
 """
-import asyncio, json, sys, subprocess, tempfile, time, wave, os
+import asyncio, json, os, re, sys, subprocess, tempfile, time, wave
 import websockets
 import opuslib_next
 
 WS_URL = os.environ.get("LOOP_WS", "ws://127.0.0.1:8002/xiaozhi/v1/")
 TAG = "[LOOP]"
+
+#: 服务端注入路径锚点（connection.log_music_injection）。与固件 `Music screen:`
+#: 同族的行内风格：字段名/引号一致，串口/日志抓取脚本可以统一断言。
+#:
+#: `injected=` 是这条锚点的要害：它由服务端在**拼装完送给模型的那份提示之后**
+#: 按「注入文本是否真出现在系统提示里」判定，所以 ``injected=yes`` 才是
+#: 「音乐状态真的进了模型」的证据。只看「状态=playing」会漏掉占位符缺失、
+#: 拼装回归、用户自定义模板这三种「读到了却没进去」的失效。
+MUSIC_INJECT_RE = re.compile(
+    r"Music inject:\s+injected=(?P<injected>\w+)\s+state=(?P<state>\w+)\s+"
+    r"title='(?P<title>.*?)'\s+"
+    r"author='(?P<author>.*?)'\s+form=(?P<form>\w+)\s+pos=(?P<pos>[\w.]+)")
+
+#: 状态名 → 服务端权威字段的默认组合。与 music_session.py 的 STATE_* 同名。
+_MUSIC_STATES = {
+    "started": {"event": "started", "state": "playing"},
+    "paused": {"event": "paused", "state": "paused_user"},
+    "resumed": {"event": "resumed", "state": "playing"},
+    "completed": {"event": "completed", "state": "completed"},
+    "interrupted": {"event": "interrupted", "state": "interrupted"},
+    "resume_failed": {"event": "resume_failed", "state": "resume_failed"},
+    "stopped": {"event": "stopped", "state": "stopped"},
+    "start_failed": {"event": "start_failed", "state": "start_failed"},
+}
+
+
+def music_notification(state="started", *, title="晴天", author="周杰伦", live=False,
+                       position_s=None, duration_s=None):
+    """构造一条 ``music.session`` 通知（设备 → 服务端，无 id = 不期待响应）。"""
+    spec = _MUSIC_STATES.get(state)
+    if spec is None:
+        raise ValueError(f"未知音乐状态: {state}（可选 {', '.join(_MUSIC_STATES)}）")
+    form = "live" if live else "finite"
+    params = {"event": spec["event"], "state": spec["state"], "title": title,
+              "author": author, "form": form}
+    # 直播流不带位点/总量：带上就是撒谎，服务端也会主动丢（见 music_session.py）。
+    if not live:
+        if position_s is not None:
+            params["position_s"] = position_s
+        if duration_s is not None:
+            params["duration_s"] = duration_s
+    return {"jsonrpc": "2.0", "method": "music.session", "params": params}
+
+
+async def push_music_notification(ws, payload):
+    """经既有 MCP 消息通路发通知（``protocol.cc::SendMcpMessage`` 的线上形状）。"""
+    await ws.send(json.dumps({"session_id": "debug", "type": "mcp",
+                              "payload": payload}))
+
+
+def assert_music_injected(pushed, log_path):
+    """在服务端日志里找注入锚点：找不到 = 注入没生效（验收缝的真判据）。"""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            log = f.read()
+    except OSError as e:
+        print(f"{TAG} !! 读不到服务端日志 {log_path}: {e}")
+        return False
+    matches = list(MUSIC_INJECT_RE.finditer(log))
+    if not matches:
+        print(f"{TAG} !! 注入锚点一条都没有：事件没到 / 没注入 / 占位符没展开")
+        return False
+    last = matches[-1].groupdict()
+    if last["injected"] != "yes":
+        # 状态读到了、但**没进**送给模型的提示（占位符缺失/拼装回归/自定义模板）。
+        # 这正是 issue #9 要防的「看起来做了、实际一半失效」。
+        print(f"{TAG} !! 注入锚点报 injected={last['injected']}："
+              f"音乐状态没进送给模型的内容（占位符没展开？）")
+        return False
+    expected_state = pushed["params"]["state"]
+    if last["state"] != expected_state:
+        print(f"{TAG} !! 注入状态是 {last['state']}，推送的是 {expected_state}")
+        return False
+    if pushed["params"]["title"] and last["title"] != pushed["params"]["title"]:
+        print(f"{TAG} !! 注入曲目是 {last['title']!r}，推送的是 "
+              f"{pushed['params']['title']!r}")
+        return False
+    if pushed["params"]["form"] == "live" and last["pos"] != "none":
+        print(f"{TAG} !! 直播流注入带了位点 {last['pos']}（不该有）")
+        return False
+    print(f"{TAG} 注入已生效: state={last['state']} title='{last['title']}' "
+          f"author='{last['author']}' form={last['form']} pos={last['pos']}")
+    return True
+
+
+#: 需要跟一个值的选项（解析时要把值一并从位置参数里剔掉，否则 ``--server-log
+#: /dev/null`` 会把 ``/dev/null`` 当成要问的问题）。
+_OPTIONS_WITH_VALUE = ("--music", "--music-title", "--music-author", "--music-pos",
+                      "--music-duration", "--server-log")
+
+
+def parse_cli(argv):
+    """拆出位置参数（要问的话）与音乐推送选项。纯函数，方便测试。
+
+    返回 ``(text, music, log_path)``；``music`` 为 None 表示不推送。
+    """
+    options = {}
+    positional = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in _OPTIONS_WITH_VALUE:
+            options[token] = argv[i + 1] if i + 1 < len(argv) else None
+            i += 2
+            continue
+        if token.startswith("--"):
+            i += 1
+            continue
+        positional.append(token)
+        i += 1
+
+    music = None
+    if options.get("--music") is not None:
+        live = "--music-live" in argv
+        music = music_notification(
+            options["--music"],
+            title=options.get("--music-title") or "晴天",
+            author=options.get("--music-author") or "周杰伦",
+            live=live,
+            position_s=None if live else int(options.get("--music-pos") or 0),
+            duration_s=None if live else int(options.get("--music-duration") or 269),
+        )
+    log_path = options.get("--server-log") or os.environ.get("LOOP_SERVER_LOG")
+    return (positional[0] if positional else "你好呀"), music, log_path
+
 
 def pcm_from_say(text):
     wav_path = tempfile.mktemp(suffix=".wav")
@@ -17,7 +163,7 @@ def pcm_from_say(text):
     os.unlink(wav_path)
     return pcm
 
-async def run(text, realtime=False, tail_silence_s=1.8):
+async def run(text, realtime=False, tail_silence_s=1.8, music=None):
     pcm = pcm_from_say(text)
     pcm += b"\x00\x00" * int(16000 * tail_silence_s)
     enc = opuslib_next.Encoder(16000, 1, opuslib_next.APPLICATION_AUDIO)
@@ -34,6 +180,11 @@ async def run(text, realtime=False, tail_silence_s=1.8):
         await ws.send(json.dumps(hello))
         while True:
             if json.loads(await asyncio.wait_for(ws.recv(), 10)).get("type")=="hello": break
+        # 说话之前先推音乐状态：模型这一次调用就该读到它（注入是逐轮现取的）。
+        if music is not None:
+            await push_music_notification(ws, music)
+            print(f"{TAG} 已推送 music.session: state={music['params']['state']} "
+                  f"title={music['params']['title']!r}")
         async def reader():
             nonlocal t_stt, t_first, stt_text
             while True:
@@ -68,6 +219,22 @@ async def run(text, realtime=False, tail_silence_s=1.8):
     print(f"{TAG} 说完话->首包音频 : {r(t_voice_end,t_first)}")
     if t_first is None: print(f"{TAG} !! 未收到回复音频"); sys.exit(1)
 
+
+def _arg_value(argv, name, default=None):
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+
 if __name__ == "__main__":
-    args=[a for a in sys.argv[1:] if not a.startswith("--")]
-    asyncio.run(run(args[0] if args else "你好呀", realtime="--realtime" in sys.argv))
+    argv = sys.argv[1:]
+    text, music, log_path = parse_cli(argv)
+    asyncio.run(run(text, realtime="--realtime" in argv, music=music))
+    if music is not None:
+        if not log_path:
+            print(f"{TAG} !! 未给 --server-log/LOOP_SERVER_LOG，无法断言注入是否生效")
+            sys.exit(1)
+        if not assert_music_injected(music, log_path):
+            sys.exit(1)

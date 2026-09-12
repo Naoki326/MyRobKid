@@ -79,5 +79,8 @@ For the input format `{"speaker":"...", "content":"..."}` (speaker = speaker nam
 {{ dynamic_context }}
 </context>
 
+<music_status>
+</music_status>
+
 <memory>
 </memory>

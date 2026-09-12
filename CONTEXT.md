@@ -68,6 +68,10 @@ _Avoid_: 播放状态（那是设备状态机的泛指）、播放器实例（�
 音乐会话向消息区的呈现：播放中显示曲目、作者与总量（直播流不显示总量），结束/中断显示结束态且不残留旧曲目；不复用状态栏（那里仍报设备状态）。写屏一律晚于它触发的状态转移，且音乐握住消息区时 idle 分支重画而非清空。见 ADR-0015。
 _Avoid_: 状态栏（那是设备状态的出口）、播放器界面（没有进度条/封面）
 
+**推送通道** / **注入**:
+设备把音乐会话的**状态变更**经既有 MCP 消息通路推给服务端（JSON-RPC 通知 `music.session`，无 id，不引入新连接或协议）；服务端维护当前会话，并在**每次调用模型前**把最新状态注入系统提示的 `<music_status>` 占位符（逐轮展开、不累积、不写历史）。通道粒度是状态变更全集（含暂停/继续），历史粒度只写曲目级事件——两者不能合并，否则「暂停了吗」答不出、位点还会在暂停期间虚涨。事件在**真的出声之后**才发（判据是播放器已验证的完成条件，不是工具返回值）。为什么必须走注入而不能只写历史：已实测，写在历史里的 system 事件对「开口说话那次调用」不可见（那次收到的 system 只有基础提示一条），只有意图识别那次能看到。见 ADR-0016。
+_Avoid_: 轮询（服务端不主动问设备）、历史写入（那是另一条出口，只服务意图识别）
+
 **内容形态**:
 音乐会话所播内容的两种形态：**有限内容**（歌曲、播客、视频音频）有时长、可定位、位点可续；**直播流**（网络电台）无时长、定位无意义、续播等同重连。四类内容同走一个播放器，形态差异须由会话记录，否则对直播流定位会静默乱跳。
 _Avoid_: 音频类型（泛称）、格式（那指编解码）
@@ -145,13 +149,14 @@ _Avoid_: 未保存提示（泛称）、黄色圆点（那只是载体）
 ### 运维与调试
 
 **反馈回路**:
-主仓 tools/latency_loop.py：模拟机器人走完整对话链路，分段测量延迟的诊断工具。
+主仓 tools/latency_loop.py：模拟机器人走完整对话链路，分段测量延迟的诊断工具。`--music <state>` 扩展（issue #9 验收缝二）：说话前先经 MCP 消息通路推一条 `music.session` 通知，再据 `--server-log` 里的 `Music inject:` 锚点断言「注入是否生效」（不断言模型措辞）。
 _Avoid_: 测试脚本（泛称）、压测
 
 **管线遥测**:
 固件 MusicPlayer 每 2 秒打印的 `pipe:` 行（ring 水位/in_buf/下载字节/推帧与失败计数/位点 pos（整秒）/暂停标记 PAUSED_CONV|PAUSED_USER），音乐卡顿定位与位点核验的第一证据源；配套 USB 串口（115200）抓设备日志，`tools/serial_telemetry.py --assert` 可对位点做断言（不超墙钟、不低于起点、live 无数字位点、暂停期间位点冻结、续播接缝在 ±0.5s 内、用户暂停绝不自动续）。另有 `Music pause:` / `Music resume: mode=continue|restart` / `Music auto-resume:` 三条行为锚点行，位点带一位小数（spec 的 ±0.5s 验收缝；`pipe:` 周期行仍整秒）。
 收场反馈另有两条（issue #7）：`Music ended: reason=<completed|interrupted|resume_failed|stopped|replaced|start_failed> played=0|1 pos=…` 是播放器自报的收场真相，`Music feedback: reason=… sound=<success|alert|none> screen=<ended|interrupted|stopped|none> wake_word=on|off interactive=<scheduled|already|wake_word_only|none>` 是应用侧对真相的处置（换歌的旧会话打 `skipped=new_session`）。三者（音/屏/因果）同一条锚点行里对齐，串口断言据此核「自然播完与链路中断的音不同」「用户主动停止绝不报故障音」，不靠耳朵。
 屏幕出口（issue #8）：`Music screen: action=<now-playing|repaint|end-state|skip> seq=N owns=on|off idle_gen=N device=<idle|listening|…> title='…' author='…' form=<live|finite> duration=Ns total=<m:ss|none> text='…'` 是应用侧把**消息区真正设成了什么**的锚点——`text=` 是写下去的那串字符，`device=` 是写屏那一刻的状态，二者同行所以「曲目在状态转移之后设置」可验（`now-playing` 行的 `device=` 必须是 `idle`，且写屏晚于 `State: … -> idle`）。`action=repaint` 是 idle 分支的重画（存在本身即「曲目活过了清屏」的证据），`end-state` 的 `title=` 为空即「不留陈旧曲目」。
+推送通道（issue #9）：设备侧 `Music session: event=<…> state=<…> title='…' form=<live|finite> pos=…` 是每次推 `music.session` 通知时打的锚点（载荷形状与推送时机同一条行里对齐）；服务端侧 `Music session: applied=<yes|no> state=… title='…' form=… pos=…` 是事件入口锚点（`applied=no` 即重复事件被幂等挡住），`Music inject: injected=<yes|no> state=… title='…' form=… pos=…` 是**注入路径**锚点（每次调用模型前现取、有状态才打；`injected=` 按「注入文本是否真出现在送给模型的系统提示里」算出，不是「读到了快照」）——后者是「注入真的进了送给模型的内容」的唯一可观察出口（WS 协议不回显提示词），tools/latency_loop.py 的 `--music` 据它断言。
 _Avoid_: 音乐日志（泛称）、debug 日志
 
 **音乐地址自检**:

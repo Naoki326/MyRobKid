@@ -102,6 +102,13 @@ public:
         // 0 且 live=true。用户停止与链路中断都靠它报出「断在哪」。
         double position_s = 0.0;
         bool live = false;
+        // 本次会话的曲目（issue #9）：收场之后 GetPlaybackStatus() 已报空闲、
+        // 不再带曲目，而推送通道要告诉服务端「刚才放的是什么」（否则服务端
+        // 只能把它覆盖成「未知曲目」）。与 ending/位点同一条线程产出，不落
+        // 共享成员——换歌时旧 worker 的曲目绝不能喂给新会话。
+        std::string title;
+        std::string author;
+        int duration_s = 0;
     };
     using FinishedCallback = std::function<void(const FinishedResult& result)>;
 

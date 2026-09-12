@@ -6,6 +6,7 @@ import re
 from concurrent.futures import Future
 from core.utils.util import get_vision_url, sanitize_tool_name
 from core.utils.auth import AuthToken
+from core.utils.music_session import MUSIC_SESSION_METHOD
 from config.logger import setup_logging
 from typing import TYPE_CHECKING
 
@@ -115,6 +116,61 @@ async def send_mcp_message(conn: "ConnectionHandler", payload: dict):
         logger.bind(tag=TAG).error(f"发送MCP消息失败: {e}")
 
 
+def _format_music_position(params: dict) -> str:
+    """锚点行的位点字段：直播流写 ``live``，有限内容写一位小数秒数。
+
+    与设备侧 ``WritePositionField`` 同一口径（``Music pause:`` / ``Music ended:``
+    那些行也用一位小数）。位点缺失（设备没报）写 ``none``——不知道位点不是
+    位点为 0，写 0.0 就是撒谎。
+    """
+    form = params.get("form")
+    if isinstance(form, str) and form.strip().lower() == "live":
+        return "live"
+    position = params.get("position_s")
+    if isinstance(position, bool) or not isinstance(position, (int, float)):
+        return "none"
+    return "%.1fs" % float(position)
+
+
+def _apply_music_session_event(conn: "ConnectionHandler", payload: dict) -> None:
+    """把 ``music.session`` 通知吃进当前连接的音乐会话。
+
+    安静忽略是一等行为，不是缺陷：``params`` 缺失/类型错、未知状态、重复事件
+    都只返回 False（重复还会被幂等挡住），不报错、不断开。关闭音乐功能时设备
+    不发，服务端也什么都不注入——注入无害由这一条守着。
+
+    为什么打一行锚点（含 state/title/form/位点）：注入没生效是最难查的错
+    ——它不掉异常，只是模型答不出「这歌谁唱的」。这条锚点让「事件进来了没、
+    状态是什么」在日志里可断言（沿固件 ``Music screen:`` / ``Music ended:``
+    的行内风格）。重复事件也打（``applied=no``），重连重发的行为才可见。
+    """
+    session = getattr(conn, "music_session", None)
+    if session is None:
+        return
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    try:
+        applied = session.apply_event(params)
+    except Exception as e:
+        # 通知是只读的旁路：它坏了不该把连接一起带走。
+        logger.bind(tag=TAG).error(f"处理音乐会话事件失败: {e}")
+        return
+    state = params.get("state") or params.get("event") or "unknown"
+    position = _format_music_position(params)
+    logger.bind(tag=TAG).info(
+        "Music session: applied=%s state=%s title='%s' author='%s' form=%s pos=%s"
+        % (
+            "yes" if applied else "no",
+            state,
+            params.get("title") or "",
+            params.get("author") or "",
+            "live" if position == "live" else "finite",
+            position,
+        )
+    )
+
+
 async def handle_mcp_message(
     conn: "ConnectionHandler", mcp_client: MCPClient, payload: dict
 ):
@@ -222,6 +278,15 @@ async def handle_mcp_message(
     elif "method" in payload:
         method = payload["method"]
         logger.bind(tag=TAG).info(f"收到MCP客户端请求: {method}")
+
+        # 音乐会话状态变更（issue #9）：设备经既有 MCP 通路推来的 JSON-RPC
+        # 通知（无 id，不期待响应）。通道承载的是**状态变更全集**——开始播放
+        # / 换歌 / 暂停 / 继续 / 播完 / 中断 / 续播失败——服务端据此维护当前
+        # 会话并在每次调用模型前注入系统提示（见 connection.music_prompt / log_music_injection）。
+        # 与历史写入无关：那条路只写曲目级事件，暂停与继续不写（但必须推送，
+        # 否则「暂停了吗」答不出、位点还会在暂停期间虚涨）。
+        if method == MUSIC_SESSION_METHOD:
+            _apply_music_session_event(conn, payload)
 
     elif "error" in payload:
         error_data = payload["error"]

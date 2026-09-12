@@ -430,7 +430,7 @@ MusicPlayer::SessionOutcome MusicPlayer::WorkerTask() {
     // 结束」与「出了事」在日志里也不该长得一样。
     char pos_field[32];
     // 一位小数：与 pause/resume 锚点同口径，收场断在哪里要比整秒清楚。
-    WritePositionField(position_s, meta.live, pos_field, sizeof(pos_field));
+    WritePositionField(position_s, meta.live, /*have_position=*/true, pos_field, sizeof(pos_field));
     if (MusicEndingIsFailure(ending)) {
         ESP_LOGE(TAG, "Music ended: reason=%s played=%d pos=%s url=%s",
                  MusicEndingName(ending), facts.played ? 1 : 0, pos_field, url.c_str());
@@ -447,6 +447,11 @@ MusicPlayer::SessionOutcome MusicPlayer::WorkerTask() {
     outcome.result.ending = ending;
     outcome.result.position_s = position_s;
     outcome.result.live = meta.live;
+    // 曲目快照（issue #9）：收场后 GetPlaybackStatus() 不再报曲目，推送通道
+    // 要它才能告诉服务端「刚才放的是哪首」。
+    outcome.result.title = meta.title;
+    outcome.result.author = meta.author;
+    outcome.result.duration_s = meta.duration_s;
     return outcome;
 }
 

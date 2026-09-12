@@ -22,6 +22,7 @@
 #include "notify/notify_player.h"
 #include "audio/music_player.h"
 #include "audio/music_screen.h"
+#include "audio/music_session_event.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -285,6 +286,42 @@ private:
     // 并把设备交回可交互态。分类由播放器产出（music_ending.h）——用户主动停止
     // 与换歌都不出声，自然播完与链路中断各给一个不同的音。
     void HandleMusicFinished(const MusicPlayer::FinishedResult& result);
+    /*
+     * 把一次音乐会话状态变更推给服务端（issue #9）。
+     *
+     * 经**既有 MCP 消息通路**（SendMcpMessage），不引入新连接或协议：载荷是
+     * JSON-RPC 通知（无 id，服务端不回响应）。服务端据此维护当前会话，并在
+     * 每次调用模型前把最新状态注入系统提示——「这歌谁唱的」靠它答对。
+     *
+     * 时机是硬约束：**真的出声之后才发**（不复制既有的假成功模式）。判据是
+     * 播放器已验证的完成条件：
+     *   - started  —— StartMusicNow 已等过首帧解码，快照此时就是 playing；
+     *   - paused   —— PauseMusic 同步置位后调，快照已是暂停态；
+     *   - resumed  —— ResumeMusicNow 已真开始续播（deferred 的那条路不算出声，
+     *                 由 tts stop 之后的真实续播点再推）；
+     *   - completed/interrupted/resume_failed/stopped —— HandleMusicFinished
+     *     收场分类（播放器 worker 的结论），不是工具返回值。
+     *
+     * 为什么要 Schedule/在主循环里发：SendMcpMessage 内部已 Schedule 到主循环，
+     * 所以从任意任务调都安全；而它与工具应答共用同一条 schedule 队列，**先进
+     * 先出**——在工具处理里先推、再构造应答，服务端拿到状态早于/同于那次应答。
+     * 终态（收场）由 HandleMusicFinished 在 finished 回调里推，那时 worker 已退出、
+     * 快照已不可用，所以 state/位点显式传入。
+     *
+     * event/state 成对传入（state 是服务端权威字段，event 进日志）。终态区分靠
+     * event——服务端只认 state，这里两者都给，避免猜。
+     */
+    void PushMusicSessionEvent(const char* event, const char* state);
+    // 便捷形式：从当前播放器快照取 state/曲目/形态/位点（会话活着时用）。
+    void PushMusicSessionFromSnapshot(const char* event);
+    /*
+     * 终态推送（收场）：曲目与形态取自 FinishedResult（那时播放器快照已空闲、
+     * 不再带曲目）。event/state 同传（服务端只认 state，event 进日志）。
+     */
+    void PushMusicSessionEnding(const MusicPlayer::FinishedResult& result,
+                                const char* event, const char* state);
+    // 编载荷 + 打锚点 + 发（三条入口合流的尾巴）。
+    void SendMusicSessionFacts(const MusicSessionEventFacts& facts);
     /*
      * 屏幕出口（issue #8）：音乐会话期间消息区显示曲目与作者，取代「待机」。
      * 所有音乐写屏都经这一个 helper：写屏时机（转态之后）、所有权标记与遥测

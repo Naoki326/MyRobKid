@@ -3,6 +3,8 @@ import re
 from typing import List, Dict
 from datetime import datetime
 
+from core.utils.music_session import apply_prompt_placeholder
+
 
 class Message:
     def __init__(
@@ -93,7 +95,7 @@ class Dialogue:
 
     def get_llm_dialogue_with_memory(
             self, memory_str: str = None, voiceprint_config: dict = None,
-            current_speaker: str = None,
+            current_speaker: str = None, music_status: str = "",
     ) -> List[Dict[str, str]]:
         # 构建对话
         dialogue = []
@@ -119,6 +121,11 @@ class Dialogue:
                     full_prompt,
                     flags=re.DOTALL,
                 )
+
+            # 展开音乐状态（issue #9）：与记忆同一先例——模板里是 <music_status>
+            # 占位符，每次构建送给模型的对话时才替换成最新值。默认空串 = 整块
+            # 摘掉（没有音乐会话、或调用方不知道音乐这件事时不注入任何东西）。
+            full_prompt = apply_prompt_placeholder(full_prompt, music_status)
 
             # 追加说话人信息
             try:

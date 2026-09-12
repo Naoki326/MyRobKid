@@ -92,10 +92,13 @@ int main(int argc, char** argv) {
         facts.attempted_restart = Has(csv, "restart");
         printf("%s", MusicEndingName(DeriveMusicEnding(facts)));
     } else if (op == "pos") {
-        /* pos <seconds> <live|finite>：位点字段格式是串口断言的口径，
-           与 pipe: 周期行的整秒不同（锚点行要一位小数）。 */
+        /* pos <seconds> <live|finite> [known|unknown]：位点字段格式是串口断言的
+           口径，与 pipe: 周期行的整秒不同（锚点行要一位小数）。第三参是
+           have_position：unknown 必须写 none，不能冒充 0.0。 */
         char buf[32];
-        WritePositionField(atof(argv[2]), strcmp(argv[3], "live") == 0, buf, sizeof(buf));
+        const bool have_position = (argc < 5) || strcmp(argv[4], "unknown") != 0;
+        WritePositionField(atof(argv[2]), strcmp(argv[3], "live") == 0,
+                           have_position, buf, sizeof(buf));
         printf("%s", buf);
     } else if (op == "cue" || op == "failure" || op == "name") {
         MusicEnding ending = MusicEnding::kCompleted;
@@ -250,19 +253,53 @@ class MusicEndingHostTest(unittest.TestCase):
         self.assertEqual(self.run_op("pos", "0", "finite"), "0.0s")
         self.assertEqual(self.run_op("pos", "269", "finite"), "269.0s")
 
-    def test_position_field_is_shared_by_all_anchors(self):
-        """三处锚点（播放器收场 / 跳过分支 / 反馈行）必须同口径。
+    def test_position_field_marks_unknown_as_none(self):
+        """位点未知写 none，不能写 0.0——0.0 会被读成「刚开始放」，那是撒谎。
 
-        测试只能直接调函数，无法断言三个调用点——那是 grep 的活：
-        `grep -rn "WritePositionField" main/` 应恰好三处调用 + 一处定义。
+        这条是 issue #9 的硬约束（直播不带位点、位点未知不冒充 0.0）在
+        格式层的落点：三种取值各有其字面量，且互不相同。
+        """
+        self.assertEqual(self.run_op("pos", "0", "finite", "unknown"), "none")
+        self.assertEqual(self.run_op("pos", "83.4", "finite", "unknown"), "none")
+        # 已知位点仍是数字；直播流即便带数字也写 live（形态优先）。
+        self.assertEqual(self.run_op("pos", "83.4", "finite", "known"), "83.4s")
+        self.assertEqual(self.run_op("pos", "83.4", "live", "known"), "live")
+        self.assertEqual(self.run_op("pos", "83.4", "live", "unknown"), "live")
+        self.assertEqual(self.run_op("pos", "0", "finite", "known"), "0.0s")
+
+    def test_position_field_is_shared_by_all_anchors(self):
+        """所有 `pos=` 锚点必须走同一个格式化函数，不许再抄一份。
+
+        这是结构性不变量，不是行为断言：被它挡住的是「某处锚点把 live 写成
+        数字」「某处把未知位点写成 0.0」——单条锚点的行为测试互相看不见对方，
+        缺陷在「几处是否一致」这一层。
+
+        判据只数**函数体里的调用**（行首是空白 + 标识符），注释与文档提及不算
+        ——否则将来有人在注释里写一句 `WritePositionField` 就会把测试弄红，
+        那是假失败，会让后来人把它删掉。
         """
         import subprocess
         hits = subprocess.run(
             ["grep", "-rn", "WritePositionField", str(ROOT / "main")],
             capture_output=True, text=True).stdout.strip().splitlines()
-        calls = [h for h in hits if ".cc:" in h and "void WritePositionField" not in h]
-        self.assertEqual(len(calls), 3,
-                         "锚点格式化应恰好三处调用，实际：\n" + "\n".join(calls))
+        calls = []
+        for hit in hits:
+            path, _, rest = hit.partition(":")
+            _, _, text = rest.partition(":")
+            code = text.lstrip()
+            if not path.endswith(".cc"):
+                continue
+            if code.startswith("//") or code.startswith("*"):
+                continue          # 注释/文档提及
+            if "void WritePositionField" in code:
+                continue          # 定义
+            calls.append(hit)
+        # 四个锚点：播放器收场、应用层跳过分支、反馈行、会话推送。
+        self.assertEqual(len(calls), 4,
+                         "锚点格式化应恰好四处调用，实际：\n" + "\n".join(calls))
+        for name in ("music_player.cc", "application.cc"):
+            self.assertTrue(any(name in c for c in calls),
+                            "应覆盖 %s 的锚点，实际：\n%s" % (name, "\n".join(calls)))
 
     def test_cue_none_only_for_non_played_endings(self):
         """见过声才可能有提示音；没出声的收场一律安静（用户没听到东西，别吓他）。"""
