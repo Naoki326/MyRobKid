@@ -327,5 +327,104 @@ class InjectionIsReadOnly(unittest.TestCase):
         self.assertIn("不要主动播报", session.prompt().text)
 
 
+class TrackLevelHistoryEntries(unittest.TestCase):
+    """曲目级事件 → 历史条目（issue #10 的纯逻辑那一半）。
+
+    分类与措辞单列在这里测（不起连接、不走 MCP 入口）：它是本票最容易悄悄
+    写错的地方——把暂停也一起写进去、把四种收场写成同一条、把「换歌」写成
+    就地改写。端到端那条缝在 ``test_music_history_seam.py``。
+    """
+
+    def test_track_level_events_render_a_named_entry(self):
+        cases = {
+            "started": "开始播放",
+            "completed": "播完",
+            "interrupted": "中断",
+            "resume_failed": "续播",
+        }
+        for event_name, keyword in cases.items():
+            with self.subTest(event=event_name):
+                entry = ms.format_history_entry(event_name, "晴天", "周杰伦")
+                self.assertIsNotNone(entry)
+                self.assertIn("晴天", entry)
+                self.assertIn(keyword, entry)
+                self.assertIn(ms.HISTORY_TAG, entry)
+
+    def test_terminal_entries_are_pairwise_distinct(self):
+        """播完 / 中断 / 续播失败各有一条，且两者两两可区分。"""
+        rendered = [ms.format_history_entry(name, "晴天", "周杰伦")
+                    for name in ("completed", "interrupted", "resume_failed")]
+        self.assertEqual(len(set(rendered)), 3)
+
+    def test_pause_resume_stop_and_start_failed_write_nothing(self):
+        """集合外的事件一律 None：暂停/继续（防历史被挤爆）与 issue 未列举的两种。"""
+        for event_name in ("paused", "resumed", "stopped", "start_failed",
+                          "", "wat", None):
+            with self.subTest(event=event_name):
+                self.assertIsNone(ms.format_history_entry(event_name, "晴天", ""))
+
+    def test_track_level_set_is_exactly_the_issues_list(self):
+        """曲目级集合**恰好**是 issue 列举的那几个——多一个少一个都算缺陷。
+
+        这条以前是「集合与措辞表同步」，现在集合由措辞表推导（``frozenset(
+        _HISTORY_TEMPLATES)``），同步性已由语法保证，再断言就是恒真。改钉**内容**：
+        多一个事件进来（例如有人把 ``paused`` 加进模板）会让「暂停淹没历史」
+        这个被本 spec 明确防住的事故复活，而它是 issue 正文的硬约束。
+        """
+        self.assertEqual(ms.TRACK_LEVEL_EVENTS,
+                         frozenset({"started", "completed", "interrupted",
+                                    "resume_failed"}))
+        # 被明确排除的两个：暂停与继续（每轮一对，会挤爆历史窗口）。
+        for excluded in ("paused", "resumed"):
+            self.assertNotIn(excluded, ms.TRACK_LEVEL_EVENTS)
+        # 别名必须指向集合内的事件（否则别名等于死代码）。
+        for alias, canonical in ms._HISTORY_ALIASES.items():
+            self.assertIn(canonical, ms.TRACK_LEVEL_EVENTS)
+            self.assertNotIn(alias, ms.TRACK_LEVEL_EVENTS)
+
+    def test_track_text_falls_back_when_author_is_missing(self):
+        self.assertIn("晴天", ms.format_history_entry("started", "晴天", ""))
+        entry = ms.format_history_entry("started", "", "")
+        self.assertIn("未知曲目", entry)
+
+    def test_history_entry_reads_the_authoritative_event(self):
+        """状态机只给 ``state`` 时事件名由 _parse 兜底，历史分类跟着它走。
+
+        判别力：拿原始 ``params`` 判分类会与状态机分叉——设备只给
+        ``state=playing``时，原始字段里没有 ``event``，拿它判会误归成非曲目级。
+        """
+        session = ms.MusicSession()
+        session.apply_event({"state": "playing", "title": "晴天"})
+        entry = session.history_entry()
+        self.assertIsNotNone(entry)
+        self.assertIn("开始播放", entry)
+
+    def test_history_entry_tracks_the_latest_track(self):
+        session = ms.MusicSession()
+        session.apply_event(event(title="晴天"))
+        session.apply_event(event(title="稻香"))
+        self.assertIn("稻香", session.history_entry())
+        self.assertNotIn("晴天", session.history_entry())
+
+    def test_history_entry_is_none_before_any_event(self):
+        self.assertIsNone(ms.MusicSession().history_entry())
+
+    def test_history_entry_is_none_while_paused(self):
+        """最后的合法事件是暂停 → 没有可写入的条目（不是“把上一条再写一遍”）。"""
+        session = ms.MusicSession()
+        session.apply_event(event())
+        session.apply_event(event(event="paused", state="paused_user"))
+        self.assertIsNone(session.history_entry())
+
+    def test_history_entry_does_not_touch_idempotency_bookkeeping(self):
+        """取历史条目是只读的：不推进 applied/duplicate 记账。"""
+        session = ms.MusicSession()
+        session.apply_event(event())
+        for _ in range(5):
+            session.history_entry()
+        self.assertEqual(session.applied_events, 1)
+        self.assertEqual(session.duplicate_events, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -182,17 +182,29 @@ class ParseCli(unittest.TestCase):
              "--server-log", "/dev/null"])
         self.assertEqual(text, "这歌谁唱的")
         self.assertEqual(log_path, "/dev/null")
-        self.assertEqual(music["params"]["form"], "live")
+        self.assertEqual(music[0]["params"]["form"], "live")
 
     def test_music_options_build_the_notification(self):
         text, music, _log = latency_loop.parse_cli(
             ["--music", "paused", "--music-title", "稻香", "--music-pos", "42",
              "问一下"])
         self.assertEqual(text, "问一下")
-        params = music["params"]
+        params = music[0]["params"]
         self.assertEqual(params["state"], "paused_user")
         self.assertEqual(params["title"], "稻香")
         self.assertEqual(params["position_s"], 42)
+
+    def test_comma_separated_states_push_in_order(self):
+        """验收缝需要一串按顺序推（started → paused → resumed）。"""
+        _text, music, _log = latency_loop.parse_cli(
+            ["--music", "started,paused,resumed,", "换一首"])
+        self.assertEqual([n["params"]["event"] for n in music],
+                         ["started", "paused", "resumed"])
+
+    def test_comma_separated_titles_map_positionally(self):
+        _text, music, _log = latency_loop.parse_cli(
+            ["--music", "started,started", "--music-title", "晴天,稻香", "x"])
+        self.assertEqual([n["params"]["title"] for n in music], ["晴天", "稻香"])
 
     def test_log_path_falls_back_to_env(self):
         import os
@@ -200,6 +212,114 @@ class ParseCli(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOOP_SERVER_LOG": "/tmp/x.log"}):
             _text, _music, log_path = latency_loop.parse_cli(["hi"])
         self.assertEqual(log_path, "/tmp/x.log")
+
+
+def history_line(event="started", title="晴天", author="周杰伦", written="yes",
+                 skipped=None, prefix="I (700) mcp_handler: "):
+    line = (f"{prefix}Music history: written={written} event={event} "
+            f"title='{title}' author='{author}'")
+    if skipped:
+        line += f" skipped={skipped}"
+    return line
+
+
+class HistoryAnchorDiscrimination(unittest.TestCase):
+    """历史断言（issue #10 验收缝）的判别力：脚本自造数据不会让它变绿。
+
+    两条本票最贵的错误各有一个专门的用例：
+      - ``test_pause_written_to_history_fails``：暂停被误写进历史；
+      - ``test_missing_duplicate_anchor_fails``：重复推送产生了重复条目。
+    """
+
+    def _write_log(self, text):
+        fd, path = tempfile.mkstemp(suffix=".log")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _push(self, states):
+        return [latency_loop.music_notification(s) for s in states]
+
+    def test_track_level_written_and_pause_skipped_passes(self):
+        pushed = self._push(["started", "paused", "resumed", "completed"])
+        log = self._write_log("\n".join([
+            history_line("started"),
+            history_line("paused", written="no", skipped="not_track_level"),
+            history_line("resumed", written="no", skipped="not_track_level"),
+            history_line("completed", title="晴天"),
+        ]))
+        self.assertTrue(latency_loop.assert_music_history(pushed, log))
+
+    def test_pause_written_to_history_fails(self):
+        """核心判别力：暂停被写进历史 → 判定失败。
+
+        这是本 spec 的结构决定（暂停/继续每轮一对，会把历史挤爆）。若实现把
+        它们也写了，这里会看到 ``written=yes``——本用例就是那个哨兵。
+        """
+        pushed = self._push(["started", "paused"])
+        log = self._write_log("\n".join([
+            history_line("started"),
+            history_line("paused", written="yes"),  # 误写
+        ]))
+        self.assertFalse(latency_loop.assert_music_history(pushed, log))
+
+    def test_track_level_event_not_written_fails(self):
+        """曲目级事件没写进历史 → 失败（防「写了注释没写代码」的半成品）。"""
+        pushed = self._push(["started"])
+        log = self._write_log(history_line(
+            "started", written="no", skipped="not_track_level"))
+        self.assertFalse(latency_loop.assert_music_history(pushed, log))
+
+    def test_missing_history_anchor_fails(self):
+        """一条历史锚点都没有 → 失败（路径根本没跑，与「没写」不同）。"""
+        pushed = self._push(["started"])
+        log = self._write_log("Music session: applied=yes state=playing\n")
+        self.assertFalse(latency_loop.assert_music_history(pushed, log))
+
+    def test_missing_duplicate_anchor_fails(self):
+        """幂等：同一事件推两次、但日志里没有 ``skipped=duplicate`` → 失败。
+
+        这是「重复推送不产生重复条目」那条验收标准的判别力：没有它，实现
+        里丢掉幂等门也能保持绿。
+        """
+        pushed = self._push(["started", "started"])
+        log = self._write_log(history_line("started"))
+        self.assertFalse(latency_loop.assert_music_history(pushed, log))
+
+    def test_duplicate_anchor_makes_it_pass(self):
+        pushed = self._push(["started", "started"])
+        log = self._write_log("\n".join([
+            history_line("started"),
+            history_line("started", written="no", skipped="duplicate"),
+        ]))
+        self.assertTrue(latency_loop.assert_music_history(pushed, log))
+
+    def test_missing_log_file_fails(self):
+        pushed = self._push(["started"])
+        self.assertFalse(latency_loop.assert_music_history(
+            pushed, "/nonexistent/path/xiaozhi_server.log"))
+
+    def test_history_regex_does_not_match_inject_or_session_lines(self):
+        """三条锚点各行其道：注入/事件行的日志不得被误认成历史证据。"""
+        self.assertIsNone(latency_loop.MUSIC_HISTORY_RE.search(
+            "Music inject: injected=yes state=playing title='晴天' author='周杰伦'"
+            " form=finite pos=0.0s"))
+        self.assertIsNone(latency_loop.MUSIC_HISTORY_RE.search(
+            "Music session: applied=yes state=playing title='晴天' author='周杰伦'"
+            " form=finite pos=0.0s"))
+
+    def test_other_history_lines_do_not_satisfy_the_assertion(self):
+        """只有匹配的曲目算数：别的曲目的条目不能让本次事件变绿。"""
+        pushed = self._push(["started"])  # 默认 title=晴天
+        log = self._write_log(history_line("started", title="稻香"))
+        self.assertFalse(latency_loop.assert_music_history(pushed, log))
+
+    def test_unknown_event_fails(self):
+        """脚本的枚举与服务端分岔（名字改了漏改一边）→ 失败，不静默放过。"""
+        pushed = [{"params": {"event": "teleported", "title": "晴天"}}]
+        log = self._write_log(history_line("teleported"))
+        self.assertFalse(latency_loop.assert_music_history(pushed, log))
 
 
 if __name__ == "__main__":

@@ -7,8 +7,9 @@ from concurrent.futures import Future
 from core.utils.util import get_vision_url, sanitize_tool_name
 from core.utils.auth import AuthToken
 from core.utils.music_session import MUSIC_SESSION_METHOD
+from core.utils.dialogue import Message
 from config.logger import setup_logging
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -132,17 +133,106 @@ def _format_music_position(params: dict) -> str:
     return "%.1fs" % float(position)
 
 
+def _log_music_history(params: dict, *, written: bool, skipped=None,
+                       entry=None) -> None:
+    """历史写入锚点（issue #10 的验收缝）。
+
+    ``written=no`` 时 ``skipped=`` 说出**为什么**，这是本锚点的要害：「暂停没
+    写历史」若只能靠「日志里没看到条目」来判定，那就不是一个可断言的结论，而
+    是缺席——而缺席区分不出「没写」与「没到」。两个原因各自成值：
+
+    - ``skipped=duplicate``：重复推送被幂等挡住（``apply_event`` 返回 False）；
+    - ``skipped=not_track_level``：状态真的变了，但事件不在曲目级集合里
+      （``paused`` / ``resumed`` / ``stopped`` / ``start_failed``）；
+    - ``skipped=no_dialogue``：该写但连接上没有对话可写（安静跳过）；
+    - ``skipped=write_failed``：对话在、但写入抛了异常（真故障，另有 error 行）。
+
+    ``entry=`` 只在 **written=yes** 时出现——它是「写下去的那串字符」，没写就
+    不该报（否则「写失败」在日志里长得像成功）。
+
+    ``event=`` 报的是**设备原始字段**（没有就退到 ``state``）——这是故意的：这条
+    锚点要能看出「设备发了什么」。分类用的是 ``_parse`` 兜底后的权威事件名，两者
+    在设备少给 ``event`` 时会不同（锚点 ``event=playing`` 而条目是「开始播放」），
+    那是事实而不是矛盾。
+    """
+    event = params.get("event") or params.get("state") or "unknown"
+    line = (
+        "Music history: written=%s event=%s title='%s' author='%s'"
+        % (
+            "yes" if written else "no",
+            event,
+            params.get("title") or "",
+            params.get("author") or "",
+        )
+    )
+    if skipped:
+        line += " skipped=%s" % skipped
+    if entry:
+        line += " entry='%s'" % entry
+    logger.bind(tag=TAG).info(line)
+
+
+def _write_music_history(conn: "ConnectionHandler", entry: str) -> Optional[str]:
+    """把一条曲目级事件条目写进对话历史（issue #10）。
+
+    返回 ``None`` = **真的写了**；否则返回**没写成的原因**（写进锚点的
+    ``skipped=``）。两种原因必须分开报：
+
+    - ``no_dialogue``：连接上压根没有对话可写（关闭音乐功能 / 非对话场景）——
+      安静跳过，不报错；
+    - ``write_failed``：对话在、但写入抛了异常（下面的 ``except``）——那是真
+      故障，已经在 error 行里详述。
+
+    为什么要分：初版两种情况都返回 ``False``、调用方一律打 ``no_dialogue``，
+    于是「写入失败」被报成「没有对话可写」——**锚点在说谎**，而这条锚点存在
+    的全部意义就是「没写历史」可以被断言。一个会说谎的锚点比没有锚点更坏，
+    因为它会给验收缝一个绿色的假像。
+
+    为什么写在历史里而不是只写日志：模型据此知道**先后顺序**——「换一首」要
+    被理解为「换掉正在放的这首」，靠的就是历史里那条「开始播放《晴天》」在前、
+    「开始播放《稻香》」在后。这条出口服务的是**意图识别**那次调用；「这歌谁
+    唱的」靠 ``prompt()`` 的注入（已实测：写在历史里的 system 事件对「开口
+    说话那次调用」不可见）。两条出口分开做，不互相替代。
+
+    角色用 ``system``：与用户可见对话区分开（父 spec 的明确要求）。
+    """
+    dialogue = getattr(conn, "dialogue", None)
+    if dialogue is None:
+        return "no_dialogue"
+    try:
+        dialogue.put(Message(role="system", content=entry))
+    except Exception as e:
+        # 通知是只读的旁路：写历史失败不该把连接一起带走。
+        logger.bind(tag=TAG).error(f"写入音乐历史失败: {e}")
+        return "write_failed"
+    return None
+
+
 def _apply_music_session_event(conn: "ConnectionHandler", payload: dict) -> None:
-    """把 ``music.session`` 通知吃进当前连接的音乐会话。
+    """把 ``music.session`` 通知吃进当前连接的音乐会话，并写曲目级事件的历史。
 
     安静忽略是一等行为，不是缺陷：``params`` 缺失/类型错、未知状态、重复事件
     都只返回 False（重复还会被幂等挡住），不报错、不断开。关闭音乐功能时设备
-    不发，服务端也什么都不注入——注入无害由这一条守着。
+    不发，服务端也什么都不注入、不写历史——无害由这一条守着。
+
+    两条出口，不要合并（本函数同时走两条，但它们是两件事）：
+
+    1. **注入**（issue #9）：状态进 ``MusicSession``，每次调用模型前现取注入
+       系统提示——含暂停与继续（否则「暂停了吗」答不出、位点会虚涨）；
+    2. **历史**（issue #10）：**只**写曲目级事件（开始播放 / 换歌 / 播完 /
+       中断 / 续播失败），暂停与继续**不写**——它们每轮一对，会淹没真实对话、
+       把历史窗口挤爆。注意暂停与继续**仍经通道抵达并更新状态**，
+       「不发」与「不写历史」是两件事。
 
     为什么打一行锚点（含 state/title/form/位点）：注入没生效是最难查的错
     ——它不掉异常，只是模型答不出「这歌谁唱的」。这条锚点让「事件进来了没、
     状态是什么」在日志里可断言（沿固件 ``Music screen:`` / ``Music ended:``
     的行内风格）。重复事件也打（``applied=no``），重连重发的行为才可见。
+
+    历史锚点单列一行（``Music history:``）：历史在服务端进程内，验收缝（假设备
+    客户端）看不见，只能看日志。所以「暂停没写历史」也必须是**可断言**的，而不
+    只是「没看到」——``written=no skipped=not_track_level`` 就是那条证据；幂等
+    与曲目级分别成两个 ``skipped=`` 值，两者不会被混为一谈。
     """
     session = getattr(conn, "music_session", None)
     if session is None:
@@ -169,6 +259,28 @@ def _apply_music_session_event(conn: "ConnectionHandler", payload: dict) -> None
             position,
         )
     )
+
+    # 历史写入（issue #10）：只在状态**真的变了**时考虑（``applied`` 即幂等判据，
+    # 重复推送返回 False）。写不写由会话当前的曲目级分类决定——暂停、继续、
+    # 用户按停、起播失败都不在集合里，故一条都不写。
+    if not applied:
+        _log_music_history(params, written=False, skipped="duplicate")
+        return
+    try:
+        entry = session.history_entry()
+    except Exception as e:
+        logger.bind(tag=TAG).error(f"取音乐历史条目失败: {e}")
+        return
+    if not entry:
+        # 不是曲目级事件：状态照收（上面那行锚点已报 applied=yes），只是不写历史。
+        _log_music_history(params, written=False, skipped="not_track_level")
+        return
+    written = _write_music_history(conn, entry)
+    # ``entry=`` 只在**真的写下去**时才打：CONTEXT.md 写明它是「写下去的那串
+    # 字符」，没写却打出来就是谎报（且会让「写失败」在日志里看着像成功）。
+    _log_music_history(params, written=written is None,
+                       skipped=written,
+                       entry=entry if written is None else None)
 
 
 async def handle_mcp_message(

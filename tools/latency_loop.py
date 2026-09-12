@@ -73,6 +73,28 @@ def music_notification(state="started", *, title="晴天", author="周杰伦", l
     return {"jsonrpc": "2.0", "method": "music.session", "params": params}
 
 
+#: 历史写入锚点（mcp_handler._log_music_history，issue #10）。与上面那条同族：
+#: 字段名/引号一致，日志抓取脚本可统一断言。
+#:
+#: 为什么历史也需要一条锚点：历史在服务端进程内，假设备客户端看不见。若只靠
+#: 「日志里没看到条目」判「暂停没写历史」，那就是缺席而不是证据——缺席区分不出
+#: 「没写」与「没到」。``skipped=`` 把原因写出来，两件事才分得开。
+MUSIC_HISTORY_RE = re.compile(
+    r"Music history:\s+written=(?P<written>\w+)\s+event=(?P<event>\S+)\s+"
+    r"title='(?P<title>.*?)'\s+"
+    r"author='(?P<author>.*?)'(?:\s+skipped=(?P<skipped>\S+))?")
+
+#: 写进历史的**曲目级事件**集合（issue #10）。与 music_session.TRACK_LEVEL_EVENTS
+#: 同名同义：开始播放 / 换歌 / 播完 / 中断 / 续播失败（「换歌」就是一次新的
+#: ``started``）。暂停与继续**不写**，但仍经通道抵达服务端。
+_TRACK_LEVEL_STATES = frozenset({"started", "completed", "interrupted",
+                                 "resume_failed"})
+
+#: 反向集合：通道承载但**不**写历史的状态（本票要防的就是它们被误写进去）。
+_NOT_TRACK_LEVEL_STATES = frozenset({"paused", "resumed", "stopped",
+                                     "start_failed"})
+
+
 async def push_music_notification(ws, payload):
     """经既有 MCP 消息通路发通知（``protocol.cc::SendMcpMessage`` 的线上形状）。"""
     await ws.send(json.dumps({"session_id": "debug", "type": "mcp",
@@ -114,6 +136,83 @@ def assert_music_injected(pushed, log_path):
     return True
 
 
+def assert_music_history(pushed_list, log_path):
+    """在服务端日志里找历史锚点：曲目级事件写了、暂停/继续一条都没写（issue #10）。
+
+    判据不看「日志里有没有条目」（那是缺席），而看锚点自报的 ``written=`` 与
+    两个 ``skipped=`` 值。两条判别力：
+
+      - **暂停被误写进历史**：推 ``paused``/``resumed`` 后期望
+        ``written=no skipped=not_track_level``；若实现把它们也写了，这里会看到
+        ``written=yes``，判定失败。
+      - **重复推送产生重复条目**：同一事件推两次，第二次必须是
+        ``written=no skipped=duplicate``（幂等）。
+
+    ``pushed_list`` 是**按顺序**推出去的通知列表（每轮的 ``--music`` 追加一项）。
+    返回 True = 每个事件都留下了符合预期的证据。
+    """
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            log = f.read()
+    except OSError as e:
+        print(f"{TAG} !! 读不到服务端日志 {log_path}: {e}")
+        return False
+    anchors = [m.groupdict() for m in MUSIC_HISTORY_RE.finditer(log)]
+    if not anchors:
+        print(f"{TAG} !! 历史锚点一条都没有：历史写入路径根本没跑（没到 / 没写）")
+        return False
+
+    ok = True
+    for pushed in pushed_list:
+        event = pushed["params"]["event"]
+        title = pushed["params"].get("title")
+        # 同一事件的所有锚点里任一条匹配就算这个事件有证据（推两次时第一条
+        # 是 written=yes、第二条是 written=no skipped=duplicate，都在）。
+        candidates = [a for a in anchors if a["event"] == event
+                      and (not title or a["title"] == title)]
+        if not candidates:
+            print(f"{TAG} !! 事件 {event} title={title!r} 没有任何历史锚点")
+            ok = False
+            continue
+        if event in _TRACK_LEVEL_STATES:
+            written = [a for a in candidates if a["written"] == "yes"]
+            if not written:
+                print(f"{TAG} !! 曲目级事件 {event} 没写进历史（期望 written=yes）")
+                ok = False
+            else:
+                print(f"{TAG} 历史已写入: event={event} "
+                      f"title='{written[0]['title']}'")
+        elif event in _NOT_TRACK_LEVEL_STATES:
+            # 本票的核心断言：这些**不该**写历史。出现 written=yes 就是防线破了。
+            bad = [a for a in candidates if a["written"] == "yes"]
+            if bad:
+                print(f"{TAG} !! {event} 被写进了历史（应当 skipped=not_track_level）"
+                      f"—— 历史会被每轮的暂停/继续挤爆")
+                ok = False
+            else:
+                print(f"{TAG} 未写历史（符合预期）: event={event} "
+                      f"skipped={candidates[-1]['skipped']}")
+        else:
+            # 两个集合都不在 → 脚本与实现已经分岔（枚举名字改了漏改一边）。
+            print(f"{TAG} !! 未知事件 {event!r}：不在曲目级集合也不在通道集合"
+                  f"—— 本脚本的枚举与服务端已分岔")
+            ok = False
+
+    # 幂等：同一事件推两次时，第二次必须带 skipped=duplicate。
+    seen = set()
+    for pushed in pushed_list:
+        key = (pushed["params"]["event"], pushed["params"].get("title"))
+        if key in seen:
+            dupes = [a for a in anchors if a["event"] == key[0]
+                     and a["skipped"] == "duplicate"]
+            if not dupes:
+                print(f"{TAG} !! 重复推送的 {key[0]} 没有 skipped=duplicate 锚点"
+                      f"—— 重复事件可能产生了重复历史条目")
+                ok = False
+        seen.add(key)
+    return ok
+
+
 #: 需要跟一个值的选项（解析时要把值一并从位置参数里剔掉，否则 ``--server-log
 #: /dev/null`` 会把 ``/dev/null`` 当成要问的问题）。
 _OPTIONS_WITH_VALUE = ("--music", "--music-title", "--music-author", "--music-pos",
@@ -143,14 +242,18 @@ def parse_cli(argv):
     music = None
     if options.get("--music") is not None:
         live = "--music-live" in argv
-        music = music_notification(
-            options["--music"],
-            title=options.get("--music-title") or "晴天",
+        # 逗号分隔 = 按顺序推多条（验收缝需要 「started → paused → resumed」
+        # 这样的序列来断言「暂停没写历史」）。
+        states = [s.strip() for s in options["--music"].split(",") if s.strip()]
+        titles = [t.strip() for t in (options.get("--music-title") or "").split(",")]
+        music = [music_notification(
+            state,
+            title=(titles[i] if i < len(titles) and titles[i] else "晴天"),
             author=options.get("--music-author") or "周杰伦",
             live=live,
             position_s=None if live else int(options.get("--music-pos") or 0),
             duration_s=None if live else int(options.get("--music-duration") or 269),
-        )
+        ) for i, state in enumerate(states)]
     log_path = options.get("--server-log") or os.environ.get("LOOP_SERVER_LOG")
     return (positional[0] if positional else "你好呀"), music, log_path
 
@@ -181,10 +284,13 @@ async def run(text, realtime=False, tail_silence_s=1.8, music=None):
         while True:
             if json.loads(await asyncio.wait_for(ws.recv(), 10)).get("type")=="hello": break
         # 说话之前先推音乐状态：模型这一次调用就该读到它（注入是逐轮现取的）。
-        if music is not None:
-            await push_music_notification(ws, music)
-            print(f"{TAG} 已推送 music.session: state={music['params']['state']} "
-                  f"title={music['params']['title']!r}")
+        # 可以是一串（按顺序推）：历史缝需要「started → paused → resumed」这类
+        # 序列才能断言「暂停没写历史」。
+        for note in (music or []):
+            await push_music_notification(ws, note)
+            print(f"{TAG} 已推送 music.session: event={note['params']['event']} "
+                  f"state={note['params']['state']} "
+                  f"title={note['params']['title']!r}")
         async def reader():
             nonlocal t_stt, t_first, stt_text
             while True:
@@ -232,9 +338,11 @@ if __name__ == "__main__":
     argv = sys.argv[1:]
     text, music, log_path = parse_cli(argv)
     asyncio.run(run(text, realtime="--realtime" in argv, music=music))
-    if music is not None:
+    if music:
         if not log_path:
-            print(f"{TAG} !! 未给 --server-log/LOOP_SERVER_LOG，无法断言注入是否生效")
+            print(f"{TAG} !! 未给 --server-log/LOOP_SERVER_LOG，无法断言注入/历史是否生效")
             sys.exit(1)
-        if not assert_music_injected(music, log_path):
+        if not assert_music_injected(music[0], log_path):
+            sys.exit(1)
+        if "--assert-history" in argv and not assert_music_history(music, log_path):
             sys.exit(1)

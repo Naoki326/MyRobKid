@@ -69,6 +69,17 @@ Music inject: injected=<yes|no> state=<…> title='…' author='…' form=<live|
 - `server/tests/test_music_injection_seam.py`（12 项）与 `firmware/scripts/tests/test_music_session_event.py`（9 项）钉住本 ADR 的载荷形状与注入缝；`tools/tests/test_latency_music_push.py`（20 项）钉住假设备侧的协议与断言判别力。
 - `PROJECT_VER` 2.4.28 → 2.4.29（固件侧新增 `music_session_event.{h,cc}` 与 `FinishedResult` 的曲目字段）；服务端新增 `core/utils/music_session.py`、`<music_status>` 占位与 `Music inject:` 锚点。
 
+## 后续修订（issue #10）
+
+上面 Consequences 的第一条写的「历史写入不在本票」已被 issue #10 完成。本 ADR 的决策 1（通道粒度）与决策 4（注入）不变；新增的是第二个出口：
+
+- **历史出口**：`MusicSession.history_entry()` 把当前会话的**曲目级事件**渲染成一条 system 历史条目（「开始播放《晴天》」「《晴天》已播完」「《晴天》播放中断」「《晴天》续播失败」），由 `mcp_handler._apply_music_session_event` 在 `apply_event` 返回 True 时写进 `conn.dialogue`。分类与措辞是纯函数（`format_history_entry` + `TRACK_LEVEL_EVENTS`），单测钉住。
+- **两条出口不合并**：注入（`prompt()`）每次都重新展开、含暂停与继续；历史（`history_entry()`）只写曲目级事件。前者答「现在在放什么」，后者答「刚才放过什么」。实测表已说明为什么不能只做一条：写在历史里的 system 事件对「开口说话那次调用」不可见，只有意图识别那次能看到；反过来，把暂停/继续也写进历史会每轮产生成对条目、淹没真实对话。
+- **为什么不把历史合进通道粒度**：通道承载状态变更全集（含暂停/继续），因为服务端必须知道当前是否暂停（否则答不出「暂停了吗」、位点会在暂停期间虚涨）。历史是另一个问题：它给模型的是**先后顺序**，粒度必须粗。两者的差别是「服务端知道什么」与「模型能回忆什么」。
+- **集合按 issue 字面**：`started` / `completed` / `interrupted` / `resume_failed`（「换歌」= 新的 `started`）。`paused` / `resumed` 明确排除；`stopped` 与 `start_failed` 也不写——issue 正文的列举里没有它们，`start_failed` 从未出声、本就无「曲目」可言，`stopped` 是边界（ADR-0014 已把用户按停定为一种收场），若要写入需调度方裁决。
+- **新的可观察锚点**：`Music history: written=<yes|no> event=… title='…' author='…' [skipped=duplicate|not_track_level|no_dialogue] [entry='…']`。它存在的理由是「暂停没写历史」必须**可断言**——历史在服务端进程内，外部脚本看不见；若只能靠「日志里没看到条目」判，那是缺席而不是证据，而缺席区分不出「没写」与「没到」。
+- **缝**：`server/tests/test_music_history_seam.py`（20 项，真 `Dialogue` 与真锚点）与 `tools/tests/test_latency_history_seam.py`（6 项，走真实 WebSocket + 假设备客户端的真推送函数），另在 `test_music_session.py` 补 10 项纯函数（31→41）、`test_latency_music_push.py` 补 12 项假设备侧断言判别力（20→32）。测试随 `--assert-history` 暴露给真机验收。
+
 ## 取证链
 
 | 断言 | 观察点 | 判据 |

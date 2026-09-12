@@ -19,7 +19,12 @@
         "position_s": 83.4, "duration_s": 269}}
 
 - 无 ``id`` = 通知，服务端不回响应（与既有的请求/响应消息区分开）。
-- ``state`` 是权威字段（服务端据此维护会话），``event`` 只进日志与后续的历史写入。
+- ``state`` 是权威字段（服务端据此维护会话），``event`` 进日志与**曲目级事件
+  的历史写入**（issue #10）。
+- 两条出口不合并：``prompt()`` 是「现在在放什么」（当前状态 → 系统提示注入），
+  ``history_entry()`` 是「刚才放过什么」（曲目级事件 → 对话历史，让模型掌握
+  先后顺序）。前者含暂停与继续，后者**只**写开始播放 / 换歌 / 播完 / 中断 /
+  续播失败——通道粒度 ≠ 历史粒度。
 - 直播流（``form=live``）**不带** ``position_s`` / ``duration_s``：位点对它无意义，
   带上就是撒谎；服务端也不对它做任何位点估算。
 - 幂等：状态向量（event/state/曲目/作者/形态/总长）相同的事件视为重复，整条忽略。
@@ -72,6 +77,72 @@ _EVENT_DEFAULT_STATE = {
     STATE_STOPPED: STATE_STOPPED,
     STATE_START_FAILED: STATE_START_FAILED,
 }
+
+#: 写进对话历史的**曲目级事件**集合（issue #10）。按字面取自 issue 正文的列举
+#: ——开始播放 / 换歌 / 播完 / 中断 / 续播失败。其中「换歌」就是一次新的
+#: ``started``（不是单独的事件名）。
+#:
+#: 为什么 ``paused`` / ``resumed`` 不在里面：它们每轮对话会产生成对的两条，迅速
+#: 历史事件条目的统一标记：与用户可见对话区分开，也让「暂停有没有被误写进去」
+#: 有可断言的形状（注入那条出口在 ``<music_status>`` 里，历史在这条标签里）。
+HISTORY_TAG = "音乐动态"
+
+#: 各曲目级事件 → 历史条目正文的模板（``%s`` 是「曲名 — 作者」或「曲名」）。
+#: 文本用曲目名：模型据此知道「换一首」指的是当前这首（父 spec 的明确要求）。
+_HISTORY_TEMPLATES = {
+    "started": "开始播放《%s》",
+    STATE_COMPLETED: "《%s》已播完",
+    STATE_INTERRUPTED: "《%s》播放中断",
+    STATE_RESUME_FAILED: "《%s》续播失败",
+}
+
+#: 哪些事件算「曲目级」——**由模板表推导**，不另存一份列表。
+#:
+#: 为什么推导而不是再写一份：两者是同一份知识的两个视图（谁算曲目级 / 它怎么写），
+#: 分开存就必须靠测试拉同步，而测试是补一个语言层面本可免费的不变量。推导之后，
+#: 「加了模板却忘了加进集合」这类漂移在语法上就不可能发生。
+#:
+#: 暂停（``paused``）与继续（``resumed``）**不在**里面：它们每轮对话会产生成对
+#: 的两条，迅速淹没真实对话、把历史窗口挤爆。注意它们**仍然经推送通道发给服务端**
+#: （通道粒度是状态变更全集），「不发」与「不写历史」是两件事——不要合并。
+#:
+#: 为什么 ``stopped`` / ``start_failed`` 也不在里面：issue 正文的列举里没有它们，
+#: 本票按字面遵循。``start_failed`` 从未出声，本就无「曲目」可言；``stopped``
+#: 是边界（见 ADR-0014：用户按停是一种收场），若要写入需调度方裁决，本票不擅自改。
+TRACK_LEVEL_EVENTS = frozenset(_HISTORY_TEMPLATES)
+
+#: 别名：设备只给 ``state`` 不给 ``event`` 时，``_parse`` 用状态名兜底事件名
+#: （``state=playing`` → ``event=playing``）。曲目级集合因此也要认得状态名，
+#: 否则「设备少给一个字段」会静默地不写历史。两者是同一件事，不是两套词汇。
+_HISTORY_ALIASES = {
+    STATE_PLAYING: "started",
+}
+
+
+def format_track(title: str, author: str) -> str:
+    """曲目 → 可读口径「曲名 — 作者」（只有其一就只报那个）。"""
+    title = _coerce_text(title)
+    author = _coerce_text(author)
+    if title and author:
+        return "%s — %s" % (title, author)
+    return title or author or "未知曲目"
+
+
+def format_history_entry(event: str, title: str, author: str) -> Optional[str]:
+    """曲目级事件 → 一条历史条目文本；不是曲目级事件则 ``None``（不写历史）。
+
+    纯函数：分类与措辞都只需要事件名与曲目，不碰会话状态、不碰连接——这条判定
+    是本票最容易悄悄写错的地方（把暂停也一起写进去、把四种收场写成同一条），
+    所以它单独可测（``server/tests/test_music_session.py`` 的纯函数段）。
+
+    返回的文本带 :data:`HISTORY_TAG` 标记，便于历史里分辨与断言。
+    """
+    event = _coerce_text(event)
+    canonical = _HISTORY_ALIASES.get(event, event)
+    if canonical not in TRACK_LEVEL_EVENTS:
+        return None
+    return "[%s] %s" % (HISTORY_TAG,
+                        _HISTORY_TEMPLATES[canonical] % format_track(title, author))
 
 #: 系统提示模板里的音乐状态块（与 ``<memory>`` 同一先例：占位符 + 每轮展开）。
 PROMPT_BLOCK_RE = re.compile(r"<music_status>.*?</music_status>", re.DOTALL)
@@ -198,6 +269,23 @@ class MusicSession:
             self._applied += 1
         return True
 
+    def history_entry(self) -> Optional[str]:
+        """当前会话的**曲目级事件**该写进历史的那条文本；不该写则 ``None``。
+
+        只读当前已成立的事件（``_event`` 与曲目都是 ``apply_event`` 解析后的
+        权威值），不看调用方手里的原始 ``params``——设备可能只给 ``state``、
+        事件名由 ``_parse`` 兜底得出，拿原始字段判分类会与状态机分叉。
+
+        为什么不合并进 ``apply_event`` 的返回值：``applied`` 是「状态真的变了
+        没」（幂等判据），历史该不该写是另一个问题（暂停/继续也真的改变状态，
+        但不写历史）。两件事分开，调用方才能把两个原因分别报进锚点
+        （``skipped=duplicate`` vs ``skipped=not_track_level``）。
+        """
+        with self._lock:
+            if self._key is None:
+                return None
+            return format_history_entry(self._event, self._title, self._author)
+
     @staticmethod
     def _parse(params) -> Optional[tuple]:
         if not isinstance(params, dict):
@@ -271,10 +359,7 @@ class MusicSession:
 
 def _render_prompt(state, title, author, live, position, duration) -> str:
     """状态 + 曲目 → 一行自然语言（模型读的是它，不是字段表）。"""
-    track = title
-    if author:
-        track = "%s — %s" % (title, author) if title else author
-    track = track or "未知曲目"
+    track = format_track(title, author)
     clock = format_clock(position) if position is not None else ""
     total = format_clock(duration) if duration and duration > 0 else ""
 

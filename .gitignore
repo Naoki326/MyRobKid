@@ -29,3 +29,6 @@ __pycache__/
 /坏固件_*.bin
 /tmp/
 /音质对比/
+
+# 测试/手动验证产生的临时日志目录（tools/latency_loop.py 的 --server-log 落点）
+tools/tmp/
