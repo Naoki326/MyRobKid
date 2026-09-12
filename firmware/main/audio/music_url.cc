@@ -125,3 +125,46 @@ int ParseMusicStartSeconds(const std::string& url) {
     });
     return start;
 }
+
+std::string RemoveMusicStart(const std::string& url) {
+    size_t query_start = url.find('?');
+    if (query_start == std::string::npos) {
+        return url;  // 无查询串 = 无 ss=，逐字节原样
+    }
+    size_t fragment_start = url.find('#', query_start);
+    std::string query = url.substr(query_start + 1, fragment_start == std::string::npos
+                                                       ? std::string::npos
+                                                       : fragment_start - query_start - 1);
+    std::string fragment =
+        (fragment_start == std::string::npos) ? "" : url.substr(fragment_start);
+
+    // 逐对拼回，跳过 ss=（只认键名，值不解析）：其余参数连同书写顺序、
+    // percent 编码一并原样保留——只动该动的那一个参数。
+    std::string kept;
+    size_t pos = 0;
+    while (pos < query.size()) {
+        size_t amp = query.find('&', pos);
+        if (amp == std::string::npos) {
+            amp = query.size();
+        }
+        std::string pair = query.substr(pos, amp - pos);
+        pos = amp + 1;
+        if (pair.empty()) {
+            continue;
+        }
+        size_t eq = pair.find('=');
+        std::string key = pair.substr(0, eq == std::string::npos ? std::string::npos : eq);
+        if (key == "ss") {
+            continue;
+        }
+        if (!kept.empty()) {
+            kept += '&';
+        }
+        kept += pair;
+    }
+    if (kept.empty()) {
+        // 只剩 ss= 的地址：查询串没了，'?' 也一起去掉（不留悬空问号）。
+        return url.substr(0, query_start) + fragment;
+    }
+    return url.substr(0, query_start + 1) + kept + fragment;
+}

@@ -33,4 +33,11 @@ std::string AppendMusicStart(const std::string& url, int start_seconds);
 // 非数字 / 负值 / 缺失一律返回 0（与 duration 同一宽容口径）。
 int ParseMusicStartSeconds(const std::string& url);
 
+// 摘掉播放地址里的起点参数（ss=），其余参数逐字节保持原样。
+// 供续播「重新起流」用：AppendMusicStart 的语义是追加，直接重拼会让地址里
+// 出现两个 ss=（谁生效交给上游解析顺序，等于把行为交给运气）。续播是
+// RemoveMusicStart 之后再 AppendMusicStart 的**替换**语义（issue #4）。
+// 摘掉后查询串为空则连 '?' 一起去掉；'#' 片段原样保留。
+std::string RemoveMusicStart(const std::string& url);
+
 #endif  // MUSIC_URL_H

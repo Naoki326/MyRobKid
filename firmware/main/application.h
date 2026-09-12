@@ -120,14 +120,64 @@ public:
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
 
+    /*
+     * 「音乐是否在出声」的单一谓词（issue #4）：省电判定、延迟起播分支、
+     * 停止路径、按钮打断、唤醒词恢复（HandleStateChangedEvent 的 idle 分支）
+     * 五处都经它，语义不再各说各话。
+     * 注意 IsBusy() 不含暂停态——暂停同样占着 worker、连接与 PERFORMANCE
+     * 省电等级，判「已空闲」会把 Wi-Fi 打回省电档、撕裂恢复后的音频流。
+     */
+    bool IsMusicPlaying() const { return music_player_.IsPlaying(); }
+    bool IsMusicBusy() const { return music_player_.IsBusy(); }
+    bool IsMusicPaused() const { return music_player_.IsPaused(); }
+    /*
+     * 暂停种类**只有播放器持有**（ADR-0010/0013：状态是播放器的事实），
+     * 会话层按需现读、不缓存副本——缓存会与播放器分叉（用户暂停是降不
+     * 下来的，抄一份入参就会把用户暂停误记成会话性暂停）。
+     */
+    bool IsMusicPauseConversational() const {
+        return music_player_.IsPaused() &&
+               music_player_.GetPauseState() == PauseKind::kConversation;
+    }
+
+    /*
+     * ResumeMusic 的三态结果：resumed = 已真的开始续播；deferred = 已在说话
+     * 途中登记，答复说完即续（**不是**已经出声）；nothing = 没有可续的暂停。
+     * 调用方（MCP 工具）据此如实回话，别把 deferred 说成「已继续」。
+     */
+    enum class ResumeOutcome { kResumed, kDeferred, kNothing };
+
     /**
      * Start streaming an MP3 URL on the speaker (thread-safe).
      * Drops any in-flight conversation audio, blocks until the first frame
      * decodes and returns false when the URL is not playable. The music
-     * keeps playing after the conversation ends; waking the device stops it.
+     * keeps playing after the conversation ends; waking the device pauses it.
      */
     bool StartMusic(const std::string& url);
+    /*
+     * 真停止（`stop_music` 工具触发）：清空会话与位点，不再有「接着放」。
+     * 与 PauseMusic 的分工是 issue #4 的核心——唤醒/新对话是让位（暂停），
+     * 只有用户明确说「停止」才是停止。
+     */
     void StopMusic();
+
+    /*
+     * 让位/用户暂停（issue #4）。两种语义必须分开记：
+     *   PauseKind::kConversation — 唤醒或新对话触发，答完静默数秒自动续；
+     *   PauseKind::kUser         — 用户说「暂停」触发，必须说「继续」才续。
+     * 暂停期间唤醒词/聆听照常（暂停不是「半死」状态），省电等级保持
+     * PERFORMANCE（worker 与连接都还在）。
+     * 返回 false = 当前没有活着的音乐会话（调用方如实回话，别假成功）。
+     */
+    bool PauseMusic(PauseKind kind);
+    /*
+     * 从暂停处接着放（非阻塞）：试原连接 / 按位点重起流由播放器两段式完成。
+     * 说话途中调用会被延后到这句答完（"说完话再播"，与换歌同一条路）——
+     * 那时返回 kDeferred，调用方须如实说「已在排队」而不是「已继续」。
+     */
+    ResumeOutcome ResumeMusic();
+    // 暂停态下不做静默自动续播（用户暂停、会话结束）。
+    void CancelPauseAutoResume();
 
     // 音乐会话快照（issue #3）：状态上报经此取「播到哪了」。
     // 直接转述播放器的记账，线程安全。
@@ -139,6 +189,8 @@ public:
      * the first decoded frame.
      */
     bool StartMusicNow(const std::string& url);
+    // 立即续播（无对话在说话时走这条）：见 ResumeMusic 的注释。
+    bool ResumeMusicNow();
 
     /*
      * URL deferred until the current conversation reply finishes playing
@@ -146,6 +198,9 @@ public:
      * loop (Schedule) context.
      */
     std::string pending_music_url_;
+    // 「继续」登记（同为 main loop 独占）：说「继续」时若还在说话，延后到
+    // tts stop 再续播——与 pending_music_url_ 同一条路、同一个时刻执行。
+    bool pending_music_resume_ = false;
     
     /**
      * Reset protocol resources (thread-safe)
@@ -183,6 +238,21 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
+    /*
+     * 会话性暂停的静默计时（issue #4）。必须**另起**计数器：clock_ticks_
+     * 同时在驱动「每 10 秒打一次堆统计」，共用会被无关抖动清零。
+     * 语义分离落在 Application 而不是播放器：播放器只认「暂停了没、哪种」，
+     * 「什么时候该自己接上」是会话层的事。
+     * 只有**会话性**暂停才 arm 计数器——用户暂停绝不 arm，这是「说暂停后
+     * 随便聊一句音乐不自动响」的唯一实现手段。种类本身不在这里缓存：每次
+     * 现读播放器（IsMusicPauseConversational），免得抄本与事实分叉。
+     */
+    int pause_quiet_ticks_ = 0;
+    bool auto_resume_armed_ = false;
+    // 本轮聆听里用户说过话（VAD 起过一次）。一旦说话，这一轮的自动续播就
+    // 不再触发——他显然还有话要说，音乐不该插进来。
+    bool pause_user_spoke_ = false;
+
     // TTS pre-buffering: collect incoming TTS audio packets and only start
     // playing after the server finishes the whole response (tts stop). This
     // avoids choppy playback when the server generates or delivers audio
@@ -210,8 +280,9 @@ private:
     void StartListeningAudio();
     void ConfigureWakeWordForListening();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
-    void HandleMusicFinished(bool success);
+    void HandleMusicFinished(bool success, bool resume_failed);
     void LaunchPendingMusic();
+    void UpdatePauseAutoResume();
     static void MusicStartTaskEntry(void* arg);
     void StopNotification();
     void HandleNotificationFinished(uint32_t playback_id, bool success);

@@ -3,6 +3,7 @@
 #include <esp_log.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "board.h"
@@ -42,6 +43,11 @@ namespace {
 constexpr uint32_t kMusicTaskStackSize = 8192;
 constexpr UBaseType_t kMusicTaskPriority = 2;
 constexpr int kHttpTimeoutMs = 8000;
+// 恢复第一段的试读窗口（issue #4）：暂停时上游被反压堵着，连接若健康，
+// 恢复读取数据会立刻到达；窗口内一个字节都没到即判死。
+constexpr int kResumeProbeTimeoutMs = 2500;
+// 重起流的安全余量（ADR-0009）：宁可重复一小段，也不要跳词。
+constexpr int kResumeSafetyMarginSeconds = 2;
 constexpr size_t kHttpReadChunk = 4096;
 // PCM pre-buffer kept by the worker, in decoded frames (~26 ms each).
 // The playback queue itself only holds a couple of frames; this ring is
@@ -64,12 +70,18 @@ bool IsSupportedUrl(const std::string& url) {
 // 位点折算的单一定义（ADR-0010）：起始偏移 + 已推入播放队列的 PCM 折算秒数。
 // 状态上报与 pipe: 遥测都经此，同一口径不写两遍——两处分叉会让「串口断言
 // 通过」与「模型答出的位点」各说各话。
-int PositionSeconds(int start_offset_s, uint64_t pushed_samples, int sample_rate) {
+// 整秒口径（pipe: 周期行 / 状态上报）与一位小数口径（锚点行，spec 的
+// ±0.5s 验收缝要一位小数才够得着）共用同一个折算，不会分叉。
+double PositionSecondsF(int start_offset_s, uint64_t pushed_samples, int sample_rate) {
     if (sample_rate <= 0) {
         sample_rate = 1;
     }
-    return start_offset_s +
-           static_cast<int>(pushed_samples / static_cast<uint64_t>(sample_rate));
+    return static_cast<double>(start_offset_s) +
+           static_cast<double>(pushed_samples) / static_cast<double>(sample_rate);
+}
+
+int PositionSeconds(int start_offset_s, uint64_t pushed_samples, int sample_rate) {
+    return static_cast<int>(PositionSecondsF(start_offset_s, pushed_samples, sample_rate));
 }
 }  // namespace
 
@@ -105,8 +117,12 @@ bool MusicPlayer::Start(std::string url, FinishedCallback finished_callback) {
         url_ = std::move(url);
         finished_callback_ = std::move(finished_callback);
         cancelled_ = false;
-        // 新会话：内容属性与起点从播放地址读回（起点由 play_music 工具以
-        // ss= 追加），位点记账清零。
+        // 新会话：上一首的暂停态与待恢复标记一并清掉（换歌是替换语义，
+        // 不是恢复语义——被暂停的旧会话没有资格再被接回来）。
+        paused_ = false;
+        resume_pending_ = false;
+        // 内容属性与起点从播放地址读回（起点由 play_music 工具以 ss= 追加），
+        // 位点记账清零。
         meta_ = ParseMusicContentMeta(url_);
         start_s_ = ParseMusicStartSeconds(url_);
         pushed_samples_.store(0);
@@ -159,18 +175,81 @@ void MusicPlayer::Stop() {
     }
 }
 
+bool MusicPlayer::Pause(PauseKind kind) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!worker_running_.load()) {
+        return false;
+    }
+    // 用户暂停不被会话性让位降级：用户说「暂停」之后又来一次唤醒，音乐
+    // 仍然不许自动回来（否则「说暂停后随便聊一句音乐自己响了」）。
+    if (paused_ && pause_kind_ == PauseKind::kUser && kind == PauseKind::kConversation) {
+        return true;
+    }
+    // 反过来可以升级：会话性暂停期间用户改口说「暂停」，从此不再自动续。
+    paused_ = true;
+    pause_kind_ = kind;
+    return true;
+}
+
+void MusicPlayer::CancelPause() {
+    // 换歌/真停止的清理：撤掉待恢复标记（会话不该被接回来）。
+    // 只撤「会话该不该恢复」这层语义，**不会**让暂停中的 worker 立刻继续读
+    // ——那由 Start() 的替换路径或 Cancel() 的退出路径负责。否则一次「登记
+    // 新歌」就会让旧歌在回答还没说完时自己响起来。
+    // 暂停标志本身不在这里清：它决定 worker 是继续等还是往下走，得由
+    // Start()（换歌，进不去暂停分支了）或 Cancel()（worker 退出）来收。
+    std::lock_guard<std::mutex> lock(mutex_);
+    resume_pending_ = false;
+}
+
+bool MusicPlayer::Resume() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!worker_running_.load() || !paused_) {
+        return false;
+    }
+    // 只清标志：试读与「必要时重起流」都由 worker 自己完成（探读窗口
+    // 2.5s，重起流还要更久，不能堵住调用方——它跑在主循环上）。
+    paused_ = false;
+    resume_pending_ = true;
+    return true;
+}
+
 bool MusicPlayer::IsBusy() const { return worker_running_.load(); }
+
+bool MusicPlayer::IsPlaying() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return worker_running_.load() && !paused_;
+}
+
+bool MusicPlayer::IsPaused() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return worker_running_.load() && paused_;
+}
+
+PauseKind MusicPlayer::GetPauseState() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pause_kind_;
+}
 
 MusicPlaybackStatus MusicPlayer::GetPlaybackStatus() const {
     MusicPlaybackStatus status;
     std::lock_guard<std::mutex> lock(mutex_);
     if (!worker_running_.load()) {
-        // 空闲：不携带上一首的陈旧位点。会话性/用户暂停两态由暂停票置入，
-        // 置入时同样只报冻结时的位点、不随时间推进。
+        // 空闲：不携带上一首的陈旧位点。
         status.state = MusicPlaybackStatus::State::kIdle;
         return status;
     }
-    status.state = MusicPlaybackStatus::State::kPlaying;
+    // 暂停态报**冻结**位点：暂停后不再推帧，PositionSeconds 天然钉住不动，
+    // 不需要额外记账。
+    if (!paused_) {
+        status.state = MusicPlaybackStatus::State::kPlaying;
+    } else {
+        // 暂停种类（两态）→ 上报状态（四态）的映射。字符串口径不变：
+        // paused_conversation / paused_user（ADR-0010）。
+        status.state = pause_kind_ == PauseKind::kUser
+                           ? MusicPlaybackStatus::State::kPausedUser
+                           : MusicPlaybackStatus::State::kPausedConversation;
+    }
     status.title = meta_.title;
     status.author = meta_.author;
     status.duration_s = meta_.duration_s;
@@ -186,29 +265,173 @@ MusicPlaybackStatus MusicPlayer::GetPlaybackStatus() const {
 
 void MusicPlayer::WorkerEntry(void* arg) {
     auto* player = static_cast<MusicPlayer*>(arg);
-    player->WorkerTask();
+    // The callback belongs to *this* session: WorkerTask snapshotted it when
+    // the session began and hands it back here, together with this session's
+    // result. Reading shared members now would race with a Start() that
+    // replaces the stream (swap songs) — the old worker would fire the *new*
+    // session's callback, or the new worker's result, with the old one's.
+    SessionOutcome outcome = player->WorkerTask();
     player->task_handle_ = nullptr;
+    // 先清 worker_running_，再发回调：回调里 IsBusy()/IsPlaying() 必须说
+    // 真话（HandleMusicFinished 用它们决定归还省电与唤醒词）。
     player->worker_running_ = false;
+    player->NotifyFinished(std::move(outcome));
     vTaskDelete(nullptr);
 }
 
-void MusicPlayer::WorkerTask() {
-    bool success = false;
-    std::string url;
+bool MusicPlayer::TakeResumePending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool pending = resume_pending_;
+    resume_pending_ = false;
+    return pending;
+}
+
+std::optional<RestartSeam> MusicPlayer::PrepareRestart() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (url_.empty()) {
+        return std::nullopt;
+    }
+    const int rate = audio_service_.GetOutputSampleRate();
+    RestartSeam seam;
+    seam.from_s = PositionSecondsF(start_s_, pushed_samples_.load(std::memory_order_relaxed),
+                                   rate);
+    seam.margin_s = kResumeSafetyMarginSeconds;
+    // 请求的重起位点 = 当前位点回退安全余量（clamp ≥0），一位小数打进锚点
+    // （at= 与 from= 的差就是回退量）。写进地址的 ss= 只能是整数秒：向下取整，
+    // 多退不到 1s——方向与 ADR-0009 一致（宁可重复一小段，不跳词）。
+    seam.at_s = std::max(0.0, seam.from_s - static_cast<double>(seam.margin_s));
+    if (meta_.live) {
+        // 直播流位点无意义：重连到现场（ADR-0009「位点必须丢弃，而非拒绝」）。
+        seam.from_s = 0.0;
+        seam.at_s = 0.0;
+        seam.margin_s = 0;
+    }
+    const int restart_s = static_cast<int>(std::floor(seam.at_s));
+    // 替换语义：先摘掉旧的 ss= 再追加新的。AppendMusicStart 是**追加**，
+    // 直接重拼会让地址里出现两个 ss=（谁生效取决于上游解析顺序）。
+    std::string next = AppendMusicStart(RemoveMusicStart(url_), restart_s);
+    url_ = std::move(next);
+    start_s_ = restart_s;
+    // 位点仍报绝对值且连续：新流从 restart_s 起算，已推帧重新记账。
+    pushed_samples_.store(0);
+    return seam;
+}
+
+MusicPlayer::SessionOutcome MusicPlayer::WorkerTask() {
+    // Snapshot the callback at session start: it is *this* session's callback
+    // even if a later Start() swaps songs and installs a new one.
     FinishedCallback finished_callback;
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        url = url_;
+        finished_callback = finished_callback_;
+    }
+
+    StreamEnd end = StreamEnd::kFailed;
+    bool attempted_restart = false;
+    for (;;) {
+        end = StreamOnce();
+        if (end != StreamEnd::kRestart) {
+            break;
+        }
+        if (cancelled_.load()) {
+            // 取消优先于恢复：用户要的是停止，不是换个连接接着放。
+            end = StreamEnd::kCancelled;
+            break;
+        }
+        auto seam = PrepareRestart();
+        if (!seam.has_value()) {
+            ESP_LOGE(TAG, "Music resume failed: stream URL unusable");
+            end = StreamEnd::kFailed;
+            attempted_restart = true;
+            break;
+        }
+        MusicContentMeta meta;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            meta = meta_;
+        }
+        // 续播锚点（串口断言用）：重启式续播的「从哪来、请求从哪起」。位点带
+        // 一位小数（spec 的 ±0.5s 接缝验收），回退安全余量（宁可重复一小段，
+        // 不跳词）在这条行里看得见。
+        if (meta.live) {
+            ESP_LOGI(TAG, "Music resume: mode=restart at=live from=live margin=%ds",
+                     seam->margin_s);
+        } else {
+            ESP_LOGI(TAG, "Music resume: mode=restart at=%.1fs from=%.1fs margin=%ds",
+                     seam->at_s, seam->from_s, seam->margin_s);
+        }
+        attempted_restart = true;
+    }
+
+    // 「续播失败」不是「用户停止」也不是「自然播完」：这次会话是对已暂停
+    // 音乐的恢复，重起流没能接上。收尾方（Application）据此给用户一个可辨
+    // 反馈，别让音乐悄悄消失。
+    const bool resume_failed = attempted_restart && end == StreamEnd::kFailed;
+
+    if (!first_frame_decoded_) {
+        {
+            std::lock_guard<std::mutex> start_lock(start_mutex_);
+            start_failed_ = true;
+            start_cv_.notify_all();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> start_lock(start_mutex_);
+        // Make sure a concurrent Start() is not stuck waiting either.
+        start_failed_ = true;
+        start_cv_.notify_all();
+    }
+    if (end == StreamEnd::kFailed) {
+        ESP_LOGE(TAG, "Music worker finished (failed%s): %s",
+                 resume_failed ? ", resume failed" : "", url.c_str());
+    } else {
+        ESP_LOGI(TAG, "Music worker finished (%s): %s",
+                 end == StreamEnd::kDrained ? "completed" : "aborted", url.c_str());
+    }
+    // 结果与回调一起交给 WorkerEntry（它清完 worker_running_ 再发出）：调用方
+    // 在回调里问「播放器还在忙吗」才是准的（省电归还、唤醒词恢复都按这个判断走）。
+    // 结果不走共享成员——快速失败的新会话可能已经把共享结果覆盖了。
+    SessionOutcome outcome;
+    outcome.callback = std::move(finished_callback);
+    outcome.result.success = (end == StreamEnd::kDrained);
+    outcome.result.resume_failed = resume_failed;
+    return outcome;
+}
+
+void MusicPlayer::NotifyFinished(SessionOutcome outcome) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // 会话已死：暂停/待恢复标记一并清掉，别让下一次 Start() 读到残影。
+        paused_ = false;
+        resume_pending_ = false;
+    }
+    if (outcome.callback) {
+        outcome.callback(outcome.result);
+    }
+}
+
+MusicPlayer::StreamEnd MusicPlayer::StreamOnce() {
+    std::string url;
     MusicContentMeta meta;
     int start_s = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         url = url_;
-        finished_callback = finished_callback_;
         meta = meta_;
         start_s = start_s_;
+    }
+    if (url.empty()) {
+        ESP_LOGE(TAG, "Music stream URL is empty");
+        return StreamEnd::kFailed;
     }
     // 位点折算基准：推入播放队列的 PCM 已是输出采样率（含重定向后的单声道）。
     const uint64_t output_rate =
         static_cast<uint64_t>(std::max(1, audio_service_.GetOutputSampleRate()));
 
+    // 缓冲与句柄全归 worker 所有：恢复要走重起流时由 worker 自己拆掉重建，
+    // 别的任务不许伸手进来（ring/in_buf/解码器三者必须同时换代）。
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
     esp_audio_simple_dec_handle_t dec = nullptr;
     esp_ae_rate_cvt_handle_t rate_cvt = nullptr;
@@ -216,22 +439,58 @@ void MusicPlayer::WorkerTask() {
     PsramBytes in_buf;
     std::vector<uint8_t> pcm;
     int src_channels = 0;
+    bool pause_logged = false;
+    StreamEnd result = StreamEnd::kFailed;
 
-    auto finish = [&](bool result) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            finished_callback_ = nullptr;
+    auto close_stream = [&]() {
+        if (dec != nullptr) {
+            esp_audio_simple_dec_close(dec);
+            dec = nullptr;
         }
-        if (finished_callback) {
-            finished_callback(result);
+        if (rate_cvt != nullptr) {
+            esp_ae_rate_cvt_close(rate_cvt);
+            rate_cvt = nullptr;
+        }
+        if (http != nullptr) {
+            http->Close();
         }
     };
-    auto fail_start = [&]() {
-        {
-            std::lock_guard<std::mutex> start_lock(start_mutex_);
-            start_failed_ = true;
-            start_cv_.notify_all();
+    // 暂停态一次读全（种类与标志必须同一把锁下取，否则可能读到「暂停了但
+    // 种类还是上一轮残留」的错配）。
+    auto paused_snapshot = [&](PauseKind* kind) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (kind != nullptr) {
+            *kind = pause_kind_;
         }
+        return paused_;
+    };
+    // pipe: 周期行用整秒（2 秒一拍的遥测不该伪造精度）。
+    auto write_pos_int = [&](int seconds, char* out, size_t out_size) {
+        if (meta.live) {
+            snprintf(out, out_size, "live");
+        } else {
+            snprintf(out, out_size, "%ds", seconds);
+        }
+    };
+    // 锚点行（pause / resume / restart）用一位小数：spec 的验收缝是
+    // 「恢复后位点从原处继续（±0.5s）」，整秒量化够不着。与 pipe: 行同走
+    // 位点折算（整秒口径是 PositionSeconds，一位小数是 PositionSecondsF），
+    // 两处数字不会分叉。
+    auto write_pos_tenths = [&](double seconds, char* out, size_t out_size) {
+        if (meta.live) {
+            snprintf(out, out_size, "live");
+        } else {
+            snprintf(out, out_size, "%.1fs", seconds);
+        }
+    };
+    auto current_position_s = [&]() {
+        return PositionSeconds(start_s_, pushed_samples_.load(std::memory_order_relaxed),
+                               static_cast<int>(output_rate));
+    };
+    // 锚点用：未量化的帧级位点（整秒记账 + 不足一秒的余数）。
+    auto current_position_f = [&]() {
+        return PositionSecondsF(start_s_, pushed_samples_.load(std::memory_order_relaxed),
+                                static_cast<int>(output_rate));
     };
 
     do {
@@ -273,6 +532,8 @@ void MusicPlayer::WorkerTask() {
 
         bool http_eof = false;
         bool decode_error = false;
+        bool stream_drained = false;
+        bool restart = false;
         bool streaming_started = false;
         // Pipeline telemetry: where the stream stalls (network read, decode
         // or playback queue) is otherwise invisible.
@@ -283,7 +544,112 @@ void MusicPlayer::WorkerTask() {
         // EOF 收尾观测（issue #3）：流结束后剩余的解不动尾巴（标签/垃圾帧）
         // 不能让会话永远挂在「在播」——唤醒词不恢复、位点停在旧值。
         int eof_stall_passes = 0;
+
+        // 位点遥测：绝对位点（起点 + 已推帧）；直播流标 live（不可定位）。
+        // 与状态上报同走 PositionSeconds，两处数字不会分叉。暂停态带标记
+        // （PAUSED_CONV / PAUSED_USER）：串口断言据此跳过暂停跨度的推进率与
+        // 单调性检查，并核对「两种暂停态可区分」。
+        auto log_pipe = [&]() {
+            if (xTaskGetTickCount() - stat_last < pdMS_TO_TICKS(2000)) {
+                return;
+            }
+            PauseKind paused_kind = PauseKind::kConversation;
+            const bool is_paused = paused_snapshot(&paused_kind);
+            char pos_field[32];
+            write_pos_int(current_position_s(), pos_field, sizeof(pos_field));
+            const char* pause_flag =
+                !is_paused ? ""
+                           : (paused_kind == PauseKind::kUser ? " PAUSED_USER"
+                                                              : " PAUSED_CONV");
+            ESP_LOGI(TAG,
+                     "pipe: ring=%u/%u in_buf=%uB read=%uB/2s pushed=%u fail=%u pos=%s%s%s%s",
+                     (unsigned)ring.size(), (unsigned)kRingHighWatermark,
+                     (unsigned)in_buf.size(), (unsigned)stat_read_bytes,
+                     (unsigned)stat_pushed, (unsigned)stat_push_fail, pos_field, pause_flag,
+                     http_eof ? " EOF" : "", decode_error ? " DECERR" : "");
+            stat_read_bytes = stat_pushed = stat_push_fail = 0;
+            stat_last = xTaskGetTickCount();
+        };
+
+        // 暂停：不 Read、不解码、不推帧，但**不退出、不关连接**。
+        // worker 一停止取数，http_client 的 8KB 关卡就堵住它自己的 TCP
+        // 回调线程（http_client.cc OnTcpData），接收窗口随即关闭，Mac 侧
+        // ffmpeg 自己停在写阻塞上（实测 0 CPU / 0 下载）。纯复用既有反压，
+        // 不新增音频管线开关；ring（~0.8s）与 in_buf 故意留着，那是快路径
+        // 「零间隙」的来源。
+        auto wait_while_paused = [&]() {
+            PauseKind kind = PauseKind::kConversation;
+            if (!paused_snapshot(&kind)) {
+                return false;
+            }
+            if (!pause_logged) {
+                char pos_field[32];
+                write_pos_tenths(current_position_f(), pos_field, sizeof(pos_field));
+                ESP_LOGI(TAG, "Music pause: kind=%s pos=%s",
+                         kind == PauseKind::kUser ? "user" : "conversation",
+                         pos_field);
+                pause_logged = true;
+            }
+            log_pipe();
+            vTaskDelay(1);
+            return true;
+        };
+
         while (!cancelled_.load() && !decode_error) {
+            // 1) 暂停判定必须在 HTTP 填充循环**之外**（在循环里判＝暂停期间
+            // 仍把 in_buf 填满），此处先卡住整个一轮。
+            if (wait_while_paused()) {
+                continue;
+            }
+            // 2) 恢复：两段式。先试原连接（短超时探读），一个字节都没到即
+            // 判死 → 返回 kRestart，由 WorkerTask 按位点重拼地址重起流。
+            // 坑：http_client 把「读超时」与「连接硬错误」都折叠成 -1（干净
+            // EOF 是 0），所以这里必须自己开分支，不能沿用下面 size<0 即
+            // decode_error 的那条路；探完无论如何都要把超时还原成 8s——
+            // 实例级超时留成 2.5s 会把后续一次真实卡顿误判成死连接。
+            if (TakeResumePending()) {
+                // 锚点行带一位小数（spec 的 ±0.5s 验收缝）；探针行只是诊断，
+                // 另用整秒口径。
+                char pos_field[32];
+                write_pos_tenths(current_position_f(), pos_field, sizeof(pos_field));
+                if (http_eof) {
+                    // 暂停时流其实已经读完了：没有「连接还活着吗」要探，把
+                    // 手里这点残余播完就正常收尾（探读会返回 0 → 误判成
+                    // 「连接死了」→ 白重起一次流，把结尾又播一遍）。
+                    pause_logged = false;
+                    ESP_LOGI(TAG, "Music resume: mode=continue at=%s (stream ended)",
+                             pos_field);
+                } else {
+                    http->SetTimeout(kResumeProbeTimeoutMs);
+                    std::vector<uint8_t> probe(kHttpReadChunk);
+                    int size = http->Read(reinterpret_cast<char*>(probe.data()),
+                                          probe.size());
+                    http->SetTimeout(kHttpTimeoutMs);
+                    if (size > 0) {
+                        // 连接还活着：把探到的字节接进压缩缓冲，原连接继续用。
+                        in_buf.insert(in_buf.end(), probe.begin(), probe.begin() + size);
+                        stat_read_bytes += size;
+                        pause_logged = false;
+                        // 续播锚点（串口断言用）：mode=continue 表示原连接接着读，
+                        // at= 是接缝处的位点（暂停时冻结的那个）。
+                        ESP_LOGI(TAG, "Music resume: mode=continue at=%s", pos_field);
+                    } else {
+                        // -1 = 探读超时/连接硬错误；0 = 已 EOF。暂停期间上游若把
+                        // socket 收了（超过 proxy_read_timeout）就会走到这里——
+                        // 判死的结论正是期望：位点还在，换连接接着放。
+                        // 这一行**不是**续播锚点（锚点由 WorkerTask 在重起流前
+                        // 打一条，带 from=/margin=）；这里只留探针结果，供定位
+                        // 「为什么走了 restart」。用整秒：它不进断言。
+                        char probe_pos[32];
+                        write_pos_int(current_position_s(), probe_pos, sizeof(probe_pos));
+                        ESP_LOGI(TAG, "Music resume probe: at=%s result=%d", probe_pos,
+                                 size);
+                        restart = true;
+                        break;
+                    }
+                }
+            }
+
             size_t iter_consumed = 0;
             size_t iter_decoded = 0;
             // 停滞判据用会话内单调的推帧总数，不用 stat_pushed——后者每 2 秒
@@ -308,6 +674,12 @@ void MusicPlayer::WorkerTask() {
             while ((ring.size() < kRingHighWatermark ||
                     in_buf.size() < kMaxCompressedBuffer) &&
                    (in_buf.size() > 0 || !http_eof)) {
+                // 填充循环里也要能立刻停下：暂停标志可能刚刚在同一次填充中
+                // 被置位，继续读完这一轮就把内存填成「暂停前的样子」了。
+                PauseKind pause_kind = PauseKind::kConversation;
+                if (paused_snapshot(&pause_kind)) {
+                    break;
+                }
                 size_t old_size = in_buf.size();
                 if (!http_eof && old_size < kMaxCompressedBuffer) {
                     in_buf.resize(old_size + kHttpReadChunk);
@@ -315,6 +687,13 @@ void MusicPlayer::WorkerTask() {
                                           kHttpReadChunk);
                     if (size < 0) {
                         ESP_LOGE(TAG, "Music HTTP read failed: %d", http->GetLastError());
+                        if (paused_snapshot(nullptr)) {
+                            // 暂停期间读挂了不是「会话结束」：用户还在暂停态里。
+                            // 不推任何帧，交回暂停分支等着；恢复时探读会判死并
+                            // 走重起流（位点还在，重取即可）。
+                            in_buf.resize(old_size);
+                            break;
+                        }
                         http_eof = true;  // treat as end of stream, play what we have
                         decode_error = true;
                         break;
@@ -430,6 +809,12 @@ void MusicPlayer::WorkerTask() {
                 }
             }
 
+            // 填充循环中途被暂停：这一轮不推帧（推出去就把「暂停」变成了
+            // 几十毫秒后才静音），回到暂停分支原地等恢复。
+            if (wait_while_paused()) {
+                continue;
+            }
+
             // 2. Feed the playback queue once the pre-buffer is filled.
             //    (The queue API takes a plain vector; copy the single frame
             //    out of the PSRAM ring — the long-lived buffers stay in PSRAM.)
@@ -464,32 +849,11 @@ void MusicPlayer::WorkerTask() {
                 }
             }
 
-            if (xTaskGetTickCount() - stat_last >= pdMS_TO_TICKS(2000)) {
-                // 位点遥测：绝对位点（起点 + 已推帧）；直播流标 live（不可定位）。
-                // 与状态上报同走 PositionSeconds，两处数字不会分叉。
-                char pos_field[32];
-                if (meta.live) {
-                    snprintf(pos_field, sizeof(pos_field), "live");
-                } else {
-                    snprintf(pos_field, sizeof(pos_field), "%us",
-                             (unsigned)PositionSeconds(
-                                 start_s,
-                                 pushed_samples_.load(std::memory_order_relaxed),
-                                 static_cast<int>(output_rate)));
-                }
-                ESP_LOGI(TAG,
-                         "pipe: ring=%u/%u in_buf=%uB read=%uB/2s pushed=%u fail=%u pos=%s%s%s",
-                         (unsigned)ring.size(), (unsigned)kRingHighWatermark,
-                         (unsigned)in_buf.size(), (unsigned)stat_read_bytes,
-                         (unsigned)stat_pushed, (unsigned)stat_push_fail, pos_field,
-                         http_eof ? " EOF" : "", decode_error ? " DECERR" : "");
-                stat_read_bytes = stat_pushed = stat_push_fail = 0;
-                stat_last = xTaskGetTickCount();
-            }
+            log_pipe();
 
             // 3. Finished when everything has been played out.
             if (http_eof && in_buf.empty() && ring.empty()) {
-                success = true;
+                stream_drained = true;
                 break;
             }
             // EOF 后若解码器对剩余字节既不消费也不产出、队列也推不进
@@ -508,7 +872,7 @@ void MusicPlayer::WorkerTask() {
                                  start_s,
                                  pushed_samples_.load(std::memory_order_relaxed),
                                  static_cast<int>(output_rate)));
-                    success = true;
+                    stream_drained = true;
                     break;
                 }
             } else {
@@ -522,28 +886,18 @@ void MusicPlayer::WorkerTask() {
             // the ~24 ms/frame pace with margin.
             vTaskDelay(1);
         }
+
+        if (restart) {
+            result = StreamEnd::kRestart;
+        } else if (stream_drained) {
+            result = StreamEnd::kDrained;
+        } else if (cancelled_.load()) {
+            result = StreamEnd::kCancelled;
+        } else {
+            result = StreamEnd::kFailed;
+        }
     } while (false);
 
-    if (dec != nullptr) {
-        esp_audio_simple_dec_close(dec);
-    }
-    if (rate_cvt != nullptr) {
-        esp_ae_rate_cvt_close(rate_cvt);
-    }
-    if (http) {
-        http->Close();
-    }
-
-    if (!first_frame_decoded_) {
-        fail_start();
-    }
-    {
-        std::lock_guard<std::mutex> start_lock(start_mutex_);
-        // Make sure a concurrent Start() is not stuck waiting either.
-        start_failed_ = true;
-        start_cv_.notify_all();
-    }
-    ESP_LOGI(TAG, "Music worker finished (%s): %s",
-             success ? "completed" : "aborted", url.c_str());
-    finish(success);
+    close_stream();
+    return result;
 }

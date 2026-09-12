@@ -94,8 +94,49 @@ void McpServer::AddCommonTools() {
             return true;
         });
 
+    AddTool("self.audio_speaker.pause_music",
+        "Pause the currently playing music/radio WITHOUT losing the position. "
+        "Call this when the user asks to pause or stop for now. The paused music "
+        "stays paused until the user asks to resume — it never continues by itself. "
+        "Use stop_music only when the user wants the music gone for good. "
+        "Returns \"paused\", or \"nothing_playing\" when no music is playing.",
+        PropertyList(),
+        [&board](const PropertyList& properties) -> ReturnValue {
+            if (!Application::GetInstance().PauseMusic(PauseKind::kUser)) {
+                return std::string("nothing_playing");
+            }
+            return std::string("paused");
+        });
+
+    AddTool("self.audio_speaker.resume_music",
+        "Resume the paused music from where it was paused (not from the beginning). "
+        "Call this when the user asks to continue/resume playback. "
+        "Returns \"resumed\" (playback is continuing now), \"resume_pending\" (the "
+        "resume is queued and starts as soon as the current reply finishes speaking "
+        "— tell the user it will continue shortly), \"already_playing\" (nothing was "
+        "paused, playback is untouched) or \"nothing_to_resume\".",
+        PropertyList(),
+        [&board](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            if (!app.IsMusicPaused()) {
+                return std::string(app.IsMusicPlaying() ? "already_playing"
+                                                        : "nothing_to_resume");
+            }
+            switch (app.ResumeMusic()) {
+                case Application::ResumeOutcome::kResumed:
+                    return std::string("resumed");
+                case Application::ResumeOutcome::kDeferred:
+                    return std::string("resume_pending");
+                case Application::ResumeOutcome::kNothing:
+                    break;
+            }
+            return std::string("nothing_to_resume");
+        });
+
     AddTool("self.audio_speaker.stop_music",
-        "Stop the music or radio stream that is currently playing on the device.",
+        "Stop the music or radio stream that is currently playing on the device. "
+        "This ends the listening session: the position is dropped and the music "
+        "cannot be resumed afterwards (use pause_music for that).",
         PropertyList(),
         [&board](const PropertyList& properties) -> ReturnValue {
             Application::GetInstance().StopMusic();

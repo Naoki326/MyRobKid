@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,7 @@
  *
  * The speaker is exclusive with conversation audio: callers are expected to
  * drop in-flight TTS first (AudioService::ResetDecoder()) before Start(),
- * and to stop playback when the device is woken up again.
+ * and to pause or stop playback when the device is woken up again.
  *
  * Start() blocks until the first audio frame has been decoded (bounded by
  * the HTTP timeouts), so an MCP tool call can synchronously report whether
@@ -34,7 +35,7 @@
 /*
  * 音乐会话快照（issue #3）：状态上报「播到哪了」的唯一事实源。
  * 四态与 CONTEXT.md 的口径一致：空闲 / 在播 / 会话性暂停 / 用户暂停，
- * 互不混淆；后两态由暂停票置入，本票先立口径（ADR-0010）。
+ * 互不混淆；后两态由暂停票（issue #4）置入。
  */
 struct MusicPlaybackStatus {
     enum class State { kIdle, kPlaying, kPausedConversation, kPausedUser };
@@ -62,9 +63,41 @@ struct MusicPlaybackStatus {
     }
 };
 
+/*
+ * 暂停语义只有两种（issue #4）：会话性让位（唤醒/新对话，答完静默数秒自动续）
+ * 与用户暂停（必须说「继续」）。传参必须是这个两态枚举——若拿四态的
+ * MusicPlaybackStatus::State 代替，kIdle/kPlaying 会被静默当成会话性暂停。
+ */
+enum class PauseKind { kConversation, kUser };
+
+// 续播走的是重启路径时，重拼地址用的三个同族数字：暂停那一刻的位点、请求的
+// 重起位点、回退的安全余量（秒）。三者恒同进同出，故收成一个结构而不是三个出参。
+// 位点带一位小数（spec 的 ±0.5s 接缝验收要这精度）。at_s 是**请求**的重起位点
+// （from_s - margin_s，锚点 at= 报它）；写进地址的 ss= 只能是整数秒，另取
+// floor(at_s)，多退不到 1s——方向是 pre-roll，不与「不跳词」冲突。
+struct RestartSeam {
+    double from_s = 0.0;  // 暂停那一刻的绝对位点（锚点 from=）
+    double at_s = 0.0;    // 请求的重起位点 = from_s - margin_s（锚点 at=）
+    int margin_s = 0;     // 安全余量（宁可重复一小段，不跳词）；直播为 0
+};
+
 class MusicPlayer {
 public:
-    using FinishedCallback = std::function<void(bool success)>;
+    /*
+     * 会话结束回调，在 worker 任务里调用（调用方负责转到自己的线程）。
+     * 两个 bool 是两件不同的事：success = 正常播完（EOF 且缓冲播空）；
+     * resume_failed = 这次结束发生在「恢复已暂停的音乐」的路上——重起流
+     * 也没接上。后者要给用户可辨反馈（issue #12），不能与「自然播完」混作
+     * 一谈，否则断线会被听成「歌放完了」。
+     *
+     * 两者与回调**同一条线程**产出（WorkerTask 一次返回），不落任何共享
+     * 成员：换歌时旧 worker 的结果绝不能喂给新会话的回调，反之亦然。
+     */
+    struct FinishedResult {
+        bool success = false;
+        bool resume_failed = false;
+    };
+    using FinishedCallback = std::function<void(const FinishedResult& result)>;
 
     explicit MusicPlayer(AudioService& audio_service);
     ~MusicPlayer();
@@ -75,22 +108,95 @@ public:
     bool Start(std::string url, FinishedCallback finished_callback);
     // Ask the worker to stop without waiting for it (safe from the main
     // loop: the worker may be blocked inside an HTTP read for a while).
+    // This is a *stop*: the session ends and the position is dropped.
     void Cancel();
     // Cancel() + wait until the worker has fully drained out.
     void Stop();
+
+    /*
+     * 谓词分家（issue #4）：「播放器在忙」在多个调用点语义不同（省电判定、
+     * 延迟起播、停止路径、按钮打断、唤醒词恢复），一个 bool 装不下，于是
+     * 拆成显式谓词：
+     *   IsBusy()    worker 存活 = 会话仍持有连接与扬声器，对象不可复用
+     *               （省电判定用它：暂停也占着资源，不能判成已空闲）
+     *   IsPlaying() worker 存活且未暂停 = 真在出声（按钮打断/让位用它）
+     *   IsPaused()  两种暂停之一
+     *   GetPauseState() 暂停种类（仅 IsPaused() 为真时有意义；未暂停/空闲
+     *                   的返回值不作保证，判断前先问 IsPaused()）
+     */
     bool IsBusy() const;
+    bool IsPlaying() const;
+    bool IsPaused() const;
+    PauseKind GetPauseState() const;
+
+    /*
+     * 暂停（非阻塞）：只置位，立即返回。真正的「停」发生在 worker 主循环
+     * 入口——它不再从流里取数（不 Read / 不解码 / 不推帧），但 worker 与
+     * 连接都留着：http_client 的 8KB 关卡随即堵住自己的 TCP 回调线程，
+     * 接收窗口关闭，上游 ffmpeg 自己停在写阻塞上。复用既有反压，
+     * 不新增音频管线开关。
+     * 返回 false = 当前没有活着的音乐会话（调用方据此如实回话，别假成功）。
+     */
+    bool Pause(PauseKind kind);
+    /*
+     * 撤掉暂停态与待恢复标记（换歌 / 真停止时用）。用户暂停不会被会话性
+     * 让位降级——那由 Pause() 内部的升级规则处理；这里是「这次会话不再
+     * 需要恢复」的外部指令。
+     */
+    void CancelPause();
+
+    /*
+     * 恢复（非阻塞）：两段式。置位后立即返回；「先试原连接、必要时按位点
+     * 重新起流」都由 worker 自己完成（探读要 2.5s，重起流还要更久，不能
+     * 堵着主循环）。返回 false = 当前并不处于暂停态（重复说「继续」无副作用）。
+     */
+    bool Resume();
 
     void NotifyStartLocked(bool failed);
 
     // 音乐会话快照：状态 + 绝对位点（起点 + 已推入播放队列的 PCM 量）。
     // 位点口径（issue #3 的关键决定）：只算真正推出的帧——ring 预缓冲
     // （约 0.8s）与解码预读都不计入，否则位点系统性偏大，续播必跳词。
-    // 空闲/暂停态不报陈旧位点；直播流（live）不记位点。
+    // 空闲态不报陈旧位点；暂停态报**冻结**位点（暂停后不再推帧，天然钉住）。
     MusicPlaybackStatus GetPlaybackStatus() const;
 
 private:
+    /*
+     * 一次流会话的结束方式。kRestart 不是失败：它是恢复时「原连接已死」的
+     * 结论——换个连接按位点接着放，由 worker 自己拆掉旧缓冲、重拼地址后
+     * 再进来一次（缓冲全归 worker 所有，别的任务不许伸手进来重建）。
+     */
+    enum class StreamEnd { kDrained, kCancelled, kRestart, kFailed };
+
     static void WorkerEntry(void* arg);
-    void WorkerTask();
+    // Returns this session's callback **and its result** (both snapshotted at
+    // session start / produced at its end) so that WorkerEntry can fire them
+    // after clearing worker_running_ without touching any shared member — by
+    // then a Start() replacing the stream may already have installed a new
+    // callback, and a fast-failing new session may already have overwritten a
+    // shared result.
+    struct SessionOutcome {
+        FinishedCallback callback;
+        FinishedResult result;
+    };
+    SessionOutcome WorkerTask();
+    // 一次流会话：建连接、解码、推帧，直到播完/取消/判死（要重起流）。
+    // 每次进入都自带全套缓冲与解码器句柄——重起流时由 worker 自己换代，
+    // ring/in_buf/rate_cvt 三者必须同时重建（跨连接的旧缓冲是 stale 字节）。
+    StreamEnd StreamOnce();
+    bool TakeResumePending();
+    // 会话真正结束后才回调（WorkerEntry 在 worker_running_ 清零之后调用，
+    // 且传的是**本次会话**的回调与其结果）：调用方在回调里问「播放器还在
+    // 忙吗」得到的是真答案。
+    void NotifyFinished(SessionOutcome outcome);
+    /*
+     * 按位点重拼播放地址：起点 = 当前绝对位点回退 kResumeSafetyMarginSeconds
+     * （宁可重复一小段，也不要跳词），并以替换语义写回 ss=（地址里不许出现
+     * 两个 ss=）。直播流位点无意义：起点归零 = 重连到现场。
+     * 返回的 from_s/at_s 供遥测区分「暂停时的位点」与「请求的重起位点」；
+     * nullopt 表示地址不可用（不能重起流）。
+     */
+    std::optional<RestartSeam> PrepareRestart();
 
     AudioService& audio_service_;
     mutable std::mutex mutex_;
@@ -99,12 +205,21 @@ private:
     TaskHandle_t task_handle_ = nullptr;
     std::atomic<bool> cancelled_{false};
     // True while the worker task is alive; Start() waits for it to clear
-    // before reusing the player.
+    // before reusing the player. Cleared *before* the finished callback runs
+    // so that "IsBusy() == false" inside that callback means what it says.
     std::atomic<bool> worker_running_{false};
+
+    // 暂停（issue #4）：两种语义分开记。paused_ 与 pause_kind_ 总是一起改
+    // （mutex_ 保护，读的一方也要取种类，索性不做无锁读）——用户暂停绝不
+    // 自动续、必须说「继续」，单个 bool 表达不了这件事。
+    bool paused_ = false;
+    PauseKind pause_kind_ = PauseKind::kConversation;
+    // Resume() 只置这个标记（非阻塞）；worker 在循环里取走并执行两段式恢复。
+    bool resume_pending_ = false;
 
     // 位点记账（issue #3）：本次会话已成功推入播放队列的 PCM 样本数
     // （输出采样率口径）。只有 TryPushPcmToPlaybackQueue 成功才累加，
-    // ring 里的预读帧不算。
+    // ring 里的预读帧不算。重起流时按新起点清零（位点仍绝对且连续）。
     std::atomic<uint64_t> pushed_samples_{0};
     // 当前会话的内容属性与起点，Start() 时从播放地址解析（mutex_ 保护）。
     MusicContentMeta meta_;

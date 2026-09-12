@@ -29,6 +29,11 @@ static constexpr bool kTtsPrebufferEnabled = true;
 static constexpr bool kTtsPrebufferEnabled = false;
 #endif
 
+// 会话性暂停的静默阈值（issue #4）：答完进聆听后连续这么多秒无人说话，
+// 就回待机并自动续播。5s 是「用户还在想下一句」与「他其实说完了」之间的
+// 折中：太短会打断追问，太长会让音乐接得莫名其妙。复用 1Hz tick，恰好整秒。
+static constexpr int kPauseAutoResumeQuietTicks = 5;
+
 Application::Application() : notify_player_(audio_service_), music_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
 
@@ -265,6 +270,16 @@ void Application::Run() {
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+                // 静默期内用户再说话：这一轮的自动续播作废（不打断追问）。
+                // VAD 说「有人在说」就足以取消——等他真说完再判会晚一整轮。
+                if (audio_service_.IsVoiceDetected()) {
+                    pause_user_spoke_ = true;
+                    if (auto_resume_armed_ && pause_quiet_ticks_ > 0) {
+                        ESP_LOGI(TAG, "Music auto-resume cancelled: user speaking");
+                    }
+                    auto_resume_armed_ = false;
+                    pause_quiet_ticks_ = 0;
+                }
             }
         }
 
@@ -281,6 +296,12 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+
+            // 会话性暂停的自动续播（issue #4）：TTS 说完 → 进聆听 → 静默
+            // 计数 → 数秒仍无人说话则回待机并续播。用现成的 1Hz tick，不另
+            // 起定时器；**不依赖「设备自然回待机」**（那条路是服务端 120s
+            // 无语音超时，中途还会触发 end_prompt 让机器人说一句告别语）。
+            UpdatePauseAutoResume();
 
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -587,13 +608,18 @@ void Application::InitializeProtocol() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         // Music keeps streaming after the conversation ends: keep Wi-Fi at
         // full performance while the music player is feeding the speaker.
-        if (!music_player_.IsBusy()) {
+        // 暂停也算「还占着」：worker 与那条连接都还在，恢复时不许被省电档
+        // 撕裂（issue #4 的省电判定与 :1345 处同一谓词，不各写一份）。
+        if (!IsMusicBusy()) {
             board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         }
         ResetTtsBuffer();
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
+            // 会话结束了：静默期不存在了，自动续播作废（issue #4 的取消条件
+            // 之一）。音乐留在暂停态——唤醒词已恢复，用户可以说「继续」。
+            CancelPauseAutoResume();
             SetDeviceState(kDeviceStateIdle);
         });
     });
@@ -668,6 +694,11 @@ void Application::InitializeProtocol() {
                             // music now (and stay in idle — no listening while
                             // the music plays).
                             LaunchPendingMusic();
+                        } else if (pending_music_resume_) {
+                            // 用户在答话途中说了「继续」：现在这句答完了，
+                            // 按位点接上（与换歌同一时刻、同一处收口）。
+                            pending_music_resume_ = false;
+                            ResumeMusicNow();
                         } else if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
@@ -819,13 +850,15 @@ void Application::HandleToggleChatEvent() {
         state = kDeviceStateIdle;
     }
 
-    // Music yields to conversations: stop it before connecting, same as
-    // HandleStartListeningEvent(). Music plays with the device in idle, so
-    // the idle branch below would otherwise open a conversation on top of
-    // the still-running stream (podcast keeps playing while listening).
-    StopMusic();
-    // A new conversation turn invalidates any deferred music URL.
-    Schedule([this]() { pending_music_url_.clear(); });
+    // 让位优先于停止（issue #4）：唤醒/新对话只**暂停**音乐（会话性暂停），
+    // 答完静默数秒自动接上；真停止只由 stop_music 工具触发（StopMusic）。
+    // 按钮打断与唤醒词走同一路径，行为自动一致。
+    PauseMusic(PauseKind::kConversation);
+    // 新一轮对话作废上一轮登记的延迟起播/延迟续播（陈旧状态不清会意外起播）。
+    Schedule([this]() {
+        pending_music_url_.clear();
+        pending_music_resume_ = false;
+    });
 
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -891,10 +924,13 @@ void Application::HandleStartListeningEvent() {
         state = kDeviceStateIdle;
     }
 
-    // Music yields to conversations: stop it before connecting.
-    StopMusic();
-    // A new conversation turn invalidates any deferred music URL.
-    Schedule([this]() { pending_music_url_.clear(); });
+    // 让位优先于停止（issue #4）：先暂停（放着的话），再说下一步。
+    PauseMusic(PauseKind::kConversation);
+    // 新一轮对话作废上一轮登记的延迟起播/延迟续播。
+    Schedule([this]() {
+        pending_music_url_.clear();
+        pending_music_resume_ = false;
+    });
 
     if (state == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
@@ -1058,7 +1094,10 @@ void Application::HandleStateChangedEvent() {
             display->ClearChatMessages();    // Clear messages first
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            // 回 idle 时恢复唤醒词，但**音乐在出声时除外**：流式播放需要那条
+            // TCP 收包路径（AFE 会饿死它，ADR-0008）。暂停态不算「在出声」，
+            // 所以暂停期间唤醒词照常可用。
+            audio_service_.EnableWakeWordDetection(!IsMusicPlaying());
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1068,6 +1107,10 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
+
+            // 新一轮静默窗口从「进聆听」这一拍开始：上一句已经被答完，
+            // 用户要接话就在这几秒里接（issue #4 的自动续播计时口径）。
+            pause_user_spoke_ = false;
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
@@ -1192,10 +1235,16 @@ bool Application::StartMusic(const std::string& url) {
         return false;
     }
 
+    // 换歌 = 替换语义（issue #4）：新播放请求清掉暂停态与待恢复标记，
+    // 撤掉自动续播的计时——旧会话没有资格再被接回来。
+    CancelPauseAutoResume();
+    music_player_.CancelPause();
+
     // While a conversation is active the LLM reply (TTS) has not been
     // spoken yet: defer the stream until the reply finishes playing, so the
     // robot says "coming right up" first and the music starts clean after
     // it. Registration happens on the main loop, which also consumes it.
+    // 注：状态门只看对话状态——暂停态的音乐不该被误判成「要延迟起播」。
     DeviceState state = GetDeviceState();
     if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
@@ -1218,18 +1267,134 @@ bool Application::StartMusicNow(const std::string& url) {
     // continuous audio into pieces).
     Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
-    if (!music_player_.Start(url, [this](bool success) {
-            Schedule([this, success]() { HandleMusicFinished(success); });
+    if (!music_player_.Start(url, [this](const MusicPlayer::FinishedResult& result) {
+            Schedule([this, result]() {
+                HandleMusicFinished(result.success, result.resume_failed);
+            });
         })) {
         ESP_LOGE(TAG, "Failed to start music: %s", url.c_str());
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        // 起流就没成功：没有暂停会话可谈（暂停态若还在，那是上一首的残影，
+        // 一并撤掉——播放器内部 Start 已清，这里清会话层的计时）。
+        CancelPauseAutoResume();
         return false;
     }
     // While streaming, drop wake-word detection: the AFE feed saturates the
     // input core and starves the low-priority TCP receive task (~7KB/s
-    // throughput, stuttering audio). The button still stops the music.
+    // throughput, stuttering audio). The button still pauses the music.
     audio_service_.EnableWakeWordDetection(false);
     return true;
+}
+
+bool Application::PauseMusic(PauseKind kind) {
+    // 已经在播才谈得上暂停（没有活着的会话时播放器会拒绝）。注意：重复的
+    // 让位调用仍然会往下走完唤醒词/省电这些副作用——它们本身幂等，但并
+    // 不是「没发生」；这里不做「重复调用跳过」的记账，只是不重复计时。
+    // 用户暂停可从会话性暂停升级（用户说「暂停」= 我就是要它停着）。
+    if (!music_player_.Pause(kind)) {
+        return false;
+    }
+    // 暂停 = 用户已不在播放态：唤醒词/聆听必须恢复，否则暂停成了「半死」
+    // 状态（唤醒不了、也停不掉）。续播时再关。答复进行中（speaking）是个例外
+    // ——那时的唤醒词口径与 HandleStateChangedEvent 一致（只有 AFE 唤醒词
+    // 能在说话期间工作），否则会打开一条与语音处理抢输入的通道。
+    if (GetDeviceState() == kDeviceStateSpeaking) {
+        audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+    } else {
+        audio_service_.EnableWakeWordDetection(true);
+    }
+    // 省电等级保持 PERFORMANCE：worker 与连接都还占着，且恢复要求即时出声。
+    //
+    // 种类现读播放器实际持有的那个（谓词内部问 GetPauseState()）：用户暂停
+    // 是降不下来的（播放器内部会拒绝从 user 回到 conversation），若照抄入参，
+    // 就会把「用户暂停」误记成会话性暂停，于是随便聊一句音乐自己回来了——
+    // 两种语义的分水岭就在这一行。
+    if (!IsMusicPauseConversational()) {
+        // 用户暂停绝不自动续：必须说「继续」。
+        auto_resume_armed_ = false;
+        pause_quiet_ticks_ = 0;
+    }
+    return true;
+}
+
+Application::ResumeOutcome Application::ResumeMusic() {
+    // 正在说话（TTS）时不能立刻出声：音乐一旦开始推帧就会与尚未念完的 TTS
+    // 抢同一条播放队列（听感是串音），而聆听态下麦克风还会把音乐当人声送去
+    // ASR。沿用既有的「说完话再播」：登记待恢复，等 tts stop 执行——与换歌
+    // （pending_music_url_）同一条路。返回 kDeferred 而不是 kResumed：这时
+    // 音乐尚未出声，工具若回「resumed」用户会听到假话。
+    if (GetDeviceState() == kDeviceStateSpeaking) {
+        if (!IsMusicPaused()) {
+            return ResumeOutcome::kNothing;
+        }
+        Schedule([this]() {
+            pending_music_resume_ = true;
+            ESP_LOGI(TAG, "Music resume deferred until the reply finishes");
+        });
+        return ResumeOutcome::kDeferred;
+    }
+    return ResumeMusicNow() ? ResumeOutcome::kResumed : ResumeOutcome::kNothing;
+}
+
+bool Application::ResumeMusicNow() {
+    if (!music_player_.Resume()) {
+        return false;
+    }
+    // 音乐要立刻出声（用户说「继续」不该等），且不能与对话音频拼在同一条
+    // 队列里：与 StartMusicNow 同一取舍——音乐接管扬声器，剩下的话就不念了。
+    // 复位解码器后，后续到达的 TTS 包因状态已不是 speaking 而被丢弃（见
+    // OnIncomingAudio），不会串音。
+    audio_service_.ResetDecoder();
+    // 续播期间唤醒词让位（与起播同一原因：AFE 抢输入核、饿死 TCP 收包）。
+    audio_service_.EnableWakeWordDetection(false);
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    CancelPauseAutoResume();
+    // 回到待机：聆听态下麦克风开着，会把音乐当人声送去 ASR。先告知服务端
+    // 停止聆听（几毫秒的事，与服务端 120s 无语音超时那条路无关），再切状态。
+    if (GetDeviceState() == kDeviceStateListening && protocol_ != nullptr) {
+        protocol_->SendStopListening();
+    }
+    if (GetDeviceState() != kDeviceStateIdle) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+    return true;
+}
+
+void Application::CancelPauseAutoResume() {
+    // 只重置计时器：暂停种类归播放器持有，这里没有副本可清（也正是不该
+    // 有——缓存会与播放器分叉）。
+    auto_resume_armed_ = false;
+    pause_quiet_ticks_ = 0;
+}
+
+void Application::UpdatePauseAutoResume() {
+    // 会话性暂停的自动续播（issue #4）：答完进聆听 → 静默计数 → 数秒仍无人
+    // 说话则回待机并续播。只在聆听态里数——进了 speaking 说明在答，回了 idle
+    // 说明这次会话已经结束，都不该倒数。用户暂停永不 arm（IsMusicPause-
+    // Conversational 现读播放器、只认会话性），这是「说暂停后随便聊一句音乐
+    // 不自动响」的唯一实现手段。
+    if (!IsMusicPauseConversational() || GetDeviceState() != kDeviceStateListening ||
+        pause_user_spoke_) {
+        // 只在真的数过秒时才打，免得每拍刷日志。
+        if (auto_resume_armed_ && pause_quiet_ticks_ > 0) {
+            ESP_LOGI(TAG, "Music auto-resume cancelled: quiet=%ds interrupted",
+                     pause_quiet_ticks_);
+        }
+        auto_resume_armed_ = false;
+        pause_quiet_ticks_ = 0;
+        return;
+    }
+    auto_resume_armed_ = true;
+    if (++pause_quiet_ticks_ < kPauseAutoResumeQuietTicks) {
+        return;
+    }
+    pause_quiet_ticks_ = 0;
+    auto_resume_armed_ = false;
+    ESP_LOGI(TAG, "Music auto-resume: quiet=%ds", kPauseAutoResumeQuietTicks);
+    // ResumeMusic 才是那一步：它非阻塞（探读与必要时重起流都在 worker 里），
+    // 顺手把聆听态收掉（音乐会重新占用扬声器与麦克风）——若在这里先切 idle、
+    // 由 ResumeMusic 再切一次，两处就会各写一份「谁该收聆听」的规矩。
+    ResumeMusic();
 }
 
 void Application::MusicStartTaskEntry(void* arg) {
@@ -1255,8 +1420,11 @@ void Application::LaunchPendingMusic() {
     }
     std::string url = std::move(pending_music_url_);
     pending_music_url_.clear();
+    // 换歌先撤暂停态与自动续播计时（新播放请求 = 替换，不是恢复）。
+    CancelPauseAutoResume();
+    music_player_.CancelPause();
     // Music plays with the device in idle: no listening while it plays,
-    // wake word / button still stops it and reopens the conversation.
+    // wake word / button still pauses it and reopens the conversation.
     SetDeviceState(kDeviceStateIdle);
     auto* url_copy = new std::string(std::move(url));
     if (xTaskCreate(MusicStartTaskEntry, "music_start", 8192, url_copy, 5,
@@ -1270,7 +1438,12 @@ void Application::LaunchPendingMusic() {
 }
 
 void Application::StopMusic() {
-    if (music_player_.IsBusy()) {
+    // 真停止（stop_music 工具）：会话结束、位点丢弃，不再有「接着放」。
+    // 必须**能从暂停态停止**——暂停态下 IsMusicBusy() 仍为 true，Cancel()
+    // 一样有效，不会卡死。
+    CancelPauseAutoResume();
+    music_player_.CancelPause();
+    if (IsMusicBusy()) {
         // Cancel is non-blocking: the main loop must not wait on an HTTP
         // read. The finished callback restores the power save level once
         // the worker has drained out.
@@ -1279,13 +1452,33 @@ void Application::StopMusic() {
     }
 }
 
-void Application::HandleMusicFinished(bool success) {
-    ESP_LOGI(TAG, "Music playback %s", success ? "completed" : "aborted");
-    if (!music_player_.IsBusy()) {
+void Application::HandleMusicFinished(bool success, bool resume_failed) {
+    ESP_LOGI(TAG, "Music playback %s%s", success ? "completed" : "aborted",
+             resume_failed ? " (resume failed)" : "");
+    // 回调在播放器把 worker_running_ 清零之后才发出（WorkerEntry 的顺序），
+    // 所以这里忙碌为假 = 这次回调属于**当前**会话，而不是换歌路上那条陈旧的
+    // 收尾回调（换歌时新 worker 已在跑，这里必须什么都不做）。
+    if (!IsMusicBusy()) {
+        // 会话已经结束：撤掉自动续播与暂停记账。
+        CancelPauseAutoResume();
         Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         // Music over: bring wake-word detection back (it was paused while
         // streaming to keep the TCP receive path responsive).
         audio_service_.EnableWakeWordDetection(true);
+        if (resume_failed) {
+            // 续播接不上：给一个可辨的提示音并回到可交互状态（不静默——
+            // 用户不该把「断线」听成「歌放完了」）。通道还开着才回聆听；
+            // 否则留在待机（那里唤醒词是开着的），别造出一个「在聆听但
+            // 没人听」的半死状态。
+            audio_service_.PlaySound(Lang::Sounds::OGG_EXCLAMATION);
+            Schedule([this]() {
+                if (GetDeviceState() == kDeviceStateIdle && protocol_ != nullptr &&
+                    protocol_->IsAudioChannelOpened()) {
+                    SetDeviceState(kDeviceStateListening);
+                }
+            });
+            return;
+        }
         // Music over: resume listening (only when a conversation could be
         // continued, i.e. the audio channel is still open).
         Schedule([this]() {
@@ -1329,9 +1522,13 @@ void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
     ResetTtsBuffer();
-    // Interrupting the reply also cancels any music deferred behind it:
-    // a leftover URL would otherwise surprise-launch on the next turn.
-    Schedule([this]() { pending_music_url_.clear(); });
+    // 打断这句话就一并撤掉「延迟到这句话之后」的登记：留下的 URL/续播标记
+    // 会在下一轮意外起播。注意**只**清登记，不动暂停位点——位点是 issue #5
+    // 要保住的东西。
+    Schedule([this]() {
+        pending_music_url_.clear();
+        pending_music_resume_ = false;
+    });
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
