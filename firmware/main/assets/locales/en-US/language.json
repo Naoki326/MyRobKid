@@ -57,6 +57,7 @@
         "HELLO_MY_FRIEND": "Hello, my friend!",
         "MUSIC_ENDED": "Playback finished",
         "MUSIC_INTERRUPTED": "Playback interrupted",
+        "MUSIC_NOW_PLAYING": "Now playing: ",
         "MUSIC_STOPPED": "Stopped"
     }
 }

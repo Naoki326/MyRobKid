@@ -21,6 +21,7 @@
 #include "device_state_machine.h"
 #include "notify/notify_player.h"
 #include "audio/music_player.h"
+#include "audio/music_screen.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -284,6 +285,60 @@ private:
     // 并把设备交回可交互态。分类由播放器产出（music_ending.h）——用户主动停止
     // 与换歌都不出声，自然播完与链路中断各给一个不同的音。
     void HandleMusicFinished(const MusicPlayer::FinishedResult& result);
+    /*
+     * 屏幕出口（issue #8）：音乐会话期间消息区显示曲目与作者，取代「待机」。
+     * 所有音乐写屏都经这一个 helper：写屏时机（转态之后）、所有权标记与遥测
+     * 锚点只在这里写一份，别在四个调用点各抄一遍。
+     *
+     * 空文本 = 清空消息区并交还所有权（此后别人清屏照旧生效，旧曲目不会
+     * 复活）。调用方负责判「现在该不该清」（例如只在音乐握着消息区时才清
+     * ——否则会擦掉别人的告警文案）。
+     */
+    void ShowMusicScreen(const char* action, const std::string& text, bool owns,
+                         const MusicScreenFacts* facts = nullptr);
+    /*
+     * 用当前播放会话快照写「正在播放」（仅主循环线程调用）。
+     * 会话已不在（快照为 kIdle）时清空并交还所有权。
+     */
+    void WriteMusicNowPlaying(const char* action);
+    /*
+     * 「别人的清屏/覆写」动作的统一入口（issue #8 决策 3/4）。
+     *
+     * 为什么必须有这一处：音乐在忙且消息区归音乐所有时，那些动作应当**重画**
+     * 曲目而不是抹掉它——但**清屏 API 本身因显示变体而异**（LCD 的
+     * `SetChatMessage("", "")` 在气泡变体里会留下残影、`ClearChatMessages()`
+     * 才是对的；而 OLED/Emote 根本没重写 `ClearChatMessages()`，只有
+     * `SetChatMessage("", "")` 有效）。所以清屏动作由调用方以回调传入，
+     * 这个 helper 只负责**归属权判断与交还**（决策 4 说的「这两件事只有一处
+     * 实现」）——散抄归属权判断正是 ADR-0015 决策 4 要消掉的东西。
+     *
+     * clear_fn 只在「音乐没握着消息区」时被调用；握着就重画（经
+     * WriteMusicNowPlaying，快照现取，换歌后重画出来就是新曲目）。
+     */
+    void RepaintOrClearMusicScreen(std::function<void()>&& clear_fn);
+    // 同上，但可从任意任务调用（排到主循环的下轮，保证晚于 pending 的转态）。
+    void ScheduleMusicNowPlaying();
+    /*
+     * 消息区当前是不是归音乐所有（issue #8）。
+     * 为什么需要它：不只 idle 分支会清消息区（音频通道关闭、通知结束、告警
+     * 撤销、起播失败回落…）；而音乐**恰恰**在「说话态 → 空闲态」这条路径上
+     * 起播。清屏的是状态转移、写曲目的是状态转移之后的 Schedule 回调，于是
+     * 「不显示待机」要成立，就必须有一个显式标记告诉那些清屏点「这块区域现在
+     * 的内容是曲目，重画而不是清掉」。
+     * 只在主循环线程读写（写屏一律经 Schedule）。
+     */
+    bool music_screen_owns_content_ = false;
+    /*
+     * 消息区被重画的代数（issue #8）：idle 分支每走一次重画分支递增。`repaint`
+     * 锚点报出它、`now-playing` 锚点报出当时的值——两条合起来就是「写屏接住了
+     * 那次重画」的直接证据（序号只增不减）。
+     */
+    unsigned idle_repaint_gen_ = 0;
+    /*
+     * 写屏序号（issue #8 的「曲目在状态转移之后设置」佐证）：主循环每写一次屏
+     * 加一，锚点行里报出来，抓取脚本据此与 `State: … -> idle` 行比对先后。
+     */
+    unsigned music_screen_seq_ = 0;
     void LaunchPendingMusic();
     void UpdatePauseAutoResume();
     static void MusicStartTaskEntry(void* arg);

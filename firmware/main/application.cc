@@ -616,7 +616,15 @@ void Application::InitializeProtocol() {
         ResetTtsBuffer();
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
-            display->SetChatMessage("system", "");
+            // 音乐会话还在（在播或暂停）时，这条路径**不**清消息区：这是
+            // 服务端 120s 无语音超时的收尾，音乐本身没结束，屏幕上的曲目是
+            // 用户唯一的「它在放」凭据。清掉它，剩下两个音乐出口（工具/日志）
+            // 都看不见——那就是本 spec 要修的那个「屏在说谎」。
+            if (!IsMusicBusy()) {
+                RepaintOrClearMusicScreen([display]() {
+                    display->SetChatMessage("system", "");
+                });
+            }
             // 会话结束了：静默期不存在了，自动续播作废（issue #4 的取消条件
             // 之一）。音乐留在暂停态——唤醒词已恢复，用户可以说「继续」。
             CancelPauseAutoResume();
@@ -832,7 +840,11 @@ void Application::DismissAlert() {
         auto display = Board::GetInstance().GetDisplay();
         display->SetStatus(Lang::Strings::STANDBY);
         display->SetEmotion("neutral");
-        display->SetChatMessage("system", "");
+        // 音乐还在时那块区域的内容是曲目，不是告警文案的灰烬（issue #8）：
+        // 重画而不是清空，否则「刚一连上服务端、屏幕就空了」——而音乐没停。
+        RepaintOrClearMusicScreen([display]() {
+            display->SetChatMessage("system", "");
+        });
     }
 }
 
@@ -1091,7 +1103,22 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
-            display->ClearChatMessages();    // Clear messages first
+            // 消息区的手交（issue #8）：音乐恰恰在「说话态 → 空闲态」这条路径
+            // 上起播，而下面那句 ClearChatMessages 会抹掉消息区。曲目写在状态
+            // 转移**之后**（经 Schedule），所以正常顺序是 clear → 写曲目；但
+            // 两条路都能回到这里（tts stop → idle、音频通道关闭 → idle），
+            // 「先写后清」的次序一旦出现，用户就会看到放着歌、屏幕空着。
+            // 因此：音乐握着这块区域时就重画而不是清掉，且**重画的内容取自
+            // 播放器快照**（不是缓存文本）——换歌后重画出来的就是新曲目，与
+            // 「换歌立刻更新」同一事实源。重画代数（遥测用手交佐证）在这里
+            // 递增：它记的是「idle 分支走过一次重画」，不是通用写屏次数，
+            // 所以留在分支里而不进 helper。
+            if (music_screen_owns_content_ && IsMusicBusy()) {
+                idle_repaint_gen_++;
+            }
+            RepaintOrClearMusicScreen([display]() {
+                display->ClearChatMessages();  // Clear messages first
+            });
             display->SetEmotion("neutral");  // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             // 回 idle 时恢复唤醒词，但**音乐在出声时除外**：流式播放需要那条
@@ -1275,12 +1302,29 @@ bool Application::StartMusicNow(const std::string& url) {
         // 起流就没成功：没有暂停会话可谈（暂停态若还在，那是上一首的残影，
         // 一并撤掉——播放器内部 Start 已清，这里清会话层的计时）。
         CancelPauseAutoResume();
+        // 屏幕出口（issue #8）：换歌失败时屏幕上正挂着**上一首**的曲目名，
+        // 而播放器已经空闲——那就是「没在放歌，屏幕写着歌」，本票要消掉的那
+        // 类假话的另一半。只在自己确实写过曲目时清（否则会把别人的告警文案
+        // 擦掉：首首起播失败时消息区本来就没有曲目）。
+        Schedule([this]() {
+            if (music_screen_owns_content_) {
+                ShowMusicScreen("skip", "", /*owns=*/false, nullptr);
+            }
+        });
         return false;
     }
     // While streaming, drop wake-word detection: the AFE feed saturates the
     // input core and starves the low-priority TCP receive task (~7KB/s
     // throughput, stuttering audio). The button still pauses the music.
     audio_service_.EnableWakeWordDetection(false);
+    // 屏幕出口（issue #8）：起播成功后写曲目与作者。经 Schedule 排到主循环
+    // 的下轮，晚于同一个任务刚刚触发的 pending 转态——「曲目文本必须在状态
+    // 转移之后设置，否则会被 idle 分支的清屏吃掉」。
+    //
+    // 为什么不在这里直接 SetChatMessage：换歌走这条路（StartMusicNow 也由
+    // 先前的对话结束路径过来），而 StartMusicNow 在**任意**任务上运行；写屏
+    // 必须在主循环，与 idle 分支的重画同线程、有确定先后。
+    ScheduleMusicNowPlaying();
     return true;
 }
 
@@ -1355,6 +1399,11 @@ bool Application::ResumeMusicNow() {
     if (GetDeviceState() != kDeviceStateIdle) {
         SetDeviceState(kDeviceStateIdle);
     }
+    // 屏幕出口（issue #8）：续播成功（含暂停态恢复）后回到「正在播放」。
+    // 同样经 Schedule：对话途中的续播会在 tts stop 那一刻执行，而那一刻
+    // idle 分支可能刚重画过消息区（“说完话再播”这条路的清屏在前、写曲目在
+    // 后），次序不能靠运气。
+    ScheduleMusicNowPlaying();
     return true;
 }
 
@@ -1429,6 +1478,11 @@ void Application::LaunchPendingMusic() {
                     nullptr) != pdPASS) {
         delete url_copy;
         ESP_LOGE(TAG, "Failed to create music start task");
+        // 起播根本没发生（issue #8）：若屏幕上还挂着上一首，得清掉——
+        // 不然后面回 Listening 时那块区域会一直写着已经不在放的曲目。
+        if (music_screen_owns_content_) {
+            ShowMusicScreen("skip", "", /*owns=*/false, nullptr);
+        }
         if (GetDeviceState() == kDeviceStateIdle) {
             SetDeviceState(kDeviceStateListening);
         }
@@ -1448,6 +1502,93 @@ void Application::StopMusic() {
         music_player_.Cancel();
         audio_service_.ResetDecoder();
     }
+}
+
+void Application::ShowMusicScreen(const char* action, const std::string& text,
+                                  bool owns, const MusicScreenFacts* facts) {
+    // 只在主循环线程调用（写屏与所有权标记必须与 idle 分支同线程，否则
+    // 「重画而不是清掉」的判据会与清屏赛跑）。
+    // 空文本 = 清空消息区（起播失败走这条：屏幕不该留着上一首——「放着歌屏幕
+    // 写着待机」的反面就是「没放歌屏幕写着歌」）。清空用 ClearChatMessages 而
+    // 不是 SetChatMessage("", "")：后者在 WeChat 气泡变体里是个空操作（那个
+    // 实现遇到空串直接返回），留下的气泡会一直挂着旧曲目名。
+    auto display = Board::GetInstance().GetDisplay();
+    if (text.empty()) {
+        display->ClearChatMessages();
+    } else {
+        display->SetChatMessage("system", text.c_str());
+    }
+    // 所有权跟着文本走：没有文本就没东西可保（end-state 写完之后，消息区
+    // 不再归音乐，之后的 idle 清屏照旧生效，结束态不会自己复活）。
+    music_screen_owns_content_ = owns && !text.empty();
+    // 写屏序号（issue #8 的手交佐证）：主循环每写一次递增，锚点行里报出来——
+    // 抓取脚本据此看出「谁先谁后」，不靠两行日志的时间戳赛跑。
+    const unsigned seq = ++music_screen_seq_;
+    char total_field[16] = "none";
+    if (facts != nullptr && MusicScreenShowsTotal(*facts)) {
+        snprintf(total_field, sizeof(total_field), "%s",
+                 FormatMusicClock(facts->duration_s).c_str());
+    }
+    // 屏幕出口锚点（issue #8）：文本、曲目/作者/形态/总量与**写屏那一刻的设备
+    // 状态**同一条行里对齐。「曲目在状态转移之后设置」这件事因此不靠人看屏幕：
+    // now-playing 行的 device= 必须是 idle（音乐在空闲态下播）、且它晚于
+    // `State: … -> idle` 那一行；idle 分支的重画另打 repaint。
+    ESP_LOGI(TAG,
+             "Music screen: action=%s seq=%u owns=%s idle_gen=%u device=%s "
+             "title='%s' author='%s' form=%s duration=%ds total=%s text='%s'",
+             action, seq, music_screen_owns_content_ ? "on" : "off",
+             idle_repaint_gen_, DeviceStateMachine::GetStateName(GetDeviceState()),
+             facts != nullptr ? facts->title.c_str() : "",
+             facts != nullptr ? facts->author.c_str() : "",
+             facts == nullptr ? "none" : (facts->live ? "live" : "finite"),
+             facts != nullptr ? facts->duration_s : 0, total_field, text.c_str());
+}
+
+void Application::WriteMusicNowPlaying(const char* action) {
+    // 快照现取（不是缓存）：暂停期间它仍给出当前曲目，恢复后报的是同一首，
+    // 换歌后报的是新的那首——「换歌立刻更新」就是这一句的自然结果。
+    const MusicPlaybackStatus status = music_player_.GetPlaybackStatus();
+    if (status.state == MusicPlaybackStatus::State::kIdle) {
+        // 没有活着的会话：没有曲目可报。拼一次只剩 Lang 前缀的文本（「正在
+        // 播放：」）再写到屏幕上就是新的谎话，所以这里显式清空并交还所有权。
+        // 调用点（起播/续播成功、idle 重画）都在会话活着时才到这里，这是兜底。
+        ShowMusicScreen("skip", "", /*owns=*/false, nullptr);
+    } else {
+        MusicScreenFacts facts;
+        facts.title = status.title;
+        facts.author = status.author;
+        facts.duration_s = status.duration_s;
+        // 内容形态的单一判据是 seekable（live == !seekable），不去问 duration。
+        facts.live = !status.seekable;
+        ShowMusicScreen(action,
+                        BuildMusicNowPlaying(facts, Lang::Strings::MUSIC_NOW_PLAYING),
+                        /*owns=*/true, &facts);
+    }
+}
+
+void Application::RepaintOrClearMusicScreen(std::function<void()>&& clear_fn) {
+    // 归属权判断与交还只有这一处实现（ADR-0015 决策 4）。此前这段形状在四条
+    // 路径上各抄一遍，结果其中一处漏了交还（StopNotification）——散抄的典型
+    // 症状，也正是这个 helper 要消掉的东西。
+    //
+    // 为什么要判 IsMusicBusy() 而不只看标记：标记说的是「上次写屏留了曲目」，
+    // 忙碌说的是「那个会话还活着」。会话没了却还重画，就会拿空闲快照去写
+    // 「正在播放：」——那是新的谎话。两个合起来才是「该保住曲目」的完整判据。
+    if (music_screen_owns_content_ && IsMusicBusy()) {
+        WriteMusicNowPlaying("repaint");
+    } else {
+        clear_fn();
+        music_screen_owns_content_ = false;
+    }
+}
+
+void Application::ScheduleMusicNowPlaying() {
+    // 起播/续播发生在应用层与 music_start 任务上，而写屏必须落在主循环、且
+    // 在 pending 的 STATE_CHANGED **之后**：音乐恰恰在「说话态 → 空闲态」这条
+    // 路径上起播，idle 分支就在那条路径上重画/清空消息区。经 Schedule 排到
+    // 下一轮，那一轮先处理 STATE_CHANGED 再处理 SCHEDULE（与 ADR-0014 决策 4
+    // 同一机制、同一理由）。
+    Schedule([this]() { WriteMusicNowPlaying("now-playing"); });
 }
 
 void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result) {
@@ -1540,8 +1681,16 @@ void Application::HandleMusicFinished(const MusicPlayer::FinishedResult& result)
         if (sound_asset != nullptr) {
             audio_service_.PlaySound(*sound_asset);
         }
+        // 屏幕出口（issue #8）与 #7 的结束态共用同一个 helper：结束态就是
+        // 「写一次但不再保留所有权」——写完之后陈旧的 idle 重画照旧生效，屏幕
+        // 不会抱着一个已经过时的曲目名（「结束时不留陈旧曲目」的那一半）。
         if (message != nullptr) {
-            Board::GetInstance().GetDisplay()->SetChatMessage("system", message);
+            ShowMusicScreen("end-state", message, /*owns=*/false, nullptr);
+        } else if (music_screen_owns_content_) {
+            // 无文案的收场（换歌/起流失败）：只交还所有权不给新文本。换歌时
+            // 新会话的曲目就在主循环的下一拍，起流失败则由起播那一刻的报错
+            // 接手屏幕；这里只需保证「没在放歌就不写着歌」。
+            ShowMusicScreen("skip", "", /*owns=*/false, nullptr);
         }
     });
 
@@ -1560,7 +1709,12 @@ void Application::StopNotification() {
     notify_player_.Stop();
     audio_service_.ResetDecoder();
     auto& board = Board::GetInstance();
-    board.GetDisplay()->SetChatMessage("assistant", "");
+    // 通知放完了，但音乐可能还在（在播或暂停）：它接着通知占着同一条扬声器
+    // 与同一块消息区，通知那条文案不该留在屏幕上、曲目也不该因此消失
+    // （issue #8）。音乐在忙就重画曲目，否则照旧清掉。
+    RepaintOrClearMusicScreen([&board]() {
+        board.GetDisplay()->SetChatMessage("assistant", "");
+    });
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
     if (GetDeviceState() == kDeviceStateNotifying) {
         SetDeviceState(kDeviceStateIdle);

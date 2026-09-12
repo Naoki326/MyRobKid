@@ -5,7 +5,7 @@
   server/.venv/bin/python tools/serial_telemetry.py [秒数，默认 120]
   server/.venv/bin/python tools/serial_telemetry.py 25 --assert [--start N] [--live]
       [--min-lines K] [--offset-tol S] [--expect-restart] [--expect-auto-resume]
-      [--expect-ending REASON[,REASON…]]
+      [--expect-ending REASON[,REASON…]] [--expect-screen]
 
 插上 USB 后自动探测 /dev/cu.usbmodem*，全量日志存 /tmp/serial_full.log。
 
@@ -39,6 +39,20 @@
   - pause_is_not_an_ending          暂停跨度里不该出现收场锚点（按钮打断只是暂停）
   - playback_returns_interactive    收场后唤醒词恢复 / 回到 Listening
   - 可选 --expect-ending REASON     本次抓取要覆盖指定收场（可逗号分隔/重复）
+
+屏幕出口（issue #8）——消息区被设成了什么、什么时刻设的：
+  - screen_shows_track              播放中的文本含曲目与作者
+  - screen_updates_on_song_change   换歌后屏幕立刻是新曲目（只播一首时报不适用）
+  - screen_set_after_state_change   曲目文本晚于 `State: … -> idle`（idle 分支的
+                                    清屏在前）——「不被清屏吃掉」的串口佐证
+  - live_screen_has_no_total        直播流 form/total 都是 live/none，文本无时钟
+  - ended_screen_has_no_stale_track 收场后给出结束态，不残留旧曲目
+  - 可选 --expect-screen         本次抓取要验证屏幕出口（没抓到锚点即失败）
+
+锚点行：`Music screen: action=<now-playing|repaint|end-state|skip> seq=N
+  owns=<on|off> idle_gen=N device=<state> title='…' author='…' form=<live|finite>
+  duration=Ns total=<m:ss|none> text='…'`——设备真正写给消息区的那串字符与当时
+的事实同一条行里对齐；`State: … -> idle` 行（DeviceStateMachine）用来定先后。
 
 一个抓取窗口里可能连播多首（每首一条起流锚点行），断言**按会话分段**跑：位点
 单调、起点下限、挂钟偏差都只在同一会话内比较，换歌不误报。起点取自锚点行
@@ -94,6 +108,30 @@ FEEDBACK_RE = re.compile(
 FEEDBACK_SKIP_RE = re.compile(
     r"Music feedback:\s+reason=(?P<reason>\w+)\s+pos=" + _NUM_POS +
     r"\s+skipped=(?P<skipped>\w+)")
+# 屏幕出口锚点（issue #8）：应用侧每次把消息区设成什么、当时设备在哪个状态、
+# 这块区域归不归音乐所有，都在这条行里对齐。「曲目在状态转移之后设置」因此在
+# 串口上可验，不靠人看屏幕。
+#   action=now-playing   起播/续播成功后写曲目与作者
+#   action=repaint      有东西要覆写/清空消息区，而音乐还握着它 → 重画曲目
+#                       （idle 分支、收尾清屏、通知接管、告警撤销四条路）
+#   action=end-state     收场反馈（播放结束/中断/已停止），不保留旧曲目
+#   action=skip          起播没成功（换歌失败/起播任务起不来）：清空并交还所有权
+#                       ——换歌本身不写 skip（旧会话的收场归新会话，见 ADR-0014
+#                       决策 5），新曲目由新会话的 now-playing 接着写上
+# text= 是**最后**一个字段：曲目里带单引号（`Don't Stop`）时，前面的非贪婪
+# 匹配仍能对得上。
+SCREEN_RE = re.compile(
+    r"Music screen:\s+action=(?P<action>[\w-]+)\s+seq=(?P<seq>\d+)\s+"
+    r"owns=(?P<owns>\w+)\s+idle_gen=(?P<idle_gen>\d+)\s+device=(?P<device>\w+)\s+"
+    r"title='(?P<title>.*?)'\s+author='(?P<author>.*?)'\s+form=(?P<form>\w+)\s+"
+    r"duration=(?P<duration>\d+)s\s+total=(?P<total>[\w:]+)\s+"
+    r"text='(?P<text>.*)'\s*$")
+# 设备状态转移行（DeviceStateMachine，TAG=StateMachine）：屏幕文本必须晚于它那
+# 一次转移——idle 分支就在那条路径上重画/清空消息区。
+STATE_RE = re.compile(r"\bState:\s+(?P<old>\w+)\s+->\s+(?P<new>\w+)")
+# 文本里有没有时钟形状的总量（`4:29` / `1:01:01`）。直播流上出现一个就是撒谎——
+# 短语里恰好带冒号数字（`13:30 开始`）的误判率极低，而漏判的代价是一条假绿。
+_CLOCK_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 
 # 收场原因 → (提示音, 屏幕文案) 的**验收对照表**（issue #7 的契约）。固件那边同
 # 一张表分开实现（music_ending.cc 给提示音，application.cc 给文案）；这里独立写
@@ -263,6 +301,40 @@ def parse_feedback_line(text):
     }
 
 
+def parse_screen_line(text):
+    """解析屏幕出口锚点行（Music screen: action=…）。未命中返回 None。
+
+    文本与字段同一条行：text= 是设备真正写给消息区的那串字符，title=/author=/
+    form=/duration=/total= 是当时的事实（曲目、内容形态、总量），device= 是写屏
+    那一刻的设备状态。断言拿它们两两对照——「屏幕被设成了什么」而不是「应该
+    是什么」。
+    """
+    m = SCREEN_RE.search(text)
+    if not m:
+        return None
+    return {
+        "action": m.group("action"),
+        "seq": int(m.group("seq")),
+        "owns": m.group("owns"),
+        "idle_gen": int(m.group("idle_gen")),
+        "device": m.group("device"),
+        "title": m.group("title"),
+        "author": m.group("author"),
+        "form": m.group("form"),
+        "duration_s": int(m.group("duration")),
+        "total": m.group("total"),
+        "text": m.group("text"),
+    }
+
+
+def parse_state_line(text):
+    """解析设备状态转移行（`State: speaking -> idle`）。未命中返回 None。"""
+    m = STATE_RE.search(text)
+    if not m:
+        return None
+    return {"old": m.group("old"), "new": m.group("new")}
+
+
 def _parse_pos(raw):
     """位点原始字段 → 数值（'live' / None 原样返回）。
 
@@ -315,7 +387,8 @@ def effective_start(session, cli_start):
 
 def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
                      offset_tol=DEFAULT_OFFSET_TOL, expect_restart=False,
-                     expect_auto_resume=False, expect_ending=()):
+                     expect_auto_resume=False, expect_ending=(),
+                     expect_screen=None):
     """对抓到的采样做断言。samples = [{'t': 抓到时刻, 'line': 原始行}, …]。
 
     返回 [AssertionResult, …]；全部 .ok 为 True 才算验收通过。
@@ -341,16 +414,23 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
     orphan_markers = []
     orphan_endings = []  # 起流失败时**没有**锚点（从未出声就没打过）
     feedbacks = []  # 反馈锚点不归会话：它是应用侧对「刚刚那次收场」的处置
-    for s in samples:
+    # 屏幕出口（issue #8）：也不归会话——写屏与应用侧的其他动作同行，而会话
+    # 分段靠起流锚点（写屏可能早于锚点：起播那一刻与推第一帧不是同一拍）。
+    screens = []
+    states = []  # 设备状态转移行（写屏必须晚于它那一次 -> idle）
+    # 行序（不是时间戳）：真机抓取里相邻两行可能落在同一秒（pipe: 与锚点行
+    # 同一拍打出），拿 t 比先后会退化成浮点相等的运气。行序是设备实际打印的
+    # 次序，恒可分辨。
+    for idx, s in enumerate(samples):
         line = s["line"]
         session = parse_session_line(line)
         if session is not None:
-            sessions.append({"t": s["t"], "session": session, "events": [],
+            sessions.append({"t": s["t"], "i": idx, "session": session, "events": [],
                              "markers": [], "endings": []})
             continue
         ending = parse_ending_line(line)
         if ending is not None:
-            record = {"t": s["t"], "ending": ending}
+            record = {"t": s["t"], "i": idx, "ending": ending}
             if sessions:
                 sessions[-1]["endings"].append(record)
             else:
@@ -361,7 +441,15 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
             continue
         feedback = parse_feedback_line(line)
         if feedback is not None:
-            feedbacks.append({"t": s["t"], "feedback": feedback})
+            feedbacks.append({"t": s["t"], "i": idx, "feedback": feedback})
+            continue
+        screen = parse_screen_line(line)
+        if screen is not None:
+            screens.append({"t": s["t"], "i": idx, "screen": screen})
+            continue
+        state = parse_state_line(line)
+        if state is not None:
+            states.append({"t": s["t"], "i": idx, "state": state, "line": line})
             continue
         pause = parse_pause_line(line)
         resume = parse_resume_line(line)
@@ -377,19 +465,20 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
         parsed = parse_pipe_line(line)
         if parsed is None:
             continue
-        event = {"t": s["t"], "parsed": parsed}
+        event = {"t": s["t"], "i": idx, "parsed": parsed}
         if sessions:
             sessions[-1]["events"].append(event)
         else:
             orphan_events.append(event)
     if orphan_events or orphan_markers:
         # 没抓到锚点的抓取（旧固件或起播早于开抓）：整段当一次会话，起点靠 CLI。
-        sessions.insert(0, {"t": None, "session": None, "events": orphan_events,
-                            "markers": orphan_markers, "endings": orphan_endings})
+        sessions.insert(0, {"t": None, "i": None, "session": None,
+                            "events": orphan_events, "markers": orphan_markers,
+                            "endings": orphan_endings})
     elif orphan_endings:
         # 只有孤儿收场（起流失败）：照样要能被断言看见，但不造出一个空会话
         # （那会让位点断言对着零个样本失败，把一条真结论误报成三条噪声）。
-        sessions.append({"t": None, "session": None, "events": [],
+        sessions.append({"t": None, "i": None, "session": None, "events": [],
                          "markers": [], "endings": orphan_endings})
 
     events = [e for s in sessions for e in s["events"]]
@@ -400,6 +489,14 @@ def evaluate_capture(samples, *, start_s=None, live=None, min_lines=3,
     # 没有收场锚点的抓取（issue #3/#4 那套核验）这里什么都不加——不凭空多断言。
     _add_ending_assertions(add, endings, feedbacks, expect_ending, events, markers,
                            last_t=max((s["t"] for s in samples), default=None))
+
+    # ── 屏幕出口断言（issue #8）：屏幕被设成了什么，不靠人眼 ──────────
+    # 缺省「有屏幕锚点就断言」：旧固件的抓取（无锚点）与 issue #3/#4 那几套
+    # 只关心位点的核验不该凭空多出五条必然失败的断言；--expect-screen 则显式
+    # 点名要求（没抓到就是失败——「这次要验屏幕」不能静默放行）。
+    if screens or expect_screen:
+        _add_screen_assertions(add, screens, states, sessions, endings, feedbacks,
+                               events)
 
     if not events and endings:
         # 一次根本没出声的抓取（典型：起流失败）：位点类断言无从谈起，不适用。
@@ -563,6 +660,159 @@ def _net_playback_offsets(numeric_events, session_t=None, pause_intervals=None):
                      for start, end in intervals)
         played.append(max(0.0, t - origin - paused))
     return played
+
+
+def _add_screen_assertions(add, screens, states, sessions, endings, feedbacks,
+                           events):
+    """屏幕出口断言组（issue #8）：屏幕被设成了什么，不靠人眼。
+
+    判据一律以**锚点行自报的信息**为准：`Music screen: action=… text='…'` 是
+    设备真正写给消息区的那串字符，title=/author=/form=/total= 是当时的事实。
+    本组证明五件事：
+      - 播放中的文本含曲目与作者；
+      - 换歌后屏幕上立刻是新曲目（不是顶着上一首）；
+      - 曲目文本晚于它那一次 `State: … -> idle`（写屏在状态转移之后，idle
+        分支的清屏在前——这是 issue #8 唯一必须在真机上验证的时序）；
+      - 直播流的 form/total 都是 live/none，且文本里没有 m:ss；
+      - 收场之后屏幕上再没有旧曲目名，且参与反馈的原因都有一次 end-state 写屏。
+
+    会话（sessions）用来把「换歌」认出来：每首一条起流锚点，写屏只认「向后最近
+    的那条锚点」——那正是它写的曲目。
+    """
+    now = [s for s in screens if s["screen"]["action"] in ("now-playing", "repaint")]
+    ends = [s for s in screens if s["screen"]["action"] == "end-state"]
+
+    # 1) 曲目与作者显示出来了。没抓到任何写屏时只报一条，不把「一个都没写」
+    #    重复成五条错误。
+    actions = ", ".join(dict.fromkeys(s["screen"]["action"] for s in screens))
+    if not now:
+        add("screen_shows_track", False,
+            "未见任何曲目写屏（Music screen: action=now-playing）"
+            + (f"——实际动作：{actions}" if screens
+               else "——旧固件没有屏幕锚点；已点名 --expect-screen"))
+    else:
+        missing = [s for s in now
+                   if not s["screen"]["title"]
+                   or s["screen"]["title"] not in s["screen"]["text"]
+                   or s["screen"]["author"] not in s["screen"]["text"]]
+        shown = now[-1]["screen"]
+        add("screen_shows_track", not missing,
+            f"{len(now)} 次曲目写屏（{actions}），最后一条：text='{shown['text']}'"
+            + (f"；{len(missing)} 条缺曲目/作者" if missing else ""))
+
+    # 2) 换歌立刻更新：每条起流锚点后面都该有一条写它那首的曲目写屏。只抓到
+    #    一首时无从比较——如实报「不适用」，而不是用一条必然失败把它算成回归。
+    anchored = [s for s in sessions if s["session"] is not None]
+    stale = []
+    for sess in anchored:
+        title = sess["session"]["title"]
+        after = [s for s in now if s["i"] >= sess["i"]]
+        if not after:
+            stale.append(f"{title}（起流后无写屏）")
+            continue
+        first = after[0]["screen"]
+        if first["title"] != title:
+            stale.append(f"{title} → 屏幕上却是 '{first['title']}'")
+    if len(anchored) <= 1:
+        add("screen_updates_on_song_change", True,
+            f"本次抓取只有 {len(anchored)} 条起流锚点——换歌断言不适用"
+            "（需连播两首或换一首）"
+            + ("；但仅有的那首也无写屏" if stale else ""))
+    else:
+        add("screen_updates_on_song_change", not stale,
+            f"{len(anchored)} 首均有各自的曲目写屏" if not stale else
+            "换歌后屏幕未更新：" + "；".join(stale))
+
+    # 3) 写屏在状态转移之后（issue #8 的核心时序）。两条判据：
+    #    a) 曲目写屏必须在 idle 态下（音乐在空闲态下播）；
+    #    b) 任何一条曲目写屏之后紧跟着 `-> idle`（中间没有别的写屏）= 那次清屏
+    #       吃掉了刚写的曲目——这正是 ticket 要防的那一刻；
+    #    c) 至少要有一条写屏前面有过 `-> idle`——否则「写屏在状态转移之后」
+    #       这句话在本次抓取里没有任何佐证（没抓到转移行，如抓取开始得太晚）。
+    eaten = []
+    proven = []
+    for s in now:
+        after_states = [st for st in states if st["i"] > s["i"]]
+        next_write = next((w["i"] for w in screens if w["i"] > s["i"]), None)
+        if (after_states and after_states[0]["state"]["new"] == "idle"
+                and (next_write is None or after_states[0]["i"] < next_write)):
+            eaten.append(s["screen"]["text"])
+        if any(st["i"] <= s["i"] and st["state"]["new"] == "idle" for st in states):
+            proven.append(s["screen"]["text"])
+    if eaten:
+        add("screen_set_after_state_change", False,
+            "写屏后紧跟着 `-> idle`（那次清屏会吃掉刚写的曲目）："
+            + "; ".join(eaten))
+    elif proven:
+        add("screen_set_after_state_change", True,
+            f"{len(proven)}/{len(now)} 条曲目写屏晚于 `-> idle`（未被清屏吃掉）；"
+            f"写屏时设备状态：{', '.join(dict.fromkeys(s['screen']['device'] for s in now))}")
+    elif any(st["state"]["new"] == "idle" for st in states):
+        # 抓到了 `-> idle` 却没有任何写屏在它之后：要么写屏丢在清屏前（就是 ticket
+        # 要防的那件事），要么抓取窗口没盖住真正那次起播。两条都不能当通过。
+        add("screen_set_after_state_change", False,
+            f"抓取里有 {sum(1 for st in states if st['state']['new'] == 'idle')} 次"
+            " `-> idle`，但没有一条曲目写屏在它们之后——清屏在前、写屏在后这句"
+            "话没得到佐证")
+    elif anchored and min(s["i"] for s in anchored) == 0:
+        # 抓取从起流那一刻（或更晚）才开始：那次 `-> idle` 在窗口之前，没有
+        # 转移行可比——如实报「不适用」，而不是拿一条假红线把它算成回归。
+        add("screen_set_after_state_change", True,
+            f"{len(now)} 条曲目写屏，但抓取始于起流那一刻（无 `-> idle` 转移）"
+            "——转态时序无从比对，请先开抓取再触发播放")
+    else:
+        # 抓取盖住了起播之前的窗口，却一条 `-> idle` 都没抓到：那说明状态转移
+        # 行根本没进日志（或被抓取过滤掉了），「写屏在转移之后」这句话就成了
+        # 无凭之谈——不当通过。
+        add("screen_set_after_state_change", False,
+            f"{len(now)} 条曲目写屏，但整个抓取窗口里一条 `State: … -> idle` "
+            "都没有——转态时序无法核对（确认设备日志与抓取过滤条件）")
+
+    # 4) 直播流不显示总量：form/total 与文本三处互相印证。
+    live_screens = [s for s in now if s["screen"]["form"] == "live"]
+    if live_screens:
+        bad = [s for s in live_screens
+               if s["screen"]["total"] != "none"
+               or _CLOCK_RE.search(s["screen"]["text"])]
+        add("live_screen_has_no_total", not bad,
+            f"{len(live_screens)} 条直播写屏 total=none、文本无时钟" if not bad else
+            "直播流上出现了总量：" + "; ".join(
+                f"total={s['screen']['total']} text='{s['screen']['text']}'"
+                for s in bad))
+    elif any(s["session"] is not None and s["session"]["form"] == "live"
+             for s in sessions):
+        add("live_screen_has_no_total", False,
+            "直播会话未见任何写屏——无法核对「不显示总量」")
+
+    # 5) 收场不留陈旧曲目：每条有屏幕文案的收场都要有一次 end-state 写屏，且写屏
+    #    之后不得再出现旧曲目的文本。
+    needs_end = [f for f in feedbacks
+                 if f["feedback"]["skipped"] is None
+                 and f["feedback"]["screen"] not in (None, "none")]
+    if needs_end:
+        missing = []
+        leftover = []
+        for f in needs_end:
+            hit = [s for s in ends if s["i"] >= f["i"]]
+            if not hit:
+                missing.append(f["feedback"]["reason"])
+                continue
+            write = hit[0]
+            if write["screen"]["title"]:
+                leftover.append(f"{f['feedback']['reason']}：写屏仍带曲目 "
+                                f"'{write['screen']['title']}'")
+            # 结束态之后（同一次收场里）不得再出现旧曲目的文本。
+            later = [s for s in now if s["i"] >= write["i"]]
+            titles = {s["session"]["title"] for s in sessions
+                      if s["session"] is not None}
+            for s in later:
+                if any(t and t in s["screen"]["text"] for t in titles):
+                    leftover.append(s["screen"]["text"])
+        add("ended_screen_has_no_stale_track", not missing and not leftover,
+            f"{len(needs_end)} 次收场均给出结束态且不留旧曲目"
+            if not missing and not leftover else
+            "; ".join(([f"未见结束态写屏：{', '.join(missing)}"] if missing else [])
+                      + ([f"屏幕仍留旧曲目：{'; '.join(leftover)}"] if leftover else [])))
 
 
 def _add_ending_assertions(add, endings, feedbacks, expect_ending, events, markers,
@@ -1037,7 +1287,7 @@ def capture_with_log(port, duration, log_file):
                     continue
                 t = time.time()
                 if ("pipe:" in text or "Music" in text or "music" in text
-                        or "PAUSED" in text):
+                        or "PAUSED" in text or "StateMachine" in text):
                     ts = time.strftime("%H:%M:%S", time.localtime(t))
                     tagged = f"[{ts}] {text}"
                     key_lines.append(tagged)
@@ -1054,7 +1304,8 @@ def main(argv=None):
     # CLI 只在没抓到锚点时兜底。
     flags = {"assert": False, "start": None, "live": None, "min-lines": 3,
              "offset-tol": DEFAULT_OFFSET_TOL, "expect-restart": False,
-             "expect-auto-resume": False, "expect-ending": []}
+             "expect-auto-resume": False, "expect-ending": [],
+             "expect-screen": False}
     positional = []
     i = 0
     while i < len(args):
@@ -1070,6 +1321,10 @@ def main(argv=None):
         elif a == "--expect-auto-resume":
             # 本次抓取要求覆盖「会话性暂停 → 静默数秒自动续播」。
             flags["expect-auto-resume"] = True
+        elif a == "--expect-screen":
+            # 本次抓取要验证屏幕出口（issue #8）：没抓到屏幕锚点就是失败，
+            # 不静默放行——「这次要验屏幕」是个明确的意图。
+            flags["expect-screen"] = True
         elif a == "--expect-ending":
             # 本次抓取要求覆盖指定的收场原因（issue #7）。可重复，也可逗号分隔：
             #   --expect-ending completed --expect-ending interrupted
@@ -1097,6 +1352,8 @@ def main(argv=None):
     print(f"✅ 打开 {port}，抓取 {duration}s，全量日志 → /tmp/serial_full.log")
     print("   关注行: pipe: ring=…(ring水位) in_buf=…(解码缓冲) read=…/2s(网络读) "
           "pushed=… fail=… pos=…(位点) PAUSED_CONV/PAUSED_USER(暂停种类)")
+    print("           Music screen: action=…(屏幕被设成什么) "
+          "State: … -> idle(状态转移，用于核对写屏时机)")
 
     with open("/tmp/serial_full.log", "ab") as f:
         f.write(f"\n==== capture {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n".encode())
@@ -1112,7 +1369,8 @@ def main(argv=None):
         min_lines=flags["min-lines"], offset_tol=flags["offset-tol"],
         expect_restart=flags["expect-restart"],
         expect_auto_resume=flags["expect-auto-resume"],
-        expect_ending=tuple(flags["expect-ending"]))
+        expect_ending=tuple(flags["expect-ending"]),
+        expect_screen=True if flags["expect-screen"] else None)
     ok = True
     for r in results:
         mark = "✅" if r.ok else "❌"

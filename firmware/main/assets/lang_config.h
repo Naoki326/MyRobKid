@@ -44,6 +44,7 @@ namespace Lang {
         constexpr const char* MODEM_INIT_ERROR = "模组初始化失败";
         constexpr const char* MUSIC_ENDED = "播放结束";
         constexpr const char* MUSIC_INTERRUPTED = "播放中断";
+        constexpr const char* MUSIC_NOW_PLAYING = "正在播放：";
         constexpr const char* MUSIC_STOPPED = "已停止";
         constexpr const char* MUTED = "已静音";
         constexpr const char* NEW_VERSION = "新版本 ";
