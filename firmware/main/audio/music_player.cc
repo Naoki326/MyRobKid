@@ -235,11 +235,23 @@ void MusicPlayer::WorkerTask() {
         size_t stat_push_fail = 0;
         TickType_t stat_last = xTaskGetTickCount();
         while (!cancelled_.load() && !decode_error) {
-            // 1. Keep the ring above the high watermark.
+            // 1. Keep the ring above the high watermark — and keep the
+            // compressed backlog filled even when the ring is full.
             // The compressed-buffer cap gates only *reading*: decoding must
             // keep consuming in_buf regardless, otherwise the loop stalls
             // with a full in_buf and an empty ring.
-            while (!http_eof && ring.size() < kRingHighWatermark) {
+            //
+            // Pre-fill (2026-09-12, music stutter): the ring alone absorbs
+            // only ~0.8 s of an upstream stall. The 64KB compressed backlog
+            // (~8 s at 64kbps) is what actually rides out CDN hiccups and
+            // ffmpeg reconnects (up to 5 s, -reconnect_delay_max). It lives
+            // in PSRAM, so filling it in steady state costs no internal
+            // SRAM. Gate: read while the ring has room OR the compressed
+            // backlog is not yet full; the inner decode loop still honours
+            // the ring watermark, so PCM never overflows.
+            while (!http_eof &&
+                   (ring.size() < kRingHighWatermark ||
+                    in_buf.size() < kMaxCompressedBuffer)) {
                 size_t old_size = in_buf.size();
                 if (old_size < kMaxCompressedBuffer) {
                     in_buf.resize(old_size + kHttpReadChunk);

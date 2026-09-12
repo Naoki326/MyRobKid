@@ -61,21 +61,34 @@ NUMERIC_CEILING = {
     "CONFIG_LWIP_TCP_SND_BUF_DEFAULT": 5760,
 }
 
-# 吞吐的真实来源：WiFi 驱动 IRAM 加速。它是**段内挪移**（DRAM 共享段 → IRAM），
-# 不占运行时堆，且 IDF 文档明说关掉会降吞吐——唯一一项可以只赚不赔的改动。
-# IDF 默认即 y，本项目曾显式关掉。
-REQUIRED_ON = (
-    "CONFIG_ESP_WIFI_IRAM_OPT",
-    "CONFIG_ESP_WIFI_RX_IRAM_OPT",
-)
+# IRAM 加速：**必须关闭**（2026-09-12 二次修正）。
+#
+# 上一版这里写的是「必须开启」，依据是「IRAM 加速是段内挪移、不占运行时堆」。
+# **那条依据是错的。** IRAM 文本与 DRAM 数据共享同一 333.8KB 段，文本变长就把
+# _data_start 往后推——实测两项加速共吃 **17.8KB** 运行时常驻内存
+# （_data_start 0x3fc9d000 → 0x3fca1700）。
+#
+# 只回退缓冲与窗口、保留 IRAM 加速后，设备 free sram 仅回到 17-19KB，
+# 音乐 worker 的 8192B 栈（MALLOC_CAP_INTERNAL）仍分不出来：
+#     E MusicPlayer: Failed to create music worker task
+#     E Application: Failed to start music: ...
+# minimal sram 掉到 7663 < 8192。
+#
+# 所以它列入 REQUIRED_OFF：内部 SRAM 没有余量可供任何吞吐调优。
+# 要吞吐请走 PSRAM 承载网络缓冲，或解上游组件的调度天花板（那条不花内存）。
+# IDF 默认即 y，本板显式关闭。
+REQUIRED_ON = ()
 
 # 刻意不启用的开关（ADR-0011 已裁定）。列在这里是为了让「顺手打开它」变成
 # 一次需要改测试的决定，而不是一次静默优化。
-#   - SPIRAM_TRY_ALLOCATE_WIFI_LWIP：省内部 RAM，但 IDF 警告会引入额外延迟，
-#     与本项目音频路径对延迟的敏感冲突（ADR-0003 的省电锯齿同源）。
+#   - ESP_WIFI_IRAM_OPT / RX_IRAM_OPT：见上，吃 17.8KB 运行时常驻内存，本板吃不起。
+#   - SPIRAM_TRY_ALLOCATE_WIFI_LWIP：初版以「延迟」为由否决；回退后它是吞吐的
+#     主要出路，但在未完成延迟验证前不得擅自开启——故仍列在这里。
 #   - LWIP_WND_SCALE：影响所有连接（含 60ms/帧的音频 WebSocket），
 #     收益在大文件、风险在音频。
 REQUIRED_OFF = (
+    "CONFIG_ESP_WIFI_IRAM_OPT",
+    "CONFIG_ESP_WIFI_RX_IRAM_OPT",
     "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP",
     "CONFIG_LWIP_WND_SCALE",
 )

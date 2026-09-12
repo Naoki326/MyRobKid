@@ -10,28 +10,42 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 CONFIG_SPIRAM_MEMTEST=n
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
-# **内存约束与窗口取舍（2026-09-12 实测推翻初版 ADR-0011 的两个判断）**
+# **内存约束与取舍（2026-09-12 两次实测推翻初版 ADR-0011）**
 #
-# 1) 接收缓冲是**真实分配**的内部 RAM，不是可自由调大的旋钮。初版提到 8/16/6
-#    后，设备运行时 free sram 从 41067 掉到 **9919**、minimal 掉到 **2095**，
-#    并出现 `Failed to create music start task`（OOM）。内部 SRAM 已被
-#    camera/LVGL/AFE 吃得紧，原值 3/6/3 是为省内存选的，不是错配。
+# 这块 ESP32-S3 的内部 SRAM 已被 camera/LVGL/AFE 吃紧。内部 RAM 是**单一预算**，
+# 以下三类开销全部从它出，任一项吃多了都会让别处功能性分配失败：
 #
-# 2) lwIP TCP 窗口**不是瓶颈**，没必要为它花内存。带宽时延积（BDP）
-#    分析：局域网 RTT 3.5–30ms 下，5760B 窗口的理论上限是 188–1607KB/s，
-#    而验收目标是 200KB/s——**窗口从未限制过吞吐**。把它提到 16384 是每
-#    socket +10.4KB × 两个方向，纯浪费。
+#   1. IRAM 文本（Wi-Fi 驱动加速把代码搬进 IRAM）——与 DRAM 数据共享同一段，
+#      文本变长就把 _data_start 往后推。实测两项加速共吃 **17.8KB**（_data_start
+#      0x3fc9d000 → 0x3fca1700）。
+#   2. WiFi 接收缓冲（静态/动态 RX）——真实分配，每块约 1.6KB。
+#   3. lwIP TCP 窗口（TCP_WND / TCP_SND_BUF）——**每 socket 每方向**真实分配。
 #
-# 结论：**只保留 IRAM 加速**（它是段内挪移，不占运行时堆，且是吞吐主来源）。
-# 缓冲与窗口维持原值。真正的吞吐出路是让 WiFi/lwIP 缓冲走 PSRAM
-# （CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP），需单独验证延迟后再上，见 ADR-0011。
-CONFIG_ESP_WIFI_IRAM_OPT=y
-CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+# **实测证据（两次都栽在同一个原因上）**：
+#   - 缓冲提到 8/16/6 + 窗口 16384：free sram 41067 → 9919，
+#     `Failed to create music start task`。
+#   - 仅保留 IRAM 加速（回退缓冲与窗口）：free 仅回18-19KB，
+#     `Failed to create music worker task`——音乐 worker 需 8192B 栈（
+#     MALLOC_CAP_INTERNAL），而 minimal sram 已掉到 7663 < 8192。
+#
+# **结论：三项全部回退。** 本板在未把网络缓冲与任务栈搬到 PSRAM 之前，
+# 内部 SRAM 没有余量可供任何吞吐调优。原值 3/6/3 + 5760 + IRAM 加速关闭，
+# 是为省内存**选的正确值**，不是上游错配。
+#
+# 吞吐的真正出路（均需单独验证，不得与配置层混做，见 ADR-0011）：
+#   - 把网络缓冲搬进 PSRAM（CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP）；
+#   - 把大栈任务搬到 PSRAM（本仓已开 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY，
+#     音乐 worker 仍走内部栈）；
+#   - 解上游组件里的调度天花板（接收任务优先级/读粒度/反压），那条路**不花内存**。
+#
+# 契约测试：scripts/tests/test_network_throughput_defaults.py
+#
+# 注：IRAM 加速的 =n **不在这里重写**——基础 sdkconfig.defaults 已是 n，
+# 分片只写覆盖项（上游 test_build 的 test_chip_defaults_only_contain_target_overrides
+# 会拦住重复值）。曾误以为它不占运行时堆而在此开启，已撤销。
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_RX_BA_WIN=3
-# 显式写成 IDF 默认值（= 4×MSS），不是靠缺省——避免下次有人看到「没写」
-# 就以为可以随便调。BDP 分析表明局域网下窗口不是瓶颈，无需上调。
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
