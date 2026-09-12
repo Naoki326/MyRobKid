@@ -86,6 +86,26 @@ const INTENT_BRANCHES = SCHEMA.intent_branches || INTENT_BRANCHES_FALLBACK;
  */
 const IS_TOOLS_DOMAIN = SLUG === 'tools';
 
+/** 设备域（#29，父 spec §4.4 / §7）。
+ *
+ * 它同时有两层东西：17 个配置字段（provisioning / 认证 / hello 协商 / 节奏）
+ * 与**运行时面**（在线设备 / 固件库 / SmartConfig）+ 常驻摄像头入口。
+ * 运行时面不是可保存的字段，所以它们不在域表 ``groups`` 里，而在服务端注入的
+ * ``runtime_panels`` 里——单一事实源在 ``page_domains.DEVICES_RUNTIME``。
+ */
+const IS_DEVICES_DOMAIN = SLUG === 'devices';
+
+/** 摄像头入口（§4.4）——**单一事实源在服务端注入的域表**（壳的 `CAMERA_PAGE`）。
+ *
+ * 为什么不在这里写字面量：文案或路径在壳与页面各存一份就会分叉，而分叉的
+ * 表现是一个错别字或者一条死链——没有测试会红。设备域的入口也是**常驻**的：
+ * 它不依赖在线设备列表（设备离线也在），这是 AC 明写的一条。
+ */
+const CAMERA = SCHEMA.camera || null;
+
+/** 本域的运行时面面板（非配置字段）。非设备域注入的是空数组。 */
+const RUNTIME_PANELS = SCHEMA.runtime_panels || [];
+
 /** 配置里真实存在的值（脏计算的基准）+ 服务端存在信号。 */
 let PAGE = null;
 let CONFIG = null;
@@ -278,10 +298,16 @@ function kindFor(val) {
 
 function row(f) {
   const dirty = DIRTY[f.path];
-  return `<div class="row${dirty ? ' dirty' : ''}">
+  // 危险占位（§7 移交注记 4 / AC 1）：**分级规则是 #30**，本票只把域表上的
+  // ``danger`` 声明渲染出来（`server.auth_key` 是现场唯一一条）。
+  // 路径不在页面里硬编码：声明在表上，视觉在页面上——两处不要同一件事。
+  const danger = f.danger
+    ? `<div class="danger-note">⚠️ ${esc(f.danger_note || '危险操作，请确认后再改')}</div>`
+    : '';
+  return `<div class="row${dirty ? ' dirty' : ''}${f.danger ? ' danger-row' : ''}">
     <div class="meta"><div class="label">${esc(fieldLabel(f))}</div>
       ${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}</div>
-    <div class="ctrl">${control(f)}</div>
+    <div class="ctrl">${control(f)}${danger}</div>
   </div>`;
 }
 
@@ -845,12 +871,306 @@ function toolsGroupCard(g, domainHasCommon) {
 }
 
 /* ---------------------------------------------------------------------------
+ * 设备域（#29，父 spec §4.4 / §7）
+ *
+ * 设备域的职责是「看设备 + 配设备」，所以它一页里有两层：
+ *
+ *   1. **配置字段**（17 个，域表驱动）：provisioning 载荷 / 设备认证 /
+ *      hello 协商 / 节奏与时区——就是普通域页的 `groupCard`。
+ *   2. **运行时面**（在线设备 / 固件库 / SmartConfig）+ **常驻摄像头入口**：
+ *      面板声明由服务端注入（单一事实源 `page_domains.DEVICES_RUNTIME`），
+ *      本模块只管把它们画出来并接上**旧页面已有的接口**。
+ *
+ * 为什么运行时面不写成域表里的字段：它们没有可保存的值——在线设备是运行态，
+ * 上传/删除固件与配网广播是物理副作用。把它们当成字段会进脏列表、会进保存
+ * 请求，而服务端根本没地方接受它们。
+ *
+ * 迁移口径（本票边界）：从旧 `config_page.html` 的「设备与固件（OTA）」区与
+ * 「SmartConfig 设备配网」区**原样搬过来**——包括 `confirm()` 二次确认与
+ * 「操作顺序」警告文案。三级危险分级与统一确认层是 #30，这里不做。
+ * ------------------------------------------------------------------------ */
+
+/** 设备域页：配置分组（平铺规则同其他散字段域）+ 运行时面卡片。 */
+function renderDevicesDomain() {
+  const body = $('domainBody');
+  body.classList.remove('placeholder');
+  const domainHasCommon = SCHEMA.groups.some(
+    (g) => g.fields.some((f) => f.layer === 'common'));
+  body.innerHTML = SCHEMA.groups.map((g) => groupCard(g, domainHasCommon)).join('')
+    + runtimePanelsHtml();
+  bindInputs(body);
+  bindRuntimePanels();
+  // 本函数只在设备域跑（调用点自带 ``IS_DEVICES_DOMAIN`` 守卫），无需再判一次。
+  refreshOta();
+}
+
+/** 一张运行时面卡片的壳（id 即 §4.5 的 hash 锚点）。 */
+function runtimePanelShell(p, extra) {
+  return `<section class="group" id="${esc(p.id)}">
+    <h2>${esc(p.title)}${p.badge ? ` <span class="badge">${esc(p.badge)}</span>` : ''}</h2>
+    <div class="desc">${esc(p.desc)}</div>
+    ${extra || ''}</section>`;
+}
+
+/** 运行时面卡片：摄像头入口（常驻）+ 三个面板。
+ *
+ * 顺序有意如此：**摄像头入口在页首**。AC 明写「设备离线时常驻摄像头入口仍在」
+ * ——把它挂在在线设备列表里（最自然的那一版）意味着设备一离线入口就消失。
+ * 它由**壳级事实**（注入的 `camera`）渲染，与任何运行时状态无关。
+ */
+function runtimePanelsHtml() {
+  const camera = CAMERA ? runtimePanelShell({
+    id: 'camera-live',
+    title: `${CAMERA.icon} ${CAMERA.label}`,
+    desc: '设备域的实时视图：保留独立 URL，可当挂机监控的书签长期开着。'
+      + '它不依赖设备是否在线——设备离线时仍可以从这里进去看状态。',
+  }, '<div class="row"><div class="ctrl">'
+    + `<a class="btn primary" href="${esc(CAMERA.path)}">${esc(CAMERA.label)} ↗</a>`
+    + `<span class="hint" style="margin-left:10px">${esc(CAMERA.path)}</span>`
+    + '</div></div>') : '';
+  const panels = RUNTIME_PANELS.map((p) => RUNTIME_BODIES[p.id]
+    ? runtimePanelShell(p, RUNTIME_BODIES[p.id]()) : '').join('');
+  return camera + panels;
+}
+
+/** 面板正文（按注入的 id 分发）。
+ *
+ * 分发 key 用的是**注入的 id**（§4.5 的深链锚点），不是页面里的新名字：
+ * 服务端说有哪些面板，页面说每个面板长什么样——两边认同一个 id。
+ */
+const RUNTIME_BODIES = {
+  'online-devices': () => `
+    <div class="runtime-actions">
+      <span class="badge" id="otaDevCount">…</span>
+      <button class="btn" type="button" onclick="refreshOta()">🔄 刷新</button>
+    </div>
+    <div id="otaDevices" class="runtime-list">加载中…</div>`,
+  'firmware': () => `
+    <div class="runtime-actions"><span class="badge" id="otaFwCount">…</span></div>
+    <div id="otaFirmwares" class="runtime-list">加载中…</div>
+    <div class="runtime-actions">
+      <input type="file" id="otaFile" accept=".bin">
+      <button class="btn primary" id="otaUploadBtn" type="button"
+        onclick="uploadFirmware()">⬆ 上传固件</button>
+    </div>`,
+  'smartconfig': () => `
+    <div class="runtime-form">
+      <div class="runtime-actions">
+        <input type="text" id="scSsid" placeholder="Wi-Fi 名称 (SSID)">
+        <button class="btn" type="button" onclick="autofillWifi()">⚡ 自动填充</button>
+      </div>
+      <input type="text" id="scPass" placeholder="Wi-Fi 密码">
+      <div class="runtime-actions">
+        <button class="btn primary" id="scBtn" type="button"
+          onclick="sendSmartConfig()">📡 开始广播</button>
+        <span id="scStatus" class="hint"></span>
+      </div>
+    </div>`,
+};
+
+function bindRuntimePanels() {
+  // 面板里的按钮走内联 onclick（与旧页面同一先例），所以这里把几个只在设备域
+  // 存在的函数挂到 window 上（模块作用域不自动挂 window）。
+  window.refreshOta = refreshOta;
+  window.uploadFirmware = uploadFirmware;
+  window.deleteFirmware = deleteFirmware;
+  window.rebootDevice = rebootDevice;
+  window.autofillWifi = autofillWifi;
+  window.sendSmartConfig = sendSmartConfig;
+}
+
+/* ---- 运行时面：在线设备 + 固件库（搬自 config_page.html 的「设备与固件」区） ---- */
+
+/** 刷新在线设备与固件库。两个接口都是**既有**接口（本票不新增后端）。
+ *
+ * ⚠️ 漂移风险：旧八组页面（``config_page.html``）的同名函数**仍在线上**
+ * （``/xiaozhi/config/`` 在 #31 收线前继续保持可访），两份是同一行为的两个
+ * 副本。本票只搬不删。**修行为时两边都要改**；#31 退役旧页后旧副本随之消失，
+ * 届时这里成为唯一实现。危险操作的分级改造（#30）必须同时覆盖两份，否则
+ * 旧页上的那个按钮会静默地没有确认层。
+ *
+ * 两个请求并发（旧页面就是 `Promise.all`），但**各自报自己的错**：
+ * 旧页面用一个 try 把两次请求绑死，结果是「设备列表超时 → 固件库也空了」。
+ */
+async function refreshOta() {
+  if (!$('otaDevices')) return;
+  const devBox = $('otaDevices');
+  const fwBox = $('otaFirmwares');
+  const [dev, fw] = await Promise.all([
+    fetchJsonOrError('/xiaozhi/config/api/devices'),
+    fetchJsonOrError('/xiaozhi/config/api/firmware'),
+  ]);
+  if (dev.ok) {
+    const devices = dev.data.devices || [];
+    const badge = $('otaDevCount');
+    if (badge) badge.textContent = devices.length + ' 台';
+    devBox.innerHTML = devices.length ? devices.map((d) => `
+      <div class="row">
+        <div class="meta">
+          <div class="label">${esc(d.device_id)}</div>
+          <div class="hint">IP: ${esc(d.client_ip || '-')}</div>
+        </div>
+        <div class="ctrl" style="display:flex;gap:10px;align-items:center">
+          <span style="color:var(--ok);font-size:12px">● 在线</span>
+          <button class="btn danger" type="button"
+            onclick="rebootDevice('${esc(d.device_id)}')">⟳ 重启并检查更新</button>
+        </div>
+      </div>`).join('')
+      : '<div class="hint">暂无在线设备 —— 设备空闲时会断开连接，'
+        + '唤醒后即会出现在这里</div>';
+  } else {
+    devBox.innerHTML = '<div class="hint" style="color:var(--err)">加载失败: '
+      + esc(dev.error) + '</div>';
+  }
+  if (fw.ok) {
+    const firmwares = fw.data.firmwares || [];
+    const badge = $('otaFwCount');
+    if (badge) badge.textContent = firmwares.length + ' 个';
+    fwBox.innerHTML = firmwares.length ? firmwares.map((f) => `
+      <div class="row">
+        <div class="meta">
+          <div class="label">${esc(f.model || '?')} `
+          + `<span style="color:var(--accent)">v${esc(f.version || '?')}</span></div>
+          <div class="hint">${esc(f.filename)} · ${(f.size / 1048576).toFixed(2)} MB`
+          + ` · ${esc(new Date(f.mtime * 1000).toLocaleString())}</div>
+        </div>
+        <div class="ctrl" style="display:flex;gap:10px;align-items:center">
+          <button class="btn" type="button"
+            onclick="deleteFirmware('${esc(f.filename)}')">🗑 删除</button>
+        </div>
+      </div>`).join('')
+      : '<div class="hint">固件库为空</div>';
+  } else {
+    fwBox.innerHTML = '<div class="hint" style="color:var(--err)">加载失败: '
+      + esc(fw.error) + '</div>';
+  }
+}
+
+/** 只取 JSON 的请求：失败不抛，把错误当成一个可显示的结果。 */
+async function fetchJsonOrError(path) {
+  try {
+    const r = await fetch(path);
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data) throw new Error((data && data.error) || ('HTTP ' + r.status));
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 重启设备并让它检查 OTA 更新（旧页面的行为与 confirm 文案原样保留）。 */
+async function rebootDevice(deviceId) {
+  if (!window.confirm(`确定重启设备 ${deviceId}？\n`
+    + '设备重启后若固件库有更新版本将自动升级。')) return;
+  try {
+    const r = await fetch(
+      `/xiaozhi/ota/reboot?device_id=${encodeURIComponent(deviceId)}`,
+      { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.message || ('HTTP ' + r.status));
+    toast(`已发送重启指令给 ${deviceId} ✔`, 'ok');
+    setTimeout(refreshOta, 1500);
+  } catch (e) {
+    toast('重启失败: ' + e.message, 'err');
+  }
+}
+
+/** 上传固件（multipart，文件名必须是 型号_版本.bin）。 */
+async function uploadFirmware() {
+  const inp = $('otaFile');
+  if (!inp || !inp.files.length) { toast('请先选择 .bin 固件文件', 'err'); return; }
+  const fd = new FormData();
+  fd.append('file', inp.files[0]);
+  const btn = $('otaUploadBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '⬆ 上传中…'; }
+  try {
+    const r = await fetch('/xiaozhi/config/api/firmware/upload',
+      { method: 'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    toast(`固件 ${d.filename} 上传成功 ✔`, 'ok');
+    inp.value = '';
+    refreshOta();
+  } catch (e) {
+    toast('上传失败: ' + e.message, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⬆ 上传固件'; }
+  }
+}
+
+/** 删除固件（确认框原样保留——分级改造是 #30）。 */
+async function deleteFirmware(filename) {
+  if (!window.confirm(`确定删除固件 ${filename}？`)) return;
+  try {
+    await api('/xiaozhi/config/api/firmware/delete',
+      { method: 'POST', body: JSON.stringify({ filename }) });
+    toast('已删除 ' + filename, 'ok');
+    refreshOta();
+  } catch (e) {
+    toast('删除失败: ' + e.message, 'err');
+  }
+}
+
+/* ---- 运行时面：SmartConfig 配网（搬自 config_page.html 的配网区） ---- */
+
+/** Wi-Fi 自动填充：先问服务端（系统钥匙串），读不到再回落上次手输的凭据。 */
+async function autofillWifi() {
+  const el = $('scStatus');
+  try {
+    const r = await fetch('/xiaozhi/config/api/local-wifi');
+    const d = await r.json();
+    if (d && d.ssid) {
+      $('scSsid').value = d.ssid;
+      $('scPass').value = d.password || '';
+      if (el) el.textContent = '已填充系统 Wi-Fi 凭据';
+      return;
+    }
+  } catch (e) { /* 读不到系统 Wi-Fi（macOS 隐私限制），走下面的回落 */ }
+  let last = null;
+  try { last = localStorage.getItem('scWifi'); } catch (e) { last = null; }
+  if (last) {
+    try {
+      const d = JSON.parse(last);
+      $('scSsid').value = d.ssid || '';
+      $('scPass').value = d.pass || '';
+      if (el) el.textContent = '已填充上次使用的 Wi-Fi';
+      return;
+    } catch (e) { /* 坏数据，当没有 */ }
+  }
+  if (el) el.textContent = '无历史记录（macOS 隐私限制读不到系统 Wi-Fi），请手输，下次自动记住';
+}
+
+/** SmartConfig 广播（约 30 秒）。「操作顺序」警告在面板 desc 里。 */
+async function sendSmartConfig() {
+  const ssid = $('scSsid').value.trim();
+  const password = $('scPass').value;
+  const st = $('scStatus');
+  if (!ssid) { st.textContent = 'SSID 不能为空'; return; }
+  try { localStorage.setItem('scWifi', JSON.stringify({ ssid, pass: password })); }
+  catch (e) { /* 隐私模式写不进 localStorage，不阻断配网 */ }
+  const btn = $('scBtn');
+  if (btn) btn.disabled = true;
+  st.textContent = '广播中…（约 30 秒）';
+  try {
+    const r = await fetch('/xiaozhi/config/api/smartconfig', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ssid, password }),
+    });
+    const d = await r.json();
+    st.textContent = d.ok
+      ? '📡 广播中…设备收到后自动连网并上线' : ('失败: ' + (d.error || ''));
+  } catch (e) { st.textContent = '请求失败: ' + e; }
+  setTimeout(() => { if (btn) btn.disabled = false; }, 5000);
+}
+
+/* ---------------------------------------------------------------------------
  * 页级渲染
  * ------------------------------------------------------------------------ */
 
 function render() {
   if (IS_ENGINE_DOMAIN) { renderEngineLibrary(); return; }
   if (IS_TOOLS_DOMAIN) { renderToolsLibrary(); return; }
+  if (IS_DEVICES_DOMAIN) { renderDevicesDomain(); return; }
   const body = $('domainBody');
   // §2.5：域内常用层为空时折叠区不渲染、全部字段平铺（系统域就是这样）。
   const domainHasCommon = SCHEMA.groups.some(

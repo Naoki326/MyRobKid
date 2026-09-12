@@ -1,9 +1,9 @@
 """page_domains.py — 页面域的字段归属表（父 spec §7 的机械复算）。
 
 方案文档 §2 的三条规则（R1 求属主 / R2 定分层 / 接入字段名字集）机械算出了
-§7 的五张映射表（527 字段）。本模块把**已上线的四个域**——对话与角色（15）、
-引擎（450）、插件与工具（32）、系统（13）——搬进代码，成为渲染与计数的单一
-事实源。
+§7 的五张映射表（527 字段）。本模块把**五个域**——对话与角色（15）、
+引擎（450）、插件与工具（32）、设备（17）、系统（13）——搬进代码，成为渲染与
+计数的单一事实源。
 
 为什么字段归属要写在 Python 侧而不是页面里：
 
@@ -15,8 +15,8 @@
 3. **后续域（设备）照抄形状**：加一个 ``Domain`` 只是往表里加条目，
    渲染器、脏计数、占位页都不用改。
 
-表里**只放已裁决的域**。剩下的一域（devices）只交付占位页，它的字段归属是
-#29 的事——在这里预留空表反而会把「未实现」装成「已裁决」。
+表里**只放已裁决的域**（本票之后五域齐备）。未来新增的域在方案裁决前不进
+这张表——预留空表反而会把「未实现」装成「已裁决」。
 
 除了五张字段表，本模块还持有两个**组件轴**（§5.1 / §7 移交注记 2）：
 ``ENGINE_CATEGORIES``（六族）与 ``INTENT_BRANCHES``（三条意图分支）。它们是
@@ -51,6 +51,12 @@ class Field:
     hint: str = ""
     #: 控件附加属性（如 number 的 step）。
     step: Optional[str] = None
+    #: 危险标记（§6 / §7 移交注记 4）：**只声明「这里有个危险动作」**，
+    #: 分级规则（三级视觉 + 统一确认层）是 #30 的事。
+    #: 页面按它渲染危险视觉——路径不许在页面里硬编码第二遍。
+    danger: bool = False
+    #: 危险标注的一句话说明（"改 = 全部设备 token 失效"）。
+    danger_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,10 @@ class DomainSchema:
     slug: str
     label: str
     groups: List[Group] = field(default_factory=list)
+    #: 域内**运行时面**面板（非配置字段：在线设备 / 固件库 / 配网）。
+    #: 它们不是可保存的字段，所以不进 ``groups``、不参与计数；但它们的 id 是
+    #: §4.5 定的 hash 深链锚点，必须与分组 id 同一套事实源。
+    runtime_panels: List[dict] = field(default_factory=list)
 
     def all_fields(self) -> List[Field]:
         return [f for g in self.groups for f in g.fields]
@@ -1068,7 +1078,161 @@ ENGINE = DomainSchema(
     ] + _engine_groups(),
 )
 
-#: 本票落地的域表（slug → schema）。未上线的域（devices）**不在**这里
-#: ——它没有归属表，只有占位页（#29）；伪造一张空表会把「未裁决」装成
-#: 「已裁决」。
-DOMAIN_SCHEMAS = {d.slug: d for d in (DIALOGUE, ENGINE, TOOLS, SYSTEM)}
+# ---------------------------------------------------------------------------
+# 设备（17 字段；§7 设备表逐行照抄）+ 运行时面（§4.4）
+#
+# R1：下发给设备的连接载荷（provisioning）、设备认证、hello 协商、发往设备的
+# 节奏与时区——「设备怎么连上、连上后怎么说话」。分层：7 常用 / 10 更多设置
+# （§3 合计表）。
+#
+# 四块，hash id 用 ASCII kebab-case（§4.5）：
+#   #provisioning  provisioning 载荷（发给设备的连接地址）
+#   #auth          设备认证（启用开关、白名单、auth_key）
+#   #hello         hello 协商（设备上报值覆写的那些）
+#   #timing        发往设备的节奏与时区
+#
+# 三条落位说明（方案备注列直接落成字段属性，页面不写第二遍）：
+#
+# - **危险占位**：``server.auth_key`` 标危险。改它 = 全部设备 token 失效，
+#   所以它在更多设置里、带危险视觉。**分级细节（三级 + 统一确认层）是 #30**
+#   ——这里只声明「这是危险动作」，不做规则。
+# - **设备协商值**（移交注记 3）：``xiaozhi.type/version/transport/
+#   audio_params.format`` 标「设备协商值，通常勿改」——hello 握手用设备上报值
+#   覆写，改这里不会改变设备实际怎么连；不标的话用户会以为该改它们。
+# - ``server.auth.allowed_devices[i]`` 照表写 ``[i]`` 形态（list 记 1 个字段）：
+#   数组元素路径是 ``server.auth.allowed_devices.0``，表是计数口径，
+#   页面在入口处归一（同 ``wakeup_words``）。
+#
+# 运行时面（在线设备 / 固件库 / SmartConfig）**不是配置字段**：它们没有可保存
+# 的值，是设备的运行状态与物理副作用。所以它们在 ``runtime_panels`` 里，
+# 不参与 17 这个数，但 id 与分组 id 同一套锚点规则。
+# ---------------------------------------------------------------------------
+
+#: 摄像头入口（§4.4）——**单一事实源在 ``config_shell.CAMERA_PAGE``**
+#: （它同时喂侧栏/顶栏的家族互链与摄像头页本身），这里不复制一份：
+#: 文案或路径在壳与域表各存一份就会分叉，而分叉后没有测试会红。
+#:
+#: 这里只留一条约束说明：入口是**常驻的**（设备离线也在），它由壳渲染，
+#: 不在在线设备列表里——在线设备行旁的快捷入口（仅带摄像头能力的设备）
+#: 是可选增强，不是本入口的载体。
+
+#: 设备域的**运行时面**面板（§4.4 / AC 2）：在线设备 / 固件库 / SmartConfig。
+#:
+#: 三个面板与 17 个配置字段同页：设备域的职责是「看设备 + 配设备」，
+#: 把运行时面留在旧的分组页就是把同一件事劈成两页。
+#:
+#: ``id`` 是 §4.5 定案的深链锚点（``#online-devices`` / ``#firmware`` /
+#: ``#smartconfig``）；``api`` 列的是面板背后的**既有**接口——本票只做迁移，
+#: 不新增后端（旧页面的 ``sendSmartConfig()`` 一整套行为原样搬过来）。
+DEVICES_RUNTIME = [
+    {
+        "id": "online-devices",
+        "title": "📡 在线设备",
+        "icon": "📡",
+        "desc": "当前通过 WebSocket 连接到本服务器的设备。点「重启并检查更新」，设备重启后"
+                "会自动向服务器检查 OTA：固件库里有更新版本就自动下载刷入。"
+                "设备空闲时会断开连接，列表为空时先唤醒设备（说唤醒词或按对话键）。",
+        "api": ["/xiaozhi/config/api/devices", "/xiaozhi/ota/reboot"],
+    },
+    {
+        "id": "firmware",
+        "title": "💾 固件库",
+        "icon": "💾",
+        "desc": "固件文件存放于服务器 data/bin/ 目录，命名格式「型号_版本.bin」"
+                "（如 zhengchen-minicam_2.4.3.bin）。设备重启检查更新时，"
+                "库中版本高于设备当前版本即自动升级。",
+        "api": ["/xiaozhi/config/api/firmware",
+                "/xiaozhi/config/api/firmware/upload",
+                "/xiaozhi/config/api/firmware/delete"],
+    },
+    {
+        "id": "smartconfig",
+        "title": "📶 SmartConfig 设备配网",
+        "icon": "📶",
+        "badge": "ESP-TOUCH v2",
+        "desc": "⚠️ 操作顺序：① 先让设备处于配网模式（无 Wi-Fi 配置时开机自动进入，"
+                "开机约 5 秒后开始监听，窗口 60 秒）→ ② 在窗口内点「开始广播」。"
+                "设备已连着 Wi-Fi 时广播无效（它不会监听）；广播 AES 加密，约 30 秒。",
+        "api": ["/xiaozhi/config/api/smartconfig",
+                "/xiaozhi/config/api/local-wifi"],
+    },
+]
+
+DEVICES = DomainSchema(
+    slug="devices",
+    label="设备",
+    groups=[
+        Group(
+            id="provisioning",
+            title="🔌 发给设备的连接载荷",
+            desc="设备开机连接时拿到的服务器地址（provisioning）。设备连不上时，"
+                 "先核对这里；改完要重启服务并重启设备。",
+            fields=[
+                Field("server.websocket", "WebSocket 地址", "text", LAYER_COMMON,
+                      "provisioning 载荷：设备语音连接的主地址（备用地址在下面一行）"),
+                Field("server.mqtt_gateway", "MQTT 网关", "text", LAYER_COMMON,
+                      "provisioning 载荷：走 MQTT 时下发"),
+                Field("server.mqtt_signature_key", "MQTT 签名密钥", "text",
+                      LAYER_COMMON, "provisioning 载荷：MQTT 接入签名用"),
+                Field("server.udp_gateway", "UDP 网关", "text", LAYER_COMMON,
+                      "provisioning 载荷：走 UDP 时下发"),
+                Field("server.websocket_backup", "备用 WebSocket 地址", "text",
+                      LAYER_COMMON, "provisioning 载荷：主地址不可用时的备用地址"),
+            ],
+        ),
+        Group(
+            id="auth",
+            title="🔐 设备认证",
+            desc="OTA / WebSocket 连接认证。token 由 auth_key 签名生成；"
+                 "白名单内的设备免 token 校验。",
+            fields=[
+                Field("server.auth.enabled", "启用认证", "bool", LAYER_COMMON,
+                      "关闭 = 任何设备都能连（仅限可信局域网）"),
+                Field("server.auth.allowed_devices[i]", "白名单设备 ID", "list",
+                      LAYER_COMMON, "白名单内免 token 校验；每项一个设备 ID"),
+                Field("server.auth_key", "认证签名密钥", "text", LAYER_MORE,
+                      "给设备 token 签名用。区分大小写，改后所有已发 token 立即失效。",
+                      danger=True,
+                      danger_note="危险：改 = 全部设备 token 失效（所有设备要重新配网/重新验证）"),
+            ],
+        ),
+        Group(
+            id="hello",
+            title="📇 hello 协商（设备协商值）",
+            desc="设备连接时上报的握手参数。**这些是协商值：服务端按设备上报的值工作**，"
+                 "在这里改通常不会改变设备的实际行为——改之前先确认你确实要覆盖它。",
+            fields=[
+                Field("xiaozhi.type", "连接类型", "text", LAYER_MORE,
+                      "设备协商值，通常勿改"),
+                Field("xiaozhi.version", "协议版本", "number", LAYER_MORE,
+                      "设备协商值，通常勿改"),
+                Field("xiaozhi.transport", "传输方式", "text", LAYER_MORE,
+                      "设备协商值，通常勿改"),
+                Field("xiaozhi.audio_params.format", "音频格式", "text",
+                      LAYER_MORE, "设备协商值，通常勿改"),
+                Field("xiaozhi.audio_params.sample_rate", "采样率", "number",
+                      LAYER_MORE, "hello 协商的音频采样率"),
+                Field("xiaozhi.audio_params.channels", "声道数", "number",
+                      LAYER_MORE, "hello 协商的声道数"),
+                Field("xiaozhi.audio_params.frame_duration", "帧时长(ms)", "number",
+                      LAYER_MORE, "hello 协商的音频帧时长"),
+            ],
+        ),
+        Group(
+            id="timing",
+            title="⏱ 发往设备的节奏与时区",
+            desc="服务端向设备发消息的节奏，以及时区偏移。",
+            fields=[
+                Field("server.timezone_offset", "时区偏移(小时)", "number",
+                      LAYER_MORE, "UTC 偏移，如东八区填 8。影响发往设备的时间语义"),
+                Field("tts_audio_send_delay", "TTS 音频发送延迟(秒)", "number",
+                      LAYER_MORE, "每句 TTS 音频之间的间隔（网络差时调大）"),
+            ],
+        ),
+    ],
+    runtime_panels=list(DEVICES_RUNTIME),
+)
+
+#: 本票落地的域表（slug → schema）。五个域全部上线（#27 引擎 / #28 插件与工具 /
+#: #29 设备）——占位页从此只属于「未来新增的域」。
+DOMAIN_SCHEMAS = {d.slug: d for d in (DIALOGUE, ENGINE, TOOLS, DEVICES, SYSTEM)}

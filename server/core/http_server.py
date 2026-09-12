@@ -186,11 +186,16 @@ class SimpleHttpServer:
                             "/xiaozhi/config/api/restart",
                             self.config_handler.handle_options,
                         ),
-                        # 摄像头监控页 + 快照代理
-                        web.get("/xiaozhi/camera/", self.camera_handler.handle_page),
+                        # 摄像头监控页 + 快照代理（§4.4 / §8.2）
+                        # 页面**不再双注册**：无斜杠 301 到规范形，由应用层发；
+                        # api/* 子路由是 API 不是页面，不跟着 301。
                         web.get(
                             "/xiaozhi/camera",
-                            self.camera_handler.handle_page,
+                            self.config_handler.handle_camera_redirect,
+                        ),
+                        web.get(
+                            "/xiaozhi/camera/",
+                            self.config_handler.handle_camera_page,
                         ),
                         web.get(
                             "/xiaozhi/camera/api/snapshot",

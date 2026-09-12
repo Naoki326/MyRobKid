@@ -45,11 +45,12 @@ from config import page_domains as domains  # noqa: E402
 DOMAIN_SLUGS = ["dialogue", "engine", "tools", "devices", "system"]
 ESCAPE_SLUG = "raw"
 
-#: 本票已交付内容的域（其余一域是占位页，#29 交付内容）。
+#: 本票已交付内容的域（#29 之后五域全部上线，没有占位页了）。
 #: #26 交付 dialogue / system，#27 把 engine 从占位转正（450 字段全量可达），
-#: #28 把 tools 从占位转正（32 字段全量可达）。
-IMPLEMENTED_SLUGS = ["dialogue", "engine", "tools", "system"]
-PLACEHOLDER_SLUGS = ["devices"]
+#: #28 把 tools 从占位转正（32 字段），#29 把 devices 转正（17 字段 + 运行时面）。
+IMPLEMENTED_SLUGS = ["dialogue", "engine", "tools", "devices", "system"]
+#: 占位页从此只属于「未来新增的域」——五域齐备后它是空集。
+PLACEHOLDER_SLUGS = []
 
 
 class DomainTopologyContract(AioHTTPTestCase):
@@ -127,8 +128,12 @@ class DomainTopologyContract(AioHTTPTestCase):
     async def test_unlaunched_domains_render_a_placeholder_not_a_404(self):
         """未上线域是**占位页**，不是 404 §11 Phase 1。
 
-        判别力：三域的 slug 今天就上线（书签从此固定），内容是 #27/#28/#29 的
-        事。404 会让「地址先上线」这件事做不到——用户点进去看到的是断链。
+        判别力：三域的 slug 今天就上线（书签从此固定），内容是后续票的事。
+        404 会让「地址先上线」这件事做不到——用户点进去看到的是断链。
+
+        #29 之后五域齐备（`PLACEHOLDER_SLUGS` 为空集），本用例只剩「占位机制
+        本身还在」这条底线：占位页的渲染路径不得随「没有占位域了」被删掉，
+        否则下一个新增域上线时又得从 404 开始。
         """
         for slug in PLACEHOLDER_SLUGS:
             resp = await self._get(f"/xiaozhi/config/{slug}/")
@@ -138,6 +143,12 @@ class DomainTopologyContract(AioHTTPTestCase):
             # 未上线域的占位页没有可保存对象 → 动作区不渲染（§4.2）。
             self.assertNotIn("xzhSave()", html)
             self.assertNotIn("saveBtn", html)
+        # 五域齐备：没有任何一个域是占位页，侧栏也不该挂「未上线」标注。
+        html = await (await self._get("/xiaozhi/config/dialogue/")).text()
+        self.assertEqual(html.count('<span class="pending-tag">未上线</span>'), 0,
+                         "五域全部上线，占位标注必须一个不剩")
+        self.assertTrue(callable(getattr(shell, "render_placeholder", None)),
+                        "占位页渲染器仍在（新增域时照用，不是已被删掉的死码）")
 
     # ── 2. 尾斜杠：应用层 301，不依赖 nginx ──────────────────────
     async def test_root_without_slash_redirects_to_canonical_slash_form(self):
@@ -201,9 +212,12 @@ class DomainTopologyContract(AioHTTPTestCase):
 
     async def test_sidebar_marks_only_the_still_unlaunched_domains(self):
         html = await (await self._get("/xiaozhi/config/dialogue/")).text()
-        self.assertIn("未上线", html)
-        # 标签只在侧栏里出现，恰好在**仍未上线**的域条目上——多一个少一个都是谎。
-        # #27 之后 engine 已上线，它的标注必须消失；tools / devices 仍在。
+        # 占位标注的样式仍在壳里（新增域时照用）。断样式定义，不断「未上线」
+        # 这个字符串本身——壳里到处都是它，断它等于没断。
+        self.assertIn(".pending-tag{", html,
+                      "占位标注的样式仍在壳里（新增域时照用）")
+        # 标注只在侧栏里出现，且只在**仍未上线**的域条目上——多一个少一个都是谎。
+        # #27 之后 engine 已上线、#28 tools、#29 devices：五域一个都没有了。
         self.assertEqual(html.count('<span class="pending-tag">未上线</span>'),
                          len(PLACEHOLDER_SLUGS))
         self.assertNotIn('data-domain="engine"><span class="ic">🤖</span>'

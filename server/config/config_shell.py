@@ -31,7 +31,7 @@ DOMAINS = [
      "blurb": "VAD/ASR/LLM/VLLM/TTS/Memory 六族 + 选择器 + 引擎全局参数"},
     {"slug": "tools", "label": "插件与工具", "icon": "🧩", "implemented": True,
      "blurb": "Intent 子树、plugins.*、外部 MCP、工具调用参数"},
-    {"slug": "devices", "label": "设备", "icon": "📟", "implemented": False,
+    {"slug": "devices", "label": "设备", "icon": "📟", "implemented": True,
      "blurb": "下发给设备的连接载荷、设备认证、hello 协商、摄像头入口"},
     {"slug": "system", "label": "系统", "icon": "⚙️", "implemented": True,
      "blurb": "监听地址、会话/文件生命周期、传输保活、日志、跨用途路径"},
@@ -39,6 +39,19 @@ DOMAINS = [
 
 #: 逃生口：侧栏底部横线之下的非域小入口（§4.3）。
 RAW_ESCAPE = {"slug": "raw", "label": "原始配置", "icon": "📦"}
+
+#: 摄像头页（§4.4 / §8.1）——**保留独立 URL** 作书签挂机监控，归设备域的
+#: 实时视图，**不占一级导航**（侧栏五域不变）。
+#:
+#: 这里是它的**单一事实源**：路径（§8.1 定的规范形）、顶栏家族互链的文案与
+#: 图标都从这一处取。设备域里的「常驻入口」也指向它——
+#: 入口不存在线设备列表里（那是可选增强）：设备离线时入口仍在。
+CAMERA_PAGE = {
+    "slug": "camera",
+    "path": "/xiaozhi/camera/",
+    "label": "摄像头实时画面",
+    "icon": "📷",
+}
 
 #: 旧的五组八页配置页（§1 现状）。父 spec §11 的 expand 阶段：**旧页面原样保留
 #: 在原 URL**，收线（302 + 退役）是后续票的事。这里只登记它们的 URL，供 301 的
@@ -100,6 +113,11 @@ body{background:var(--bg);color:var(--text);font:14px/1.65 -apple-system,"PingFa
 .escape{margin-top:auto}
 .navitem.escape-item{font-size:12px;padding:8px 14px;color:var(--dim)}
 .navitem.escape-item .ic{font-size:13px}
+/* 顶栏的家族互链（§4.4）：设备页 ↔ 摄像头页。不是一级导航——一级导航在侧栏。 */
+.topnav{display:flex;align-items:center;gap:6px}
+.topnav a{display:inline-flex;align-items:center;gap:6px;color:var(--dim);text-decoration:none;font-size:12.5px;font-weight:500;padding:6px 12px;border-radius:9px;border:1px solid transparent;transition:all .2s}
+.topnav a:hover{color:var(--text);background:rgba(91,140,255,.08)}
+.topnav a.on{color:#fff;background:rgba(91,140,255,.15);border-color:rgba(91,140,255,.35)}
 .content{flex:1;margin-left:var(--sidebar-w);padding:28px 32px 120px;max-width:980px}
 
 /* ---- 分组卡片 ---- */
@@ -209,16 +227,46 @@ def render_sidebar(active: str = "") -> str:
     )
 
 
-def render_topbar(title: str, actions: str = "") -> str:
+def render_topnav(active: str = "") -> str:
+    """顶栏的**家族互链**（§4.4）：设备页 ↔ 摄像头页，两个方向。
+
+    为什么在顶栏而不是侧栏：摄像头页**不占一级导航**（§4.4 明文）——侧栏
+    五域的顺序与数量是骨架级约定。它属于「看设备」家族，所以在**这两页**
+    的顶栏上互相给对方一个入口（别的页面上不出现：它们不在这个家族里）。
+
+    ``active`` 是当前所在页的 slug（``devices`` / ``camera``）。两页都渲染
+    两条链（而不是「只渲染另一条」）：同壳互链的意思是「这两页是一家的」，
+    只给对面那一条会在语义上把当前页排除在家族外。
+    """
+    devices = next(d for d in DOMAINS if d["slug"] == "devices")
+    items = [
+        (devices["slug"], page_url(devices["slug"]), devices["icon"],
+         devices["label"]),
+        (CAMERA_PAGE["slug"], CAMERA_PAGE["path"], CAMERA_PAGE["icon"],
+         CAMERA_PAGE["label"]),
+    ]
+    links = "".join(
+        f'<a class="{"on" if slug == active else ""}" data-family-link="{slug}" '
+        f'href="{href}"><span>{icon}</span>{label}</a>'
+        for slug, href, icon, label in items
+    )
+    return f'<nav class="topnav">{links}</nav>'
+
+
+def render_topbar(title: str, actions: str = "", nav: str = "") -> str:
     """顶栏。
 
     ``actions`` 由页面自己给：**只有配置编辑页有动作区**（保存 / 重启服务）。
     只读页（逃生口）与未上线域的占位页传空串——动作区在那类页面上**不渲染**，
     不是渲染了再藏（§4.2 的验收措辞是「在编辑页之外不渲染」）。
+
+    ``nav`` 同理由页面自己给：**只有设备家族的两页**（设备域 / 摄像头页）
+    渲染家族互链（§4.4）。
     """
     return (
         '<div class="topbar">'
         f'<div class="logo"><div class="orb">🤖</div><span>{title}</span></div>'
+        f'{nav}'
         f'<div class="right">{actions}</div>'
         "</div>"
     )

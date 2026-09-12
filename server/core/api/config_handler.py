@@ -428,6 +428,8 @@ class ConfigHandler(BaseHandler):
         savebar = ""
         page_desc = domain["blurb"]
         page_icon = domain["icon"]
+        # 设备家族的两页（设备域 / 摄像头页）在顶栏互链（§4.4）。
+        nav = shell.render_topnav("devices") if slug == "devices" else ""
         # 引擎类目（六族）随域表一起注入：``classifyDirty`` 靠它把「真在引擎域里的
         # 路径」与「域内散字段」分开（非引擎散字段归「重启后生效」而不是「仅提前
         # 配好」）。类目清单的单一事实源在 ``page_domains.ENGINE_CATEGORIES``，
@@ -438,6 +440,10 @@ class ConfigHandler(BaseHandler):
         # 单一事实源在 `page_domains.INTENT_BRANCHES`——树上只有配过的分支，
         # 少一条就会让那条分支的字段归错组（不能从配置树反推）。
         intent_branches = list(page_domains.INTENT_BRANCHES)
+        # 摄像头入口（§4.4）与运行时面面板（AC 2）也随域表注入：它们的单一事实源
+        # 在 `config_shell.CAMERA_PAGE` / `page_domains.DEVICES_RUNTIME`，页面只消费。
+        # 每个域页都带上摄像头入口：它是壳级事实，不止设备域用得上（单一事实源）。
+        camera_entry = dict(shell.CAMERA_PAGE)
         if schema is not None:
             body = ""  # 正文由 config_domain_page.js 按注入的域表渲染
             actions = (
@@ -451,7 +457,7 @@ class ConfigHandler(BaseHandler):
             )
             schema_json = json.dumps(
                 dict(asdict(schema), engine_categories=engine_categories,
-                     intent_branches=intent_branches),
+                     intent_branches=intent_branches, camera=camera_entry),
                 ensure_ascii=False)
         else:
             # 未上线域：占位正文，且**动作区不渲染**（没有可保存的对象）。
@@ -460,13 +466,15 @@ class ConfigHandler(BaseHandler):
             schema_json = json.dumps(
                 {"slug": slug, "label": domain["label"], "groups": [],
                  "engine_categories": engine_categories,
-                 "intent_branches": intent_branches},
+                 "intent_branches": intent_branches, "runtime_panels": [],
+                 "camera": camera_entry},
                 ensure_ascii=False)
 
         html = self._fill_skeleton(
             skeleton, title=f"小智 · {domain['label']}", active=slug,
             page_label=domain["label"], page_icon=page_icon, page_desc=page_desc,
-            actions=actions, savebar=savebar, schema_json=schema_json, body=body)
+            actions=actions, savebar=savebar, schema_json=schema_json, body=body,
+            nav=nav)
         return web.Response(text=html, content_type="text/html", charset="utf-8")
 
     def _render_escape_page(self, skeleton: str) -> web.Response:
@@ -485,7 +493,8 @@ class ConfigHandler(BaseHandler):
         schema_json = json.dumps(
             {"slug": self._RAW_SLUG, "label": shell.RAW_ESCAPE["label"],
              "groups": [], "engine_categories": list(page_domains.ENGINE_CATEGORIES),
-             "intent_branches": list(page_domains.INTENT_BRANCHES)},
+             "intent_branches": list(page_domains.INTENT_BRANCHES),
+             "runtime_panels": [], "camera": dict(shell.CAMERA_PAGE)},
             ensure_ascii=False)
         html = self._fill_skeleton(
             skeleton, title="小智 · 原始配置", active=self._RAW_SLUG,
@@ -506,7 +515,8 @@ class ConfigHandler(BaseHandler):
         与 ``&``（防 ``</script>`` 提前结束标签）。
         """
         topbar = shell.render_topbar(
-            f"小智 · {kw['title'].split('· ', 1)[-1]}", kw.get("actions", ""))
+            f"小智 · {kw['title'].split('· ', 1)[-1]}", kw.get("actions", ""),
+            kw.get("nav", ""))
         schema_json = (kw.get("schema_json", "{}")
                        .replace("<", "\\u003c").replace("&", "\\u0026"))
         html = skeleton
@@ -521,6 +531,7 @@ class ConfigHandler(BaseHandler):
             ("__SCHEMA_JSON__", schema_json),
             ("__SAVEBAR__", kw.get("savebar", "")),
             ("__SHELL_JS__", shell.SHELL_JS),
+            ("__PAGE_STYLE__", kw.get("page_style", "")),
             ("__PAGE_JS__", kw.get("page_script", "")),
             ("__BODY__", kw.get("body", "")),
         ):
@@ -531,6 +542,56 @@ class ConfigHandler(BaseHandler):
         """域页 / 逃生口页（尾斜杠规范形）。"""
         slug = request.match_info["slug"]
         return self._render_domain_page(slug)
+
+    # ---------------- 摄像头页归位（父 spec §4.4 / §8.1 / §8.2） ----------------
+    #
+    # 摄像头页是**设备域的实时视图**：归「看设备」家族，与设备域同壳互链，
+    # 保留独立 URL（`/xiaozhi/camera/`）供书签挂机监控，不占一级导航。
+    #
+    # 三个决定都落在这一节：
+    #   1. 页面骨架用**共享壳**（同一份 `config_domain_page.html` + `render_sidebar`
+    #      + `render_topbar`），所以它自带五域侧栏与回设备域的路（§4.2「各页自带
+    #      外壳被否」）；暗色监控页只做局部样式覆盖（§4.2 明文允许）。
+    #   2. 无斜杠形态 301 到规范形，**由应用层发**（§8.2）——不再依赖仓库外的
+    #      nginx，也不再用双注册（旧写法两条路由各自返回同一份 body，
+    #      同一命名空间两套语义）。
+    #   3. `api/*` 子路由**不**跟着 301：它们是 API 而不是页面，设备固件与
+    #      页面脚本直接调它们（§8.2 的规则只约束页面 URL）。
+
+    async def handle_camera_redirect(self, request):
+        """/xiaozhi/camera → /xiaozhi/camera/（尾斜杠规范形，§8.2）。
+
+        与域页同一机制（`_permanent_redirect`）：301 + 保留查询串。
+        """
+        return self._permanent_redirect(request)
+
+    async def handle_camera_page(self, request):
+        """摄像头监控页（规范形 `/xiaozhi/camera/`）——注入共享壳。
+
+        正文/样式/脚本三段来自 `core.api.camera_handler`（它只交付摄像头
+        专有的东西），骨架与导航来自共享壳（§4.2 的唯一落点）。
+        没有可保存对象 → 动作区不渲染（§4.2）。
+        """
+        from core.api.camera_handler import CAMERA_BODY, CAMERA_CSS, CAMERA_JS
+
+        skeleton = self._read_page("config_domain_page.html")
+        schema_json = json.dumps(
+            {"slug": shell.CAMERA_PAGE["slug"],
+             "label": shell.CAMERA_PAGE["label"], "groups": [],
+             "engine_categories": list(page_domains.ENGINE_CATEGORIES),
+             "intent_branches": list(page_domains.INTENT_BRANCHES),
+             "runtime_panels": [], "camera": dict(shell.CAMERA_PAGE)},
+            ensure_ascii=False)
+        html = self._fill_skeleton(
+            skeleton, title=f"小智 · {shell.CAMERA_PAGE['label']}",
+            active=shell.CAMERA_PAGE["slug"],
+            page_label=shell.CAMERA_PAGE["label"],
+            page_icon=shell.CAMERA_PAGE["icon"],
+            page_desc="设备摄像头实时画面。保留独立 URL，可当挂机监控的书签。",
+            actions="", savebar="", schema_json=schema_json,
+            body=CAMERA_BODY, page_style=CAMERA_CSS, page_script=CAMERA_JS,
+            nav=shell.render_topnav(shell.CAMERA_PAGE["slug"]))
+        return web.Response(text=html, content_type="text/html", charset="utf-8")
 
     async def handle_auth(self, request):
         """兼容接口：PIN 已移除，直接放行（前端登录逻辑保留，避免改动）。"""
