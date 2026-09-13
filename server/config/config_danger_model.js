@@ -291,7 +291,7 @@ export function descriptiveFacts(operation, context) {
 }
 
 /** 固件库里同型号的最高版本串（认不出的行跳过）；没有则空串。 */
-export function highestVersionFor(model, firmwares) {
+function highestVersionFor(model, firmwares) {
   const rows = Array.isArray(firmwares) ? firmwares : [];
   let best = null;
   for (const f of rows) {

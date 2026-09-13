@@ -106,6 +106,8 @@ class ConnectionHandler:
         self.websocket: websockets.ServerConnection | None = None
         self.headers = None
         self.device_id = None
+        self.device_model = ""
+        self.device_version = ""
         self.client_ip = None
         self.prompt = None
         self.welcome_msg = None
@@ -226,6 +228,24 @@ class ConnectionHandler:
             )
 
             self.device_id = self.headers.get("device-id", None)
+
+            # 设备自报的型号 / 固件版本。**实测：xiaoZhi 固件的 WebSocket
+            # 握手头里只有 Protocol-Version / Device-Id / Client-Id /
+            # Authorization，没有型号与固件版本**（见资料包/源码
+            # main/protocols/websocket_protocol.cc 的 SetHeader 调用），
+            # 所以这里只能容错地探一手（为将来固件版本留门），拿不到就是空串；
+            # 真正的数据源是 OTA 自检（device_registry.record_device_info）。
+            self.device_model = ""
+            for h in ("device-model", "device_model", "board", "model"):
+                if self.headers.get(h):
+                    self.device_model = self.headers[h].strip()
+                    break
+            self.device_version = ""
+            for h in ("device-version", "device_version", "firmware-version",
+                      "app-version", "application-version"):
+                if self.headers.get(h):
+                    self.device_version = self.headers[h].strip()
+                    break
 
             # 注册到在线设备表，供 HTTP 管理接口（远程重启等）查找
             device_registry.register(self.device_id, self)

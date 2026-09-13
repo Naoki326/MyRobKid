@@ -196,6 +196,61 @@ test('重启设备：固件库有更新版本时升为危险（它变成触发�
   }), LEVEL.DANGER);
 });
 
+/* ---------------------------------------------------------------------------
+ * AC3：与 api/devices 同形的载荷必须真的驱动升降级（issue #30）
+ *
+ * 背景：AC3「固件库放入更高版本后，重启设备的确认从警示升为危险」曾经
+ * **在真实页面上不可达**——``api/devices`` 当时不返回 ``model``/``version``，
+ * 前端拿到的设备行是 ``{device_id, client_ip}``，``modelOf(d)`` 得空串，
+ * 库里找不到同型号行，恒返回警示。
+ *
+ * ⚠️ 职责边界（请勿误读）：本用例**只能**证明「给定带 model/version 的载荷，
+ * 模型算出 danger」——它碰不到 Python，后端把字段删了它**不会**红（实测过）。
+ * 「数据源真的接上了」的证据在 HTTP 契约缝：
+ * ``test_config_danger_seam.py`` 的 ``test_devices_payload_carries_model_and_
+ * version_keys`` / ``test_ota_self_check_is_the_source_of_model_and_version``
+ * （那两条删字段就红）。本用例在此守护的是模型侧的升降级行为与其反向边界。
+ * ------------------------------------------------------------------------ */
+
+test('AC3：与 api/devices 同形的设备载荷，在库中有更高同型号版本时得 danger', () => {
+  // 与 server/core/api/config_handler.py::handle_devices 逐字段同形。
+  const device = {
+    device_id: 'aa:bb:cc:dd:ee:ff',
+    client_ip: '192.168.18.20',
+    model: 'zhengchen-minicam',
+    version: '2.4.1',
+  };
+  // 库里同型号有 2.4.2 → 比设备高 → 重启是触发升级的扳机 → 危险。
+  assert.equal(
+    levelOf('reboot_device', { firmwares: FIRMWARES, device }),
+    LEVEL.DANGER,
+    '后端给了 model/version，前端就该升为危险（AC3）');
+
+  // 反向边界：把 model/version 拿掉（旧 bug 的形状）只能得警示——
+  // 证明上面那条确实是这两个字段带来的，不是固件库单方面決定。
+  const bare = { device_id: device.device_id, client_ip: device.client_ip };
+  assert.equal(
+    levelOf('reboot_device', { firmwares: FIRMWARES, device: bare }),
+    LEVEL.WARNING,
+    '没有 model/version 时只能停在警示——这正是修前的现象');
+
+  // 库里没有该型号（型号真有值但不匹配）→ 也是警示（不是「一律危险」）。
+  assert.equal(
+    levelOf('reboot_device', {
+      firmwares: FIRMWARES,
+      device: { ...device, model: 'unknown-board' },
+    }),
+    LEVEL.WARNING);
+
+  // version 与库里同型号最高版本相等 → 不触发升级 → 警示。
+  assert.equal(
+    levelOf('reboot_device', {
+      firmwares: FIRMWARES,
+      device: { ...device, version: '2.4.2' },
+    }),
+    LEVEL.WARNING, '版本相等不算有更新版本（相等不触发升级）');
+});
+
 test('重启服务的级别**不受**固件库影响（它是自愈操作，没有链条）', () => {
   // 判别力：把「重启」当成同一类动作（按固件库升降级）会让重启服务也变红。
   assert.equal(levelOf('restart_server', {

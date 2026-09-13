@@ -198,12 +198,22 @@ class ConfigHandler(BaseHandler):
     # ---------------- 设备与固件管理 ----------------
 
     async def handle_devices(self, request):
-        """在线设备列表（当前 WebSocket 在线的设备）"""
+        """在线设备列表（当前 WebSocket 在线的设备）
+
+        ``model`` / ``version`` 是设备**自报**的型号与固件版本。它们不来自
+        WebSocket 握手头（固件只发 Protocol-Version / Device-Id / Client-Id /
+        Authorization），而是设备开机自检打 OTA 接口时上报的（见 ota_handler
+        的 ``board.type`` / ``application.version``），后由 device_registry 记下。
+        取不到就是空串（前端 ``hasNewerFirmware`` 会保守处理）。
+        """
         devices = []
         for did, handler in device_registry.get_online().items():
+            info = device_registry.get_device_info(did)
             devices.append({
                 "device_id": did,
                 "client_ip": getattr(handler, "client_ip", ""),
+                "model": getattr(handler, "device_model", "") or info["model"],
+                "version": getattr(handler, "device_version", "") or info["version"],
             })
         return web.json_response({"ok": True, "devices": devices})
 

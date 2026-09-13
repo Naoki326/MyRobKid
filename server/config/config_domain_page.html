@@ -98,8 +98,8 @@ __CONFIRM__
 <!--
   危险分级模型（无 DOM 依赖的纯模块，node 缝跑）。两份在线副本
   （设备域页 / 旧八组页面）共用同一份分级判定与后果文案。
+  由下方 script 的 import 消费，不需再空加载一次。
 -->
-<script type="module" src="/xiaozhi/config/config_danger_model.js"></script>
 <!--
   路径写**绝对**前缀，不用 ``./config_domain_page.js``：
   规范 URL 是 ``/xiaozhi/config/<slug>/``（目录形式），相对路径会解析成

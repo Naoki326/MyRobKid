@@ -31,7 +31,7 @@ import {
   setSecretInput, toolsScope,
 } from './config_state_model.js';
 import {
-  CONFIRM_MODE, LEVEL, LEVEL_VISUALS, confirmButtonText, levelOf,
+  LEVEL_VISUALS, confirmButtonText, levelOf,
   needsVersionTyping, operationConsequences,
 } from './config_danger_model.js';
 
@@ -1128,6 +1128,9 @@ function confirmDanger(operation, context, opts) {
   const facts = Object.assign({}, context, opts && opts.facts);
   return window.xzhConfirm({
     level,
+    // 三载体的单一事实源：把模块里那一级读出来交给确认层，
+    // 免得壳里再存一份（两份并存就是漂移的温床）。
+    visual: LEVEL_VISUALS[level],
     title: o.title || '确认操作',
     consequences: operationConsequences(operation, facts),
     confirmText: confirmButtonText(operation, facts),

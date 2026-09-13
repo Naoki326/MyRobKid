@@ -24,6 +24,7 @@ HTTP 可达的交付内容（域名、资产路由、页面脚本消费方式、
 运行：server/.venv/bin/python -m unittest discover -s server/tests -t server
 """
 import re
+import json
 import sys
 import tempfile
 import unittest
@@ -37,6 +38,8 @@ SERVER_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVER_ROOT))
 
 from core.api.config_handler import ConfigHandler  # noqa: E402
+from core.api.ota_handler import OTAHandler  # noqa: E402
+from core.utils import device_registry  # noqa: E402
 from config import config_shell as shell  # noqa: E402
 
 #: §6.2 落位表：操作 → 级别。写死在这里，是分级表被改动时唯一会红的东西。
@@ -105,9 +108,26 @@ class DangerGradingContract(AioHTTPTestCase):
         })
 
         self.handler = ConfigHandler({}, str(project))
+        # OTA handler 只用来验证「设备自报的型号/版本会进注册表」这条数据源。
+        # 它的 bin_dir 默认是 ``os.getcwd()/data/bin``，测试里改到临时目录，
+        # 避免往仓库根写目录。
+        self.ota = OTAHandler({
+            "server": {
+                "auth_key": "server-auth-key-0000",
+                "auth": {"enabled": True, "allowed_devices": []},
+                "mqtt_gateway": None, "mqtt_signature_key": None,
+                "websocket": "wss://api.tenclass.net/xiaozhi/v1/",
+                "websocket_backup": "",
+                "port": 8002, "http_port": 8003, "timezone_offset": 8,
+            },
+            "firmware_cache_ttl": 30,
+        })
+        self.ota.bin_dir = str(project / "data" / "bin")
         app = web.Application()
         app.add_routes([
             web.get("/xiaozhi/config/", self.handler.handle_page),
+            web.post("/xiaozhi/ota/", self.ota.handle_post),
+            web.get("/xiaozhi/ota/", self.ota.handle_get),
             web.get("/xiaozhi/config/{slug}", self.handler.handle_domain_redirect),
             web.get("/xiaozhi/config/{slug}/", self.handler.handle_domain_page),
             web.get("/xiaozhi/config/config_domain_page.js",
@@ -124,6 +144,11 @@ class DangerGradingContract(AioHTTPTestCase):
         return app
 
     async def asyncTearDown(self):
+        # 注册表是模块级全局单例：清掉本用例塞进去的在线设备与自报信息，
+        # 免得污染同进程里跑的下一个用例。
+        for did in list(device_registry.get_online().keys()):
+            device_registry.unregister(did, device_registry.get_online(did))
+        device_registry._reported.clear()
         self._tmp.cleanup()
         await super().asyncTearDown()
 
@@ -200,29 +225,45 @@ class DangerGradingContract(AioHTTPTestCase):
         """新设备域页与旧八组页面都注入了**同一份**确认层（§6.5）。
 
         判别力：确认层是「共享外壳的一件组件」。若两页各写一份，分级的视觉
-        编码会分叉——而分叉在两页上都看不出问题，只有对着比才发现。所以这里
-        断言两页的容器与脚本**逐字相等**（同源），不是「都有个容器」。
+        编码会分叉——而分叉在两页上都看不出问题，只有对着比才发现。所以这里对
+        **容器与脚本断同源**（针取自壳的同一常量，再在渲染产物里找它），而不是
+        「都有个差不多的容器」。
 
         旧页是自包含 HTML（不在共享壳的骨架里），所以它的注入发生在
         ``handle_page``——这正是「抽出共享资产」的落点：一份常量，两处填。
         """
         legacy = await self._legacy()
         devices = await self._devices_html()
-        # 容器逐字相等（同一份 CONFIRM_HTML）。
+        # 容器与脚本都断**同源**：针就是壳里的那份常量本身（逐字相等），
+        # 不是断「有没有 xzhConfirm 这个词」——那种存在性断言换个实现也能绿。
         self.assertIn(shell.CONFIRM_HTML, legacy, "旧页必须注入壳的确认层容器")
         self.assertIn(shell.CONFIRM_HTML, devices, "域页必须注入壳的确认层容器")
-        # 渲染脚本逐字相等（同一份 SHELL_CONFIRM_JS）。
-        self.assertIn("xzhConfirm", shell.SHELL_CONFIRM_JS)
-        self.assertIn("xzhConfirm", legacy, "旧页必须注入壳的确认层脚本")
-        self.assertIn("xzhConfirm", devices, "域页必须注入壳的确认层脚本")
+        self.assertIn(shell.SHELL_CONFIRM_JS, legacy, "旧页必须注入壳的确认层脚本")
+        self.assertIn(shell.SHELL_CONFIRM_JS, devices, "域页必须注入壳的确认层脚本")
         # 分级 CSS 也在两页（警示的琥珀按钮两页都要有）。
         self.assertIn(".btn.warn", shell.CONFIRM_CSS)
         self.assertIn(".btn.warn", legacy, "旧页必须注入分级的颜色载体")
         self.assertIn(".btn.warn", devices, "域页必须注入分级的颜色载体")
-        # 分级模型也两页都引（同一份纯模块）。
-        for html, label in ((legacy, "旧页"), (devices, "域页")):
-            self.assertIn("/xiaozhi/config/config_danger_model.js", html,
-                          f"{label}必须引用共享的分级模型")
+        # 分级模型也两页都**真用它**（同一份纯模块）。
+        # 断的是 import 消费，不是外层 ``<script src>`` 空加载：模块只有 export、
+        # 无副作用，空加载不产生任何效果。旧页的 import 就在它自己的 HTML 里
+        # （整页自包含）；域页的 import 在骨架加载的 config_domain_page.js 里。
+        self.assertIn("from './config_danger_model.js'", legacy,
+                      "旧页必须 import 共享的分级模型（空加载不算消费）")
+        page_js = await self._get_text("/xiaozhi/config/config_domain_page.js")
+        self.assertIn("from './config_danger_model.js'", page_js,
+                      "域页必须 import 共享的分级模型（空加载不算消费）")
+
+        # 三载体的单一事实源：壳里的 VISUAL_FALLBACK **只是兜底**，正常路径
+        # 必须由页面把模块的 LEVEL_VISUALS 传进去（壳优先用 o.visual）。
+        # 判别力：删掉壳里对 o.visual 的读取、或删掉两页的 ``visual:`` 传参，
+        # 页面上确认层的图标/文案就会静默退回兜底副本——那种退化必须变红。
+        self.assertIn("o.visual", shell.SHELL_CONFIRM_JS,
+                      "壳必须优先消费调用方传来的模块视觉表（否则兜底副本会偷偷变成事实源）")
+        self.assertIn("visual: LEVEL_VISUALS[level]", legacy,
+                      "旧页必须把模块读到的三载体传给确认层")
+        self.assertIn("visual: LEVEL_VISUALS[level]", page_js,
+                      "域页必须把模块读到的三载体传给确认层")
 
     # ── 4. AC 4：本票涉及的操作不再用原生 confirm ────────────────
     async def test_no_native_confirm_left_in_either_page(self):
@@ -371,6 +412,134 @@ class DangerGradingContract(AioHTTPTestCase):
         # 副作用点名（外呼 + 配额）在按钮旁的 hint 里。
         self.assertIn("外呼", legacy, "必须点名试连 LLM 的外呼副作用")
         self.assertIn("配额", legacy, "必须点名试连 LLM 消耗少量配额")
+
+
+    # ── 8. AC3 的数据源：在线设备行必须带 model / version（issue #30） ──
+    async def test_devices_payload_carries_model_and_version_keys(self):
+        """``api/devices`` 的每个设备对象都带 ``model`` 与 ``version`` 键（AC3）。
+
+        背景（本票修的真 bug）：前端对每台在线设备调
+        ``levelOf('reboot_device', {firmwares, device: d})``；``hasNewerFirmware``
+        读 ``device.model`` / ``device.version``。接口不返回这两个字段时，
+        ``modelOf(d)`` 得空串、库里找不到同型号行，于是重启设备**永远停在
+        警示**，AC3「固件库放入更高版本后升为危险」在真实页面上不可达。
+
+        判别力：断言的是**设备对象的结构里有这两个键**（逐键 in dict），
+        不是 ``assertIn("model", str(payload))``——后者会被 payload 里
+        任何带 ``model`` 字样的字符串（如 ``"device_id"`` 之外的其他字段、
+        报错文案、甚至 ``"model"`` 作为别的键名的一部分）意外满足，与
+        「这个设备对象真有这两个键」无关。这里钉在结构上：
+        取出的值必须是 str（空串也可以），把「只多一个空壳 key」与
+        「真的把设备自报值填进去」分开；下面再断言值等于设备自报的那一份。
+        """
+        class _FakeConn:
+            client_ip = "192.168.18.20"
+
+        did = "aa:bb:cc:dd:ee:ff"
+        device_registry.register(did, _FakeConn())
+        # 设备自报的型号/版本（真实路径：OTA 自检时上报，见下一个用例）。
+        device_registry.record_device_info(did, "zhengchen-minicam", "2.4.2")
+
+        payload = await (await self.client.request(
+            "GET", "/xiaozhi/config/api/devices")).json()
+        row = next(d for d in payload["devices"] if d["device_id"] == did)
+        # 键存在（不是靠字串包含蒙混）。
+        self.assertIn("model", row, "设备行必须带 model（AC3 的升级判据）")
+        self.assertIn("version", row, "设备行必须带 version（AC3 的升级判据）")
+        # 值真的是设备自报的那一份（空壳 key 无法满足）。
+        self.assertEqual(row["model"], "zhengchen-minicam")
+        self.assertEqual(row["version"], "2.4.2")
+        self.assertIsInstance(row["model"], str)
+        self.assertIsInstance(row["version"], str)
+
+    async def test_devices_payload_model_and_version_are_empty_when_unreported(self):
+        """设备没上报过时，字段仍在但为空串（前端保守处理，不许缺 key）。
+
+        判别力：把「取不到」实现成 ``pop``/条件拼字段的实现会让前端读到
+        ``undefined``——与空串在 ``hasNewerFirmware`` 里都走「认不出 = 保守
+        算有更新」这条，但**缺 key** 会让页面模板与契约测试都变脆。这里
+        钉「键总在，值可以为空」。
+        """
+        class _FakeConn:
+            client_ip = "192.168.18.21"
+
+        did = "11:22:33:44:55:66"
+        device_registry.register(did, _FakeConn())
+        payload = await (await self.client.request(
+            "GET", "/xiaozhi/config/api/devices")).json()
+        row = next(d for d in payload["devices"] if d["device_id"] == did)
+        self.assertIn("model", row)
+        self.assertIn("version", row)
+        self.assertEqual(row["model"], "")
+        self.assertEqual(row["version"], "")
+
+    async def test_ota_self_check_is_the_source_of_model_and_version(self):
+        """设备打 OTA 自检时，body 里的 ``board.type`` / ``application.version``
+        被记入注册表，并出现在 ``api/devices`` 里（真实数据源链）。
+
+        为什么走 OTA 而不是握手头：固件的 WebSocket 握手头里只有
+        ``Protocol-Version`` / ``Device-Id`` / ``Client-Id`` / ``Authorization``
+        （见资料包/源码 ``main/protocols/websocket_protocol.cc`` 的 SetHeader），
+        **没有**型号与固件版本；hello 报文里的 ``version`` 是协议版本。设备
+        唯一上报型号与固件版本的地方就是 OTA 自检的 body。
+
+        判别力：这条是**端到端的数据源链**——真实固件体（与
+        ``Board::GetSystemInfoJson`` 同形）+ 真实 OTA handler 路由，断言值
+        一路进到设备行。把 ``record_device_info`` 调用删了就变红。
+        """
+        class _FakeConn:
+            client_ip = "192.168.18.22"
+
+        did = "de:ad:be:ef:00:01"
+        device_registry.register(did, _FakeConn())
+        # 与 Board::GetSystemInfoJson() / GetBoardJson() 同形的固件自检体。
+        body = json.dumps({
+            "version": 2,
+            "mac_address": did,
+            "application": {
+                "name": "xiaozhi", "version": "2.4.1",
+                "compile_time": "2024-01-01T00:00:00Z",
+            },
+            "board": {"type": "zhengchen-minicam", "name": "MiniCam"},
+        })
+        resp = await self.client.request(
+            "POST", "/xiaozhi/ota/", data=body,
+            headers={"device-id": did, "client-id": "uuid-0001",
+                     "content-type": "application/json"})
+        self.assertEqual(resp.status, 200, "OTA 自检本身要能成功")
+        # 数据源被记下。
+        info = device_registry.get_device_info(did)
+        self.assertEqual(info["model"], "zhengchen-minicam")
+        self.assertEqual(info["version"], "2.4.1")
+        # 并且它真的到了前端读的那个接口上。
+        payload = await (await self.client.request(
+            "GET", "/xiaozhi/config/api/devices")).json()
+        row = next(d for d in payload["devices"] if d["device_id"] == did)
+        self.assertEqual(row["model"], "zhengchen-minicam")
+        self.assertEqual(row["version"], "2.4.1")
+
+    async def test_page_reads_model_and_version_from_the_devices_payload(self):
+        """两页都把设备行的 ``model`` / ``version`` 喂给 ``levelOf``（消费侧）。
+
+        判别力：后端多两个字段而页面没读，等于没修——所以断言要挂在
+        **消费侧**（页面脚本对 ``device: d`` 的整对象传递），而不是
+        「后端返回了字段」这一半。它与 node 缝里的「同形载荷 → danger」
+        合起来才是完整证据链。
+        """
+        devices_js = await self._get_text(
+            "/xiaozhi/config/config_domain_page.js")
+        legacy = await self._legacy()
+        # 页面把整台设备对象交给模型（model/version 随结构一起过去）。
+        for name, text in (("域页", devices_js), ("旧页", legacy)):
+            self.assertRegex(
+                text, r"levelOf\('reboot_device',\s*\{[^}]*device:\s*d",
+                f"{name}：必须把设备行整对象交给 levelOf（它读 d.model/d.version）")
+        # 模型的字段名就是后端契约名（两处必须是同一个词）。
+        model = await self._model_js()
+        self.assertIn("device.model", model,
+                      "模型读的字段名必须是 device.model（与 api/devices 同词）")
+        self.assertIn("device.version", model,
+                      "模型读的字段名必须是 device.version（与 api/devices 同词）")
 
 
 if __name__ == "__main__":

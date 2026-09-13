@@ -199,6 +199,9 @@ class OTAHandler(BaseHandler):
                         device_model = data_json.get("model", "")
                 except Exception:
                     device_model = ""
+            # 记下**设备真报上来的**型号（默认值 "default" 是给 OTA 响应用的
+            # 回退，不能当设备型号记——它会污染固件库的型号匹配）。
+            reported_model = device_model
             if not device_model:
                 device_model = "default"
 
@@ -219,8 +222,17 @@ class OTAHandler(BaseHandler):
                     device_version = data_json.get("application", {}).get("version", "")
                 except Exception:
                     device_version = ""
+            reported_version = device_version
             if not device_version:
                 device_version = "0.0.0"
+
+            # 把设备自报的型号/版本记到注册表，供 /xiaozhi/config/api/devices
+            # 的在线设备行使用（重启设备的危险分级要它，见 config_handler）。
+            # 键用 device-id（MAC）：它与 WebSocket 握手时注册到 device_registry
+            # 的 ``self.device_id`` 同源（connection.py）。
+            device_registry.record_device_info(
+                device_id, reported_model, reported_version
+            )
 
             return_json = {
                 "server_time": {

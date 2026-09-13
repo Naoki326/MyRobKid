@@ -361,9 +361,13 @@ SHELL_CONFIRM_JS = """
 (() => {
   const get = () => document.getElementById('xzhConfirm');
 
-  // 分级 → 视觉三载体（颜色 + 图标 + 文案）。与 config_danger_model.js 的
-  // LEVEL_VISUALS 同源；这里是壳内的**消费侧**副本，缺模块时仍能自洽渲染。
-  const VISUAL = {
+  // 分级 → 视觉三载体（颜色 + 图标 + 文案）。
+  //
+  // 单一事实源是 config_danger_model.js 的 LEVEL_VISUALS：调用方（两页）会把它
+  // 读到的那一级通过 ``o.visual`` 传进来，这里**优先用它**。
+  // 下面这份是**空层兜底**（确认层是壳的一部分，壳不许依赖页面模块是否加载成功
+  // ——模块挂了也得弹得出确认框）。两份不一致时以模块为准；改三载体请改模块。
+  const VISUAL_FALLBACK = {
     warning: { cls: 'warn', icon: '\u26a0', label: '\u8b66\u793a', okCls: 'btn warn' },
     danger: { cls: 'danger', icon: '\u26d4', label: '\u5371\u9669', okCls: 'btn danger' },
     normal: { cls: '', icon: '', label: '\u5e38\u89c4', okCls: 'btn primary' },
@@ -386,7 +390,16 @@ SHELL_CONFIRM_JS = """
     const o = opts || {};
     const box = get();
     if (!box) return Promise.resolve(window.confirm(o.title || '\u786e\u8ba4\u64cd\u4f5c\uff1f'));
-    const v = VISUAL[o.level] || VISUAL.warning;
+    // 三载体的优先顺序：调用方传入（模块的 LEVEL_VISUALS）→ 壳内兜底。
+    // 传进来的形状是模块的 ``{icon, label, confirmClass}``，转成内部命名。
+    const fromModule = o.visual || {};
+    const base = VISUAL_FALLBACK[o.level] || VISUAL_FALLBACK.warning;
+    const v = {
+      cls: fromModule.confirmClass !== undefined ? fromModule.confirmClass : base.cls,
+      icon: fromModule.icon !== undefined ? fromModule.icon : base.icon,
+      label: fromModule.label !== undefined ? fromModule.label : base.label,
+      okCls: base.okCls,
+    };
     box.className = 'show ' + v.cls;
     box.querySelector('.hd .ic').textContent = v.icon;
     box.querySelector('.hd .tt').textContent = o.title || '';

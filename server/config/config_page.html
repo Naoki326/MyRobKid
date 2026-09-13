@@ -168,10 +168,9 @@ __CONFIRM_CSS__
 <div id="dirtyPanel" style="position:fixed;bottom:64px;left:220px;right:0;padding:0 32px 8px;font-size:12px;z-index:49"></div>
 
 <div id="toast"></div>
-<!-- 统一页内确认层（共享外壳的一件组件，§6.5） -->
+<!-- 统一页内确认层（共享外壳的一件组件，§6.5）。分级模型是 ES 模块，
+     由下方的 import 消费，不需要再空加载一次。 -->
 __CONFIRM__
-<!-- 危险分级模型（两份在线副本共用的唯一实现，父 spec §6） -->
-<script type="module" src="/xiaozhi/config/config_danger_model.js"></script>
 <script>__CONFIRM_JS__</script>
 
 <!-- type="module"：页面状态模型是外部 ES 模块（config_state_model.js，无 DOM 依赖，
@@ -439,6 +438,9 @@ function confirmDanger(operation, context, opts){
   const level = levelOf(operation, context);
   return window.xzhConfirm({
     level,
+    // 三载体的单一事实源：把模块里那一级读出来交给确认层，
+    // 免得壳里再存一份（两份并存就是漂移的温床）。
+    visual: LEVEL_VISUALS[level],
     title: o.title || '确认操作',
     consequences: operationConsequences(operation, context),
     confirmText: confirmButtonText(operation, context),
