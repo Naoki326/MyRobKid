@@ -23,6 +23,7 @@
 #include "audio/music_player.h"
 #include "audio/music_screen.h"
 #include "audio/music_session_event.h"
+#include "audio/speaking_watchdog.h"
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -255,6 +256,21 @@ private:
     // 不再触发——他显然还有话要说，音乐不该插进来。
     bool pause_user_spoke_ = false;
 
+    /*
+     * `speaking` 看门狗阈值（issue #33）：连续这么多拍满足「在 speaking 且
+     * TTS 音频已全放完」才退出 speaking。单位是 1Hz 的 CLOCK_TICK，所以等于秒。
+     * 判据（见 speaking_watchdog.h 与本文件 TtsPlaybackDrained）已排除「还在
+     * 出声」，所以只需盖过服务端逐句合成时最长的句间间隙（实测 <2s）——留 5 倍
+     * 余量，又不至于让用户在卡死后再等 47 秒。代价：句间间隙真 >10s 会提前退出。
+     */
+    static constexpr int kSpeakingWatchdogTicks = 10;
+    /*
+     * `speaking` 态的兜底看门狗（issue #33）。
+     * 为什么需要、判据为何不是「时长」——见 speaking_watchdog.h。
+     * 复用 1Hz 的 CLOCK_TICK（与 UpdatePauseAutoResume 同一做法），不另起定时器。
+     */
+    SpeakingWatchdog speaking_watchdog_{kSpeakingWatchdogTicks};
+
     // TTS pre-buffering: collect incoming TTS audio packets and only start
     // playing after the server finishes the whole response (tts stop). This
     // avoids choppy playback when the server generates or delivers audio
@@ -269,6 +285,29 @@ private:
 
     // Event handlers
     void HandleStateChangedEvent();
+    /*
+     * 「本轮回答说完了」的收口（tts stop 正常到达、与 #33 看门狗兜底两条路
+     * 共用）。按当时的状态与登记决定去哪：延迟的音乐先起播、答话途中登记的
+     * 续播现在接上、手动模式下回待机，否则进聆听。
+     * 调用方负责保证「确实在 speaking」（真收到 stop 要判、看门狗被触发时本身
+     * 就蕴含）。tts stop 那条路另需先 FlushTtsBuffer（见 InitializeProtocol）。
+     */
+    void ResolveSpeakingExit();
+    /*
+     * 「TTS 音频已经全放完了」（issue #33 看门狗的第二个事实）：播放队列已空
+     * **且** 没有还没推下去的 TTS 音频。
+     *
+     * 后半句是为了整段预缓冲模式（CONFIG_TTS_PLAYBACK_FULL_PREBUFFER）：那时音频
+     * 先攒在 tts_buffer_、不推播放队列，只判 IsPlaybackIdle 会把「还在缓冲一条
+     * 长回答」误判成「已放完」，10 秒就误打断长文。默认的流式模式（本仓实际构建
+     * 的那档、也正是 #33 复现的那档）下缓冲恒空，两半等价。
+     *
+     * **不假装的缺口**：预缓冲模式下若 tts stop 丢失则缓冲永不被冲（只在 stop 时
+     * FlushTtsBuffer）、音频不会播，本判据也永远不成立——那档配置丢 stop 没有兜底。
+     * 本票复现与验收都在默认的流式模式下。
+     */
+    bool TtsPlaybackDrained();
+
     void HandleToggleChatEvent();
     void HandleStartListeningEvent();
     void HandleStopListeningEvent();

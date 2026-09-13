@@ -303,6 +303,34 @@ void Application::Run() {
             // 无语音超时，中途还会触发 end_prompt 让机器人说一句告别语）。
             UpdatePauseAutoResume();
 
+            /*
+             * `speaking` 看门狗（issue #33）。为什么需要、判据为何不是「时长」、
+             * 以及「放完」为何是两半（播放队列空 + 无待推缓冲，为了兼顾整段预
+             * 缓冲模式）——正文在 speaking_watchdog.h 与 TtsPlaybackDrained 的
+             * 注解里，此处不复制。这里只做三件事：现取两个事实、到点打一条与真
+             * `tts stop` 可分的锚点行、经与 `tts stop` 同一处收口退出。
+             *
+             * 用 Schedule 收口而不是就地转态：与 tts stop 那条路同一个落点、
+             * 同一套次序（tts stop 也是 Schedule 到下一轮），免得两条路各自
+             * 抄一份「去哪」。
+             */
+            if (speaking_watchdog_.Tick(GetDeviceState() == kDeviceStateSpeaking,
+                                        TtsPlaybackDrained()) ==
+                SpeakingWatchdogAction::kDrainedUnstopped) {
+                // 行内的秒数是**阈值**（`kSpeakingWatchdogTicks`），不是实测间隔
+                // ——Tick 到点即清零，此处已读不到拍数。判读时它与上一行
+                // `State: … -> speaking` 的挂钟差应≈该值（ADR-0017 取证链）。
+                ESP_LOGW(TAG,
+                         "Speaking watchdog: drained %ds without tts stop - "
+                         "leaving speaking (issue #33 fallback)",
+                         kSpeakingWatchdogTicks);
+                Schedule([this]() {
+                    if (GetDeviceState() == kDeviceStateSpeaking) {
+                        ResolveSpeakingExit();
+                    }
+                });
+            }
+
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
@@ -697,21 +725,7 @@ void Application::InitializeProtocol() {
                 FlushTtsBuffer();
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (!pending_music_url_.empty()) {
-                            // The reply finished speaking: start the deferred
-                            // music now (and stay in idle — no listening while
-                            // the music plays).
-                            LaunchPendingMusic();
-                        } else if (pending_music_resume_) {
-                            // 用户在答话途中说了「继续」：现在这句答完了，
-                            // 按位点接上（与换歌同一时刻、同一处收口）。
-                            pending_music_resume_ = false;
-                            ResumeMusicNow();
-                        } else if (listening_mode_ == kListeningModeManualStop) {
-                            SetDeviceState(kDeviceStateIdle);
-                        } else {
-                            SetDeviceState(kDeviceStateListening);
-                        }
+                        ResolveSpeakingExit();
                     }
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
@@ -1207,6 +1221,44 @@ void Application::ConfigureWakeWordForListening() {
     // Disable wake word detection in listening mode
     audio_service_.EnableWakeWordDetection(false);
 #endif
+}
+
+/*
+ * 谓词的语义、为什么分两半、以及预缓冲模式下的缺口——见头文件注解。
+ */
+bool Application::TtsPlaybackDrained() {
+    if (!audio_service_.IsPlaybackIdle()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(tts_buffer_mutex_);
+    return tts_buffer_.empty();
+}
+
+void Application::ResolveSpeakingExit() {
+    // 本函数只被「确实在 speaking」的调用方进入（tts stop 那条路先判了状态，
+    // 看门狗触发本身就蕴含还在 speaking）——这里再置一道保险，因为状态可能在
+    // Schedule 排队期间被服务端断开/告警转走。
+    if (GetDeviceState() != kDeviceStateSpeaking) {
+        return;
+    }
+    // 本轮回答在此收口（无论走哪条路），看门狗计数随之归零：否则下一次进入
+    // speaking 时会带着上一轮残留的拍数，提前触发。
+    speaking_watchdog_.Reset();
+    if (!pending_music_url_.empty()) {
+        // The reply finished speaking: start the deferred
+        // music now (and stay in idle — no listening while
+        // the music plays).
+        LaunchPendingMusic();
+    } else if (pending_music_resume_) {
+        // 用户在答话途中说了「继续」：现在这句答完了，
+        // 按位点接上（与换歌同一时刻、同一处收口）。
+        pending_music_resume_ = false;
+        ResumeMusicNow();
+    } else if (listening_mode_ == kListeningModeManualStop) {
+        SetDeviceState(kDeviceStateIdle);
+    } else {
+        SetDeviceState(kDeviceStateListening);
+    }
 }
 
 void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
