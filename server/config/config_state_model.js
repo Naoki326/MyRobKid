@@ -343,7 +343,8 @@ function collectRemoved(orig, cur, base, out) {
  *
  * @param {string} path
  * @param {object} selection ``selected_module`` 的选中值（含 ``Intent``）
- * @param {string[]} [engineCategories] 引擎六族；不传 = 旧页面口径
+ * @param {string[]} [engineCategories] 引擎六族；不传 = 旧口径（
+ *   见下面 classifyDirty 里对该分支的说明）
  * @param {{intentBranches?: string[], enabledPlugins?: string[]}} [tools]
  *   工具域的组件范围（``toolsScope`` 的产物）。**不传时不存在「未启用插件」
  *   这个概念**——故 ``plugins.*`` 会落进散字段口径（active），而不是被三段
@@ -352,7 +353,7 @@ function collectRemoved(orig, cur, base, out) {
 export function classifyDirty(path, selection, engineCategories, tools) {
   // ⚠️ 本条已经是第四个位置参数（selection → engineCategories → tools）。
   // 下一次扩展请改成**单一 context 对象**（如 ``classifyDirty(path, ctx)``），
-  // 并把下面「两个可选范围都没传 = 旧页面口径」的双条件收成单条件判定，
+  // 并把下面「两个可选范围都没传 = 旧口径」的双条件收成单条件判定，
   // 不再继续追加位置参数。
   if (String(path).startsWith('selected_module.')) return 'active';
   const parts = String(path).split('.');
@@ -375,10 +376,16 @@ export function classifyDirty(path, selection, engineCategories, tools) {
       return enabled.includes(parts[1]) ? 'active' : 'staged';
     }
   }
-  // 不传任何范围时**逐字保持旧口径**：任何三段路径都当引擎块，其余一律
-  // 归 ``staged``（旧页面 config_page.html 的调用形态，不允许静默改行为）。
-  // 传了范围才按「是否真在该域的组件集合里」细化，散字段归 ``active``
-  // ——它们没有「选中」状态，「仅提前配好」对它不成立。
+  // 不传任何范围时走**保守旧口径**：任何三段路径都当引擎块，其余一律
+  // 归 ``staged``。传了范围才按「是否真在该域的组件集合里」细化，散字段归
+  // ``active``——它们没有「选中」状态，「仅提前配好」对它不成立。
+  //
+  // #31 收线后，**生产代码里已没有不传参的调用方**：唯一调用方是域页的
+  // ``groupDirty``（always 传 ENGINE_CATEGORIES 或 tools）。这条分支因此
+  // 是一条**死路**，但它被 node 缝的「不传范围 = 逐字保持旧口径」用例
+  // （``test_config_state_model.mjs``）钉着，而删它属于扩大 #31 的范围。
+  // 处置：**保留并注明**——它是一条有测试的兼容口径，不是忘了删的旧行为；
+  // 若将来把签名收成单一 context 对象，可连同那几条用例一起清掉。
   if (!engineCategories && !tools) {
     const isEnginePath = parts.length >= 3;
     if (isEnginePath) {

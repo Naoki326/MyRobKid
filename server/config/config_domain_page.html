@@ -63,6 +63,15 @@ details.group.asdetails summary{background:transparent;font-size:14px;font-weigh
 details.group.asdetails>div{padding:0 24px 18px}
 .row.dirty .label::after{content:' ●';color:var(--warn);font-size:9px;vertical-align:super}
 
+/* ---- 引擎域：「试连 LLM」的结果面板（§6.2 常规级，零确认）----
+   搬自旧八组页面（#31 收线后这里是唯一实现）。 */
+.testresult{margin-top:6px;font-size:12.5px;line-height:1.7;color:var(--dim)}
+.testresult .kv{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.testresult .kv span{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:4px 10px}
+.testresult .reply{margin-top:10px;padding:10px 12px;background:#0a0e18;border:1px solid var(--line);border-radius:10px;color:var(--text);white-space:pre-wrap}
+.testresult .warn{color:var(--warn);margin-top:10px}
+.testresult .err{color:var(--err);word-break:break-all}
+
 /* ---- 设备域：运行时面（#29，§4.4）---- */
 .runtime-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .runtime-actions:first-child{margin-top:0;margin-bottom:8px}
@@ -96,8 +105,8 @@ __CONFIRM__
 <!-- 域表：服务端注入（page_domains.py 的 JSON 形态），页面不硬编码字段归属 -->
 <script id="domain-schema" type="application/json">__SCHEMA_JSON__</script>
 <!--
-  危险分级模型（无 DOM 依赖的纯模块，node 缝跑）。两份在线副本
-  （设备域页 / 旧八组页面）共用同一份分级判定与后果文案。
+  危险分级模型（无 DOM 依赖的纯模块，node 缝跑）。全部域页共用同一份
+  分级判定与后果文案（#31 收线后旧八组页面已退役，这里是唯一消费方）。
   由下方 script 的 import 消费，不需再空加载一次。
 -->
 <!--

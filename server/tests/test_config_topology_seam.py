@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""页面拓扑与共享外壳的 HTTP 契约缝（issue #26，#24 Phase 1）。
+"""页面拓扑与共享外壳的 HTTP 契约缝（issue #26 起，#31 收线）。
 
-契约（父 spec §3 / §4 / §8.1 / §8.2）：
+契约（父 spec §3 / §4 / §8.1 / §8.2，本票 #31 收线后口径）：
 
 1. **域 slug 路由可达**（§8.1）——``dialogue`` / ``engine`` / ``tools`` /
    ``devices`` / ``system`` + 逃生口 ``raw``，每个都是**用户契约**（ADR-0012）。
-   未上线的三域必须给**占位页**：URL 先上线、内容后上线，而不是 404。
+   五域全部上线；占位页机制保留但当前是空集（新增域时照用）。
 2. **尾斜杠规范形 + 应用层 301**（§8.2）——无斜杠访问 301 到有斜杠形态，
    由应用层发，不依赖 nginx（nginx 配置在仓库外，读不出来）。
-3. **动作区只在编辑页渲染**（§4.2）——保存 / 重启服务按钮在逃生口只读页与
-   占位页上**不渲染**（「不渲染」不是「渲染了再藏」）。
-4. **五域 + 逃生口都在侧栏**（§3）——逃生口是横线之下的非域小入口，
-   未上线域条目带占位标注而不是被删掉。
+   根路径 ``/xiaozhi/config/`` 是 **302** 到首域——它不是规范形，只是旧入口
+   兑底，所以与域页尾斜杠的 301 不是同一个机制（§4.1）。
+3. **动作区只在编辑页渲染**（§4.2）——保存 / 重启服务按钮在逃生口只读页上
+   **不渲染**（「不渲染」不是「渲染了再藏」）。
+4. **五域 + 逃生口都在侧栏**（§3）——逃生口是横线之下的非域小入口。
 5. **28 个字段一条不少**（§7）——对话与角色 15 + 系统 13；同一份归属表
    （``config/page_domains.py``）既喂渲染又喂计数，所以「页面渲染出几个字段」
    与被测的期望值不是同一个来源之外的东西。
+6. **旧八组页面已退役**（#31 contract 步）——文件不在仓库、无代码路径渲染，
+   根路径 302 而不是 200。
 
 为什么不测 DOM 呈现行为：父 spec 明确不引入浏览器测试基建。折叠、确认层、
 hash 滚动按人工走查口径（issue #26 明文）；本文件只钉 HTTP 契约与交付内容。
@@ -89,7 +92,7 @@ class DomainTopologyContract(AioHTTPTestCase):
         # 页面/静态资源用**真实文件**：路由的交付路径（含 MIME）必须被测到，
         # 存根只能证明「路由存在」，证不了「页面真的能加载」。
         (project / "config").mkdir()
-        for name in ("config_page.html", "config_state_model.js",
+        for name in ("config_state_model.js",
                      "config_domain_page.html", "config_domain_page.js",
                      "config_danger_model.js"):
             (project / "config" / name).write_text(
@@ -100,7 +103,7 @@ class DomainTopologyContract(AioHTTPTestCase):
         app = web.Application()
         app.add_routes([
             web.get("/xiaozhi/config", self.handler.handle_config_root_redirect),
-            web.get("/xiaozhi/config/", self.handler.handle_page),
+            web.get("/xiaozhi/config/", self.handler.handle_config_root_default),
             web.get("/xiaozhi/config/{slug}", self.handler.handle_domain_redirect),
             web.get("/xiaozhi/config/{slug}/", self.handler.handle_domain_page),
             web.get("/xiaozhi/config/config_state_model.js",
@@ -119,6 +122,12 @@ class DomainTopologyContract(AioHTTPTestCase):
 
     async def _get(self, path, allow_redirects=False):
         return await self.client.request("GET", path, allow_redirects=allow_redirects)
+
+    async def _get_text(self, path):
+        """取一份 200 响应的正文（路由可达也一并钉住）。"""
+        resp = await self._get(path)
+        self.assertEqual(resp.status, 200, f"{path} 必须可达")
+        return await resp.text()
 
     # ── 1. 域 slug 路由可达（未上线域为占位页） ──────────────────
     async def test_every_domain_slug_is_reachable(self):
@@ -370,13 +379,271 @@ class DomainTopologyContract(AioHTTPTestCase):
         self.assertNotIn("服务端不做模板渲染", html,
                          "骨架里的作者注释不该随响应发给浏览器")
 
-    # ── 7. 旧八组页面原样保留在原 URL（expand 阶段，收线是后续票） ─
-    async def test_legacy_config_page_still_served_at_its_own_url(self):
+    # ── 7. 根路径 302 到首域；旧八组页面已退役（#31 contract 步） ────
+    async def test_root_302s_to_the_first_domain(self):
+        """``/xiaozhi/config/`` 是 **302** 到 ``dialogue``（§4.1），不是 200、也不是 301。
+
+        方案 §4.1 原文：「``/xiaozhi/config/`` **302 到首域**（对话与角色居首）
+        ——旧链接/书签/手输不 404，nginx 与 8003 直连两条路都覆盖（302 由
+        应用层发，不依赖 nginx）」。#8.1 又把 ``dialogue`` 标为「首域，
+        ``/xiaozhi/config/`` 302 到这里」。
+
+        判别力：
+
+        - **302 不是 301**：根路径不是规范形（域页 URL 才是），301 会把
+          「对话与角色」当成根路径的永久身份缓存下来。这跟域页尾斜杠的 301
+          是两回事（那条有规范形身份，§8.2），断言分开写。
+        - **不是 200**：收线前旧八组页面在这里返回 200；本票要它不再
+          200——这是「旧页面真的退役了」的机械证据。
+        """
         resp = await self._get("/xiaozhi/config/")
-        self.assertEqual(resp.status, 200,
-                         "旧配置页仍以 /xiaozhi/config/ 服务（本票不做收线）")
-        html = await resp.text()
-        self.assertIn('id="saveBar"', html, "旧页面原样保留：保存栏还在")
+        self.assertEqual(resp.status, 302,
+                         "根路径必须 302（旧入口兑底，不是规范形，也不是 200 的旧页）")
+        self.assertEqual(resp.headers["Location"], "/xiaozhi/config/dialogue/",
+                         "302 的目标必须是首域 dialogue 的规范形（§8.1）")
+        # （不再单独断“不是 301”：上面那行 ``== 302`` 已蕴含它。一个状态码
+        #   只有一个值，写成两条只是把同一个事实说两遍。）
+
+    async def test_root_redirect_preserves_the_query_string(self):
+        """跳转保留查询串（旧书签上挂的 hash 之外的参数不能丢）。"""
+        resp = await self._get("/xiaozhi/config/?a=1&b=2")
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers["Location"],
+                         "/xiaozhi/config/dialogue/?a=1&b=2")
+
+    async def test_legacy_config_page_is_gone_from_the_repo(self):
+        """旧八组页面不能再回来：文件不在仓库，也没有代码路径渲染它。
+
+        判别力：旧页退役是**不可逆**的一步。这条钉两件事：
+
+        1. 文件 ``server/config/config_page.html`` **不存在**——留着它
+            就是留一份会在下一次修改时静默分叉的副本；
+        2. 没有任何**代码**还引用它。
+
+        第 2 条的判别力在于「代码」而不是「文本」：文档字符串与注释里提
+        这个文件名是**历史记录**（比如 handler 的模块 docstring 说「旧页已
+        在 #31 退役」），它们不是渲染路径。所以这里用 ``ast`` 剥掉注释与
+        文档字符串，只看真正的代码节点里有没有那个文件名。
+        若是断文本，就只能在「写清历史」与「测试变绿」之间二选一——那是
+        一根恒真的反向断言（断测试自己不许提旧文件名），不是契约。
+        """
+        self.assertFalse(
+            (SERVER_ROOT / "config" / "config_page.html").exists(),
+            "旧八组页面必须已从仓库删除（#31 收线）")
+        import ast
+        for py in sorted((SERVER_ROOT / "core").rglob("*.py")) \
+                + sorted((SERVER_ROOT / "config").rglob("*.py")):
+            tree = ast.parse(py.read_text(encoding="utf-8"))
+            # 模块/类/函数 docstring 是历史记录的合法位置，不能当渲染路径。
+            docstrings = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef,
+                                     ast.FunctionDef, ast.AsyncFunctionDef)):
+                    doc = ast.get_docstring(node, clean=False)
+                    if doc is not None:
+                        docstrings.add(doc)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    if node.value in docstrings:
+                        continue
+                    self.assertNotIn(
+                        "config_page.html", node.value,
+                        f"{py} 的代码仍引用已删除的旧页文件名")
+
+    async def test_root_redirect_target_is_the_sidebar_first_domain(self):
+        """302 的目标与侧栏首域必须是**同一个域**（§3 五域序列 + §4.1）。
+
+        判别力：302 目标写成硬编码字符串、侧栏顺序又被挪动时，用户点
+        ``/xiaozhi/config/`` 会落到一个**不是侧栏第一项**的域上——“首域”
+        这个说法自己就不成立了。这里从侧栏 HTML 读出真正的第一项再对。
+        """
+        html = await (await self._get("/xiaozhi/config/dialogue/")).text()
+        sidebar = html[html.index('<aside class="sidebar"'):html.index("</aside>")]
+        first = re.search(r'data-domain="([a-z0-9-]+)"', sidebar)
+        self.assertIsNotNone(first, "侧栏必须有域条目")
+        resp = await self._get("/xiaozhi/config/")
+        self.assertEqual(resp.headers["Location"],
+                         f"/xiaozhi/config/{first.group(1)}/",
+                         "302 目标必须就是侧栏的首个域（§4.1「对话与角色居首」）")
+        self.assertEqual(first.group(1), "dialogue",
+                         "侧栏首域就是 dialogue（§3 五域序列写死的）")
+
+    # ── 8. 验收判据 1：零字段丢失（527 = 15+450+32+17+13；常用 347 / 更多 180）──
+    async def test_zero_field_loss_cross_domain_tally(self):
+        """五域字段总账：527 = 15+450+32+17+13；常用 347 / 更多 180（§3 / §7 / §10.1）。
+
+        判别力：各域自己的用例（dialogue/engine/tools/devices/system 的字段数
+        断言）已分别存在，但它们**合不起来**——某天一个域多 2 个、另一个域
+        少 2 个，五个用例各自全绿而总数已经错了。这条是把五个域当一本账对：
+        逐域写死数字（改一个就红）+ 总数对账（§10.1 的 527 与归层计数）。
+
+        这是**旧页退役后最重要的一条**：旧页曾渲染过这 527 个字段中的一部分，
+        删页时如果少了什么，“各域原来就对”的直觉会掩盖它。数字写死的意义就在
+        这里——它们是用 #16 的规则机械算出来的旧页对照口径，不是从当前代码
+        里反推出来的（反推的断言是自证式的）。
+        """
+        expected = {  # §3 合计表：域 → (字段数, 常用, 更多设置)
+            "dialogue": (15, 11, 4),
+            "engine": (450, 302, 148),
+            "tools": (32, 27, 5),
+            "devices": (17, 7, 10),
+            "system": (13, 0, 13),
+        }
+        total = common = more = 0
+        for slug, (n, c, m) in expected.items():
+            schema = domains.DOMAIN_SCHEMAS[slug]
+            fields = schema.all_fields()
+            self.assertEqual(len(fields), n, f"{slug} 域字段数对不上 §3")
+            self.assertEqual(len(schema.common_fields()), c,
+                             f"{slug} 常用层数对不上 §3")
+            self.assertEqual(len(fields) - len(schema.common_fields()), m,
+                             f"{slug} 更多设置数对不上 §3")
+            # 归层只能用两个值：多一个第三值就是「两层」约定被破了。
+            self.assertLessEqual(
+                {f.layer for f in fields}, {"common", "more"},
+                f"{slug} 域的字段只许落在 common / more 两层")
+            total += n
+            common += c
+            more += m
+        self.assertEqual(total, 527, "§10.1：527 = 15+450+32+17+13")
+        self.assertEqual(common, 347, "§3 合计表：常用 347")
+        self.assertEqual(more, 180, "§3 合计表：更多设置 180")
+        # 五域就是全部——不存在第六个域页承载漏掉的字段。
+        self.assertEqual(set(domains.DOMAIN_SCHEMAS), set(expected),
+                         "域集合必须就是这五个（逃生口不是域，不载字段）")
+
+    async def test_tally_is_zero_loss_not_just_balanced(self):
+        """527 不只是「合计相等」：域间不重不漏（同一路径不得出现在两个域）。
+
+        判别力：「每个域字段数对」与「字段没重复也没遗漏」是两件事：
+        从 A 域挪 3 个到 B 域，两个域的数都可能还是对的。零字段丢失的完整
+        口径是**每个字段路径恰出现在一个域**，且域内路径无重复。
+        """
+        seen = {}
+        for slug, schema in domains.DOMAIN_SCHEMAS.items():
+            paths = [f.path for f in schema.all_fields()]
+            self.assertEqual(len(paths), len(set(paths)),
+                             f"{slug} 域内有重复字段路径（渲染会多出一个控件）")
+            for path in paths:
+                self.assertNotIn(
+                    path, seen,
+                    f"{path} 同时出现在 {seen.get(path)} 与 {slug} 两个域（重复计数）")
+                seen[path] = slug
+        self.assertEqual(len(seen), 527, "五域合起来恰是 527 个唯一字段路径")
+
+    # ── 9. 验收判据 4：一级 = 6 ≤ 7、深度 ≤ 3（呈现行为的结构前提）────
+    async def test_top_level_navigation_is_six_entries_within_seven(self):
+        """侧栏一级 = 5 域 + 逃生口 = **6 ≤ 7**（§3 / §10.3）。
+
+        判别力：这是**可用服务端渲染的侧栏 HTML 直接断言**的一条（不需要
+        浏览器）：侧栏里的导航项（``.navitem``）恰好 6 个——五个是域、
+        一个是逃生口，逃生口不在五域序列里（它不是第六域，而是一级导航的
+        最后一项）。数字写死：多一个（比如把摄像头页也塞进来）就红。
+        """
+        html = await (await self._get("/xiaozhi/config/dialogue/")).text()
+        sidebar = html[html.index('<aside class="sidebar"'):html.index("</aside>")]
+        entries = re.findall(r'class="navitem[^"]*"', sidebar)
+        self.assertEqual(len(entries), 6,
+                         "一级导航 = 5 域 + 1 逃生口 = 6 ≤ 7（§10.3）")
+        # （不再单独断 ``<= 7``：上行已把它钉成恰当的 6。）
+        # 逃生口是**非域**样式（``escape-item``），不是第六个域。
+        self.assertEqual(len(re.findall(r'class="navitem escape-item', sidebar)), 1)
+        self.assertEqual(len(re.findall(r'data-domain="', sidebar)), 6)
+        # 摄像头页**不占一级导航**（§4.4）：侧栏里不得有它的入口。
+        self.assertNotIn('data-domain="camera"', sidebar)
+
+    async def test_depth_is_at_most_three_with_folded_dom_at_zero(self):
+        """深度 ≤ 3，且折叠态 DOM 字段数 = 0 的**实现前提**在交付内容里。
+
+        判别力：折叠、点击深度是呈现行为，父 spec 不引入浏览器基建——所以
+        这里钉的是它的**代码形状**（都是可静态判定的）：
+
+        - 域内两层是 ``<details>``（第一层是侧栏、第二层是卡片/类目、第三层
+          是折叠容器 = 侧栏(1) → 卡片(2) → 卡内折叠(3)）；
+        - 引擎/插件卡体**延迟到 toggle 才构建**（``data-built="0"`` +
+          ``fillEngineBody``），所以折叠态下 DOM 里真的没有字段控件；
+        - 深度不靠嵌套更多 ``<details>`` 实现（域内只有两层）。
+
+        真正的「几次点击」是**人工走查项**（见报告）——这里只钉它的前提。
+        """
+        js = await self._get_text("/xiaozhi/config/config_domain_page.js")
+        # 卡体延迟构建（折叠态 DOM 字段数 = 0 的实现前提）。
+        self.assertIn('data-built="0"', js)
+        self.assertIn("fillEngineBody", js)
+        # 域内「更多设置」是原生 details 折叠（不是第三个域、也不是分页）。
+        self.assertIn('<details class="more-settings">', js)
+        # 域内只有两层：常用平铺 + 更多设置折叠——不得再套一层。
+        self.assertNotIn('<details class="more-settings"><details', js)
+        # 逃生口是只读页（无二级/三级）——它不参与深度计算。
+        raw = await self._get_text("/xiaozhi/config/raw/")
+        self.assertNotIn("data-engine", raw)
+
+    # ── 10. 验收判据 2：盲测十题的**结构前提**（点击次数本身是人工走查项）──
+    #
+    # 十道题（§10.2）的「≤2 次点击」需要浏览器才能量。不引入浏览器基建的
+    # 前提下，能机械化钉住的是**它的结构前提**：每个目标字段落在哪个域的哪一层，
+    # 以及那一层是不是被折叠包着（包着 = 多一次点击）。
+    #
+    # 下面逐题断言「域 + 层」的组合。断言里**不拼装 HTML**（那是恒真的温床）；
+    # 读的是与渲染同源的域表（``page_domains``）。
+    _BLIND_TEST_TARGETS = [
+        # (题号, 域, 路径, 允许的最大点击数) —— 1 = 域首屏平铺可达；2 = 需展开一层折叠
+        (1, "dialogue", "wakeup_words", 1),
+        (2, "engine", "selected_module.TTS", 1),
+        (5, "dialogue", "prompt", 1),
+        (9, "dialogue", "voiceprint.speakers", 1),
+        (10, "system", "log.log_level", 1),
+        (7, "devices", "server.auth_key", 2),
+        (4, "engine", "tts_timeout", 2),
+        (8, "tools", "Intent.function_call.functions", 1),
+    ]
+
+    async def test_blind_test_structural_preconditions(self):
+        """盲测十题的结构前提：每个目标字段的域 + 层都对（§10.2）。
+
+        判别力：每题断 **域归属**（错域 = 用户会去错的页）与 **层**（错层 = 多
+        一次点击）。折叠层归 2 次点击的前提是「它真的被 ``<details>`` 包着」
+        ——域内 ``more`` 层就是包着的（见 ``groupCard``）；引擎全局参数的
+        ``more`` 也一样（它在外层 ``details.asdetails`` 里）。
+
+        未列入的事项（盲测 3/6：看设备在线、给设备配 Wi-Fi）不是**字段**，而是
+        运行时面面板——它们由 ``DEVICES_RUNTIME`` 声明（下面单独断言）。
+        """
+        for num, slug, path, max_clicks in self._BLIND_TEST_TARGETS:
+            schema = domains.DOMAIN_SCHEMAS[slug]
+            hit = next((f for g in schema.groups for f in g.fields
+                       if f.path == path), None)
+            self.assertIsNotNone(
+                hit, f"盲测第 {num} 题的目标 {path} 必须落在 {slug} 域（§10.2）")
+            # 是否真的多一次点击，取决于**该域有没有常用层**（§2.5）：
+            # 域内常用层为空时折叠区不渲染，全部字段平铺——此时 ``more`` 层
+            # 的字段也是首屏可达的（系统域就是这样）。只有「域内有常用层」
+            # 时，``more`` 层才真的被 ``<details>`` 包着（= 多一次点击）。
+            domain_has_common = len(schema.common_fields()) > 0
+            expected_clicks = 2 if (hit.layer == "more" and domain_has_common) else 1
+            self.assertEqual(
+                expected_clicks, max_clicks,
+                f"盲测第 {num} 题（{path}）在 {slug} 域的 {hit.layer} 层，"
+                f"域内有常用层={domain_has_common} → {expected_clicks} 次点击，"
+                f"但 §10.2 写的是 {max_clicks} 次")
+        # 运行时面两题（3 看设备在线 / 6 配 Wi-Fi）：面板直接挂在设备域，
+        # 域页首屏渲染（不折叠）= 1 次点击。
+        panel_ids = [p["id"] for p in domains.DEVICES_RUNTIME]
+        self.assertIn("online-devices", panel_ids, "盲测 3：在线设备区在设备域")
+        self.assertIn("smartconfig", panel_ids, "盲测 6：配网入口在设备域")
+        # 运行时面面板是首屏渲染（不折进 details）——渲染路径直接拼它们。
+        # 断**调用点**而不是函数名存在：只留定义不调用，用户在页面上看不到面板。
+        js = await self._get_text("/xiaozhi/config/config_domain_page.js")
+        self.assertIn("+ runtimePanelsHtml()", js,
+                      "设备域渲染必须真的拼上运行时面面板（光有定义不算）")
+        self.assertIn("renderDevicesDomain()", js,
+                      "设备域渲染路径必须被调用（光有定义不算）")
+
+    # 注：曾有一条 ``test_blind_test_field_order_matches_the_ten_questions``，
+    # 逐域重算「字段数 / 常用 / 更多」的同一张 §3 表。它与上面的
+    # ``test_zero_field_loss_cross_domain_tally`` 是同一断言的第二份副本
+    # （对同一份 ``DOMAIN_SCHEMAS`` 做同样的算术），已删除——重复的算术不会
+    # 多发现一件事，只会在改动时多一个要同步的地方。
 
 
 def _write_yaml(path, data):

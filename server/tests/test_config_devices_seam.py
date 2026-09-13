@@ -97,8 +97,9 @@ class DevicesDomainContract(AioHTTPTestCase):
         (project / "data" / "bin").mkdir()
         (project / "config").mkdir()
         real = SERVER_ROOT / "config"
+        # #31 收线：旧八组页面（config_page.html）已删除，不再拷它。
         for name in ("config_domain_page.html", "config_domain_page.js",
-                     "config_state_model.js", "config_page.html"):
+                     "config_state_model.js"):
             (project / "config" / name).write_text(
                 (real / name).read_text(encoding="utf-8"), encoding="utf-8")
 

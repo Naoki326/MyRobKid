@@ -53,10 +53,14 @@ CAMERA_PAGE = {
     "icon": "📷",
 }
 
-#: 旧的五组八页配置页（§1 现状）。父 spec §11 的 expand 阶段：**旧页面原样保留
-#: 在原 URL**，收线（302 + 退役）是后续票的事。这里只登记它们的 URL，供 301 的
-#: 规范形指向用；本模块不渲染它们。
-LEGACY_CONFIG_URL = "/xiaozhi/config/"
+#: 首域（§8.1）：「对话与角色居首」，所以 ``/xiaozhi/config/`` 302 到这里。
+#:
+#: 它是**显式命名**的，不从 ``DOMAINS[0]`` 反推：302 的目标是方案明文点过名的
+#: 一个事实（§4.1 / §8.1），而不是「列表碰巧把谁排在前面」。下面用断言把
+#: 两者钉在一起，顺序被挪动时会立刻变红。
+FIRST_DOMAIN_SLUG = "dialogue"
+assert DOMAINS[0]["slug"] == FIRST_DOMAIN_SLUG, (
+    "侧栏首域与 302 的目标必须是同一个域（§3 五域序列 + §4.1）")
 
 #: 规范形 URL 前缀。每个页面 URL 以尾斜杠收尾（§8.2）。
 def page_url(slug: str) -> str:
@@ -64,9 +68,12 @@ def page_url(slug: str) -> str:
     return f"/xiaozhi/config/{slug}/"
 
 
-#: 危险分级与统一确认层的 **CSS**（§6.4 / §6.5）——单独一段，因为它是两份
-#: 在线副本共用的资产：新域页骨架拿的是 ``SHELL_CSS``（已含本段），
-#: 旧八组页面自带一张样式表，所以单独拿这一段。
+#: 危险分级与统一确认层的 **CSS**（§6.4 / §6.5）。
+#:
+#: #30 抽出这一段是因为当时有**两份在线副本**（新域页 / 旧八组页面）要共用它
+#: ——旧页自带一张样式表，所以确认层的样式得单独交付。 #31 收线后旧页已删除，
+#: 分段本身的理由不再成立，但**保留分段**：它是「危险分级视觉」与「壳骨架」
+#: 两条关注点的分界，合回去只会把壳 CSS 再搅拌一次，无所得。
 #:
 #: 只有 ``.btn.warn`` 与 ``#xzhConfirm`` 两族选择器——分级的三载体里，颜色
 #: 是这一段负责的；图标与文案由 ``SHELL_CONFIRM_JS`` 与按钮文字负责。
@@ -78,7 +85,7 @@ CONFIRM_CSS = """
 
 /* ---- 统一页内确认层（§6.5「共享外壳的一件组件」）----
    原生 confirm() 无法分级编码、无法承载输入框与动态后果（§6.5）——
-   这层壳是三级分级的视觉载体，也是两份在线副本共用的唯一实现。 */
+   这层壳是三级分级的视觉载体，是全部页面的唯一实现。 */
 #xzhConfirm{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;background:rgba(4,7,14,.68);backdrop-filter:blur(3px)}
 #xzhConfirm.show{display:flex}
 #xzhConfirm .box{width:min(560px,92vw);max-height:86vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px 24px;box-shadow:0 24px 64px rgba(0,0,0,.55)}
@@ -308,22 +315,23 @@ def render_topbar(title: str, actions: str = "", nav: str = "") -> str:
 
 
 def render_placeholder(domain: dict) -> str:
-    """未上线域的占位页正文（本票只交付占位，#27/#28/#29 交付内容）。
+    """未上线域的占位页正文（当前五域齐备，它是空集；新增域时照用）。
 
     占位页必须**如实说自己未上线**，并把该域负责什么写清楚（照抄 §3 的职责
     一句话），否则用户看到空页会以为配置丢了。页面标题已由域页骨架渲染，
     这里不再重复一遍。
+
+    #31 收线后兑底路径变了：旧八组页面已删除，所以占位页不能再让人「去旧页
+    看」——那个地方已经不在。字段现在要么在某个域页上，要么在逃生口页里。
     """
     return (
         '<section class="group"><h2>该域尚未上线 <span class="badge">占位</span></h2>'
         '<div class="placeholder">'
         "这个页面域已经在侧栏与路由上就位（URL 一经上线即用户契约），"
-        "但内容还没有实现——它的字段目前仍可以在旧的分组配置页与"
-        "「原始配置」只读页里查看。<br><br>"
+        "但内容还没有实现。<br><br>"
         f"<b>计划归属本域的配置</b>：{domain['blurb']}。<br><br>"
-        "在它上线之前，改动这些字段请走旧的分组配置页（"
-        f'<a href="{LEGACY_CONFIG_URL}">{LEGACY_CONFIG_URL}</a>）；'
-        "只想核对现值时，用侧栏底部的「原始配置」页——那里有完整的原始 YAML。"
+        "在它上线之前，只想核对现值时用侧栏底部的「原始配置」页——"
+        "那里有完整的原始 YAML。"
         "</div></section>"
     )
 
@@ -331,8 +339,8 @@ def render_placeholder(domain: dict) -> str:
 #: 确认层的 HTML 壳（§6.5 的「共享外壳的一件组件」）。
 #:
 #: 为什么在壳里而不是各页各写一份：§6.5 明文「统一页内确认层（共享外壳的一件
-#: 组件）」。两份在线副本（新设备域 / 旧八组页面）共用这一个容器与这一份
-#: 渲染逻辑，分级的视觉编码才不会分叉。
+#: 组件）」。#30 时它是两份在线副本共用的容器；#31 收线后旧页退役，消费方
+#: 只剩域页，但**容器仍在壳里**——它本来就是壳级资产，不是为旧页而生的。
 #:
 #: 容器常驻 DOM（空着），内容在打开时填——页面里没有第二份「确认层」。
 CONFIRM_HTML = (

@@ -73,8 +73,9 @@ class EngineLibraryContract(AioHTTPTestCase):
         (project / "data").mkdir()
         (project / "config").mkdir()
         real = SERVER_ROOT / "config"
+        # #31 收线：旧八组页面（config_page.html）已删除，不再拷它。
         for name in ("config_domain_page.html", "config_domain_page.js",
-                     "config_state_model.js", "config_page.html"):
+                     "config_state_model.js"):
             (project / "config" / name).write_text(
                 (real / name).read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -120,6 +121,11 @@ class EngineLibraryContract(AioHTTPTestCase):
     async def _html(self, slug="engine"):
         resp = await self.client.request("GET", f"/xiaozhi/config/{slug}/")
         self.assertEqual(resp.status, 200)
+        return await resp.text()
+
+    async def _get_text(self, path):
+        resp = await self.client.request("GET", path)
+        self.assertEqual(resp.status, 200, f"{path} 必须可达")
         return await resp.text()
 
     def _schema(self, html):
@@ -204,6 +210,23 @@ class EngineLibraryContract(AioHTTPTestCase):
                           "「当前生效」六行是 selected_module.* 的编辑控件")
         self.assertEqual(len(domains.ENGINE_GLOBALS), 2)
         self.assertEqual(len(domains.ENGINE_SELECTORS), len(CATEGORIES))
+
+    async def test_engine_globals_are_one_fold_away_from_the_domain_page(self):
+        """盲测第 4 题（调 TTS 超时）的 **2 次点击**结构前提（§10.2）。
+
+        判别力：题目路径是 侧栏「引擎」→ 展开「引擎全局参数」→ tts_timeout
+        = 2 次点击。它成立的前提是**引擎全局参数真的是一层折叠**（并非平铺
+        首屏）。这条断的是那个折叠形状，不是点击次数本身（后者要浏览器）。
+
+        为什么单独钉：把全局参数**改成平铺**能让题目变简单（1 次），但会把
+        §3 的「一级 ≤7 的轻首屏」改变面貌；反过来忘了折叠它就跑到首屏。
+        两种都要变红。
+        """
+        js = await self._get_text("/xiaozhi/config/config_domain_page.js")
+        self.assertIn('details class="group asdetails" id="globals"', js,
+                      "引擎全局参数必须是一层可展开的折叠（2 次点击的前提）")
+        # 折叠面内的字段是平铺的（不再套第二层）——否则就变成 3 次点击。
+        self.assertIn("globals.fields.map(row).join('')", js)
 
     async def test_the_blocks_sum_to_four_hundred_forty_two_plus_eight(self):
         """机械对账：§7 块内 442（各块头相加）+ 表头 8 = 450。

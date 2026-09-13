@@ -165,7 +165,7 @@ function belongsToDomain(path) {
  * （`top_k` 就是 `top_k`，不是「未知字段」）。新增引擎（本机自加的 `Mlx*TTS`）
  * 零成本获得中文标签——不靠给每条引擎写一段。
  *
- * 与旧页面 `config_page.html` 的 `FIELD_META` 同源同尺：这里只留引擎卡真正
+ * 与旧页面的 `FIELD_META` 同源同尺（旧页已在 #31 退役）：这里只留引擎卡真正
  * 用得上的那一小张（控件形状由值决定，不需要在表里声明）。
  */
 const FIELD_LABEL = {
@@ -565,6 +565,33 @@ function enginesOf(cat) {
   return names;
 }
 
+/** 引擎库的「试连 LLM」一行（§6.2 常规级）。
+ *
+ * 它是 #31 收线时从旧八组页面（``config_page.html`` 的 ``testLLM``）搬过来的
+ * ——旧页退役后这里就是**唯一实现**。方案 §6.2 把它列为常规级操作（点名外呼
+ * 副作用、消耗少量配额、零确认），所以它必须随旧页退役一起留下来，
+ * 否则是「删页导致的功能净损失」。
+ *
+ * 零确认是**行为**：按钮的 onclick 直接发请求，不经过确认层。
+ *
+ * 只对 LLM 族渲染：后端 ``api/test-llm`` 目前只支持 ``type=openai`` 的
+ * 对话模型，摆在其它族旁边会是个点了必然报错的按钮。
+ */
+function llmTestRow() {
+  const hint = '用当前页面上的参数（含未保存的改动）真发一次请求，量出首句延迟'
+    + '——设备听到第一句话大致就是这个量级。'
+    + '<br><b>副作用点名</b>：这一步会真的外呼一次模型（消耗少量配额），'
+    + '因此<b>无需确认</b>——点按钮本身就是意图表达（§6.2 常规级）。';
+  return `<div class="row" id="llmTestRow">
+    <div class="meta"><div class="label">连通性测试</div>
+      <div class="hint">${hint}</div></div>
+    <div class="ctrl">
+      <button class="btn primary" type="button" id="llmTestBtn"
+        onclick="testLLM()">🧪 测试这个模型</button>
+      <div id="llmTestResult" class="testresult"></div>
+    </div></div>`;
+}
+
 /** 重建引擎库的**外框**（tab 栏 + 当前卡列表）。卡体是按需填充的。
  *
  * 上方「当前生效」与引擎全局参数由引擎域自己给；库本身是共用的（见下）。
@@ -573,10 +600,13 @@ function renderEngineLibrary() {
   // ---- 上方：当前生效六行（selected_module.* 的编辑控件，§5） ----
   const selectors = SCHEMA.groups.find((g) => g.id === 'selectors');
   const globals = SCHEMA.groups.find((g) => g.id === 'globals');
+  // 「试连 LLM」摆在 LLM 那一行之后：它是「当前生效的 LLM 能不能用」的即时
+  // 检验，贴着被检验的那一行才说得通（旧页也是放在 LLM 参数卡里）。
   const slots = selectors
     ? `<section class="group" id="selectors"><h2>${esc(selectors.title)}</h2>
         <div class="desc">${esc(selectors.desc)}</div>
-        ${ENGINE_CATEGORIES.map((cat) => slotRow(cat)).join('')}</section>`
+        ${ENGINE_CATEGORIES.map((cat) => slotRow(cat)
+          + (cat === 'LLM' ? llmTestRow() : '')).join('')}</section>`
     : '';
   const globalsBlock = globals
     ? `<details class="group asdetails" id="globals"><summary>${esc(globals.title)}
@@ -585,6 +615,71 @@ function renderEngineLibrary() {
         ${globals.fields.map(row).join('')}</details>`
     : '';
   renderLibrary(ENGINE_LIBRARY, slots + globalsBlock);
+}
+
+/** 试连 LLM：真发一次请求并量出首句延迟（§6.2 常规级，零确认）。
+ *
+ * 参数取**当前选中 LLM** 的树值（含未保存改动），与旧页一致；密钥槽里的
+ * 新值也带上（用户在页面上刚换的密钥应当能立即测），掩码占位由后端剥掉。
+ * 后端 ``api/test-llm`` 拿页面值覆盖已保存配置——所以「改了还没保存」也能测。
+ *
+ * 请求最长等 60 秒（服务端 timeout 也是 60s）：LLM 网关不通时页面不能
+ * 静默挂着，必须把「哪一步断了」的报错原样带回来。
+ */
+async function testLLM() {
+  const eng = getPath(state, 'selected_module.LLM');
+  const btn = $('llmTestBtn');
+  const box = $('llmTestResult');
+  if (!btn || !box) return;
+  if (!eng) {
+    box.innerHTML = '<div class="err">未选中 LLM 引擎</div>';
+    return;
+  }
+  const cfg = Object.assign({}, getPath(state, 'LLM.' + eng) || {});
+  // 密钥槽里的新值（未落配置树，只存在页面内存）：一起送，否则「刚换的密钥」
+  // 测不到。掩码占位形态由后端识别并忽略。
+  for (const [path, value] of Object.entries(SECRET_INPUT)) {
+    if (path.startsWith('LLM.' + eng + '.')) {
+      cfg[path.slice(('LLM.' + eng + '.').length)] = value;
+    }
+  }
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ 测试中…';
+  box.innerHTML = '<span>已发出请求，最长等 60 秒…</span>';
+  try {
+    const r = await fetch('/xiaozhi/config/api/test-llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ engine: eng, config: cfg }),
+    });
+    const d = await r.json().catch(() => null);
+    if (!d) throw new Error('HTTP ' + r.status);
+    if (!d.ok) {
+      box.innerHTML = `<div class="err">❌ 未接通：${esc(d.error || '测试失败')}</div>`;
+      return;
+    }
+    const ms = (v) => (v === null || v === undefined) ? '—' : v + ' ms';
+    const empty = d.reply ? ''
+      : `<div class="warn">⚠ 只思考、没正文：思考 token 计入 max_tokens，`
+        + `当前上限 ${d.max_tokens ?? '未设置'}，请调大 max_tokens 或降低推理级别。</div>`;
+    box.innerHTML = `
+      <div class="kv">
+        <span>✅ 已接通</span>
+        <span>模型 ${esc(d.model || '-')}</span>
+        <span>推理 ${esc(d.reasoning_effort || '-')}</span>
+        <span>首字节 ${ms(d.first_chunk_ms)}</span>
+        <span>首句 ${ms(d.first_content_ms)}</span>
+        <span>总耗时 ${ms(d.total_ms)}</span>
+        <span>思考 ${d.reasoning_chars || 0} 字</span>
+      </div>
+      ${d.reply ? `<div class="reply">${esc(d.reply)}</div>` : ''}${empty}`;
+  } catch (e) {
+    box.innerHTML = `<div class="err">❌ 请求失败：${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -884,14 +979,15 @@ function toolsGroupCard(g, domainHasCommon) {
  *      hello 协商 / 节奏与时区——就是普通域页的 `groupCard`。
  *   2. **运行时面**（在线设备 / 固件库 / SmartConfig）+ **常驻摄像头入口**：
  *      面板声明由服务端注入（单一事实源 `page_domains.DEVICES_RUNTIME`），
- *      本模块只管把它们画出来并接上**旧页面已有的接口**。
+ *      本模块只管把它们画出来并接上两个既有接口（`api/devices` /
+ *      `api/firmware*` / `api/smartconfig`，均保留）。
  *
  * 为什么运行时面不写成域表里的字段：它们没有可保存的值——在线设备是运行态，
  * 上传/删除固件与配网广播是物理副作用。把它们当成字段会进脏列表、会进保存
  * 请求，而服务端根本没地方接受它们。
  *
  * 迁移口径（#29）：从旧 `config_page.html` 的「设备与固件（OTA）」区与
- * 「SmartConfig 设备配网」区搬过来，「操作顺序」等文案照抄。
+ * 「SmartConfig 设备配网」区搬过来，#31 收线后旧页已删除，这里是唯一实现。
  *
  * **危险分级与统一确认层在 #30 落地**（父 spec §6）：三个运行时操作按 §6.2
  * 落位表归级（重启设备动态升/降、上传/删除固件为危险），确认走壳注入的
@@ -980,8 +1076,8 @@ const RUNTIME_BODIES = {
 };
 
 function bindRuntimePanels() {
-  // 面板里的按钮走内联 onclick（与旧页面同一先例），所以这里把几个只在设备域
-  // 存在的函数挂到 window 上（模块作用域不自动挂 window）。
+  // 面板里的按钮走内联 onclick（#29 从旧页搬来的先例：模块作用域不自动
+  // 挂 window），所以这里把几个只在设备域存在的函数挂到 window 上。
   window.refreshOta = refreshOta;
   window.uploadFirmware = uploadFirmware;
   window.deleteFirmware = deleteFirmware;
@@ -990,7 +1086,7 @@ function bindRuntimePanels() {
   window.sendSmartConfig = sendSmartConfig;
 }
 
-/* ---- 运行时面：在线设备 + 固件库（搬自 config_page.html 的「设备与固件」区） ----
+/* ---- 运行时面：在线设备 + 固件库（#29 从旧八组页面搬进来）----
  *
  * 危险分级（#30，父 spec §6）在这一节落地。三个操作按 §6.2 落位表归级：
  *
@@ -1000,13 +1096,15 @@ function bindRuntimePanels() {
  *   - 上传固件：危险（武装自动升级链，ADR-0002）；
  *   - 删除固件：危险（信息永失），且**额外输入固件版本号**才能确认（§6.3）。
  *
- * ⚠️ 漂移风险：旧八组页面（``config_page.html``）的同名函数**仍在线上**
- * （``/xiaozhi/config/`` 在 #31 收线前继续保持可访）。两份共用同一份
- * ``config_danger_model.js`` 与同一件确认层（壳注入），所以分级判定与视觉
- * 编码不会分叉；两边的差别只剩「面板长什么样」。
+ * 单一实现（#31 收线已发生）：旧八组页面（``config_page.html``）的同名函数
+ * （``refreshOta`` / ``rebootDevice`` / ``uploadFirmware`` / ``deleteFirmware`` /
+ * ``sendSmartConfig`` / ``restartServer``）已随旧页**一并删除**，这里就是
+ * 唯一实现。#30 末尾在这里标过的「两份仍在线、修行为要改两处」已失效；
+ * 今后改这六个函数的行为只需改这一处（对应的防静默分叉计数断言在
+ * ``test_config_danger_seam.py`` 里钉住）。
  *
- * 两个请求并发（旧页面就是 `Promise.all`），但**各自报自己的错**：
- * 旧页面用一个 try 把两次请求绑死，结果是「设备列表超时 → 固件库也空了」。
+ * 两个请求并发（旧页就是 `Promise.all`），但**各自报自己的错**：
+ * 旧页用一个 try 把两次请求绑死，结果是「设备列表超时 → 固件库也空了」。
  */
 
 /** 运行时面缓存：两个列表的最近一次结果。
@@ -1235,7 +1333,7 @@ async function deleteFirmware(filename) {
   }
 }
 
-/* ---- 运行时面：SmartConfig 配网（搬自 config_page.html 的配网区） ---- */
+/* ---- 运行时面：SmartConfig 配网（#29 从旧八组页面搬进来；#31 后是唯一实现） ---- */
 
 /** Wi-Fi 自动填充：先问服务端（系统钥匙串），读不到再回落上次手输的凭据。 */
 async function autofillWifi() {
@@ -1738,9 +1836,13 @@ window.__xzhDirtyGuard = {
   paths: () => Object.keys(DIRTY).sort(),
 };
 
-/* 内联 onclick 的显式桥（与旧页面同一先例：模块作用域不自动挂 window）。 */
+/* 内联 onclick 的显式桥（#29 从旧页搬来的先例：模块作用域不自动挂 window）。 */
 window.xzhSave = saveAll;
 window.xzhRestart = restartServer;
+/* 「试连 LLM」按钮的内联 onclick（§6.2 常规级，零确认）：模块作用域不自动
+   挂 window，与上面几个同一先例。它是引擎域独有的，但挂在**模块顶层**而不是
+   域判断分支里——它是引擎域页的固定控件，不需要等某个面板绑定才可达。 */
+window.testLLM = testLLM;
 /* 确认层可由控制台或外部脚本直接调用（调试口径与审计口径同一条）。 */
 window.xzhConfirmDanger = confirmDanger;
 

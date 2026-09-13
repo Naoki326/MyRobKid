@@ -68,13 +68,12 @@ class ConfigApiContract(AioHTTPTestCase):
         (project / "config").mkdir()
         # 页面与状态模型用真实文件：路由的交付路径（含 MIME）必须被测到，
         # 存根 HTML 只能证明“路由存在”，证明不了“页面真的能加载模块”。
+        # #31 收线后旧八组页面已删除——这里不再拷它（文件已不在仓库里）。
         real_config = SERVER_ROOT / "config"
-        (project / "config" / "config_page.html").write_text(
-            (real_config / "config_page.html").read_text(encoding="utf-8"),
-            encoding="utf-8")
-        (project / "config" / "config_state_model.js").write_text(
-            (real_config / "config_state_model.js").read_text(encoding="utf-8"),
-            encoding="utf-8")
+        for name in ("config_state_model.js", "config_domain_page.js"):
+            (project / "config" / name).write_text(
+                (real_config / name).read_text(encoding="utf-8"),
+                encoding="utf-8")
         _write_yaml(project / "config.yaml", {
             "server": {"ip": "0.0.0.0", "port": 8002},
             "LLM": {
@@ -115,9 +114,10 @@ class ConfigApiContract(AioHTTPTestCase):
         self.handler = ConfigHandler({}, str(project))
         app = web.Application()
         app.add_routes([
-            web.get("/xiaozhi/config/", self.handler.handle_page),
             web.get("/xiaozhi/config/config_state_model.js",
                     self.handler.handle_state_model),
+            web.get("/xiaozhi/config/config_domain_page.js",
+                    self.handler.handle_domain_page_script),
             web.get("/xiaozhi/config/api/full", self.handler.handle_full),
             web.post("/xiaozhi/config/api/save", self.handler.handle_save),
         ])
@@ -292,7 +292,7 @@ class ConfigApiContract(AioHTTPTestCase):
         正是本票要根除的那个 bug 的另一条路径。
 
         路径必须是**页面 getPath 认识的**形态：页面用 ``context_providers.0``
-        点号索引渲染（config_page.html 的 engFields 调用），不是 ``[0]``。
+        点号索引渲染（域页的字段渲染调用），不是 ``[0]``。
         信号给了但查不到，等于没给 —— 所以这里直接钉路径形状。
         """
         body = await self._full()
@@ -340,12 +340,26 @@ class ConfigApiContract(AioHTTPTestCase):
         self.assertIn("computeDirty", body)
 
     async def test_page_loads_the_state_model_module(self):
-        """页面必须以 module 方式引入状态模型（否则 import 语句直接语法错）。"""
-        resp = await self.client.request("GET", "/xiaozhi/config/")
+        """域页脚本必须以 module 方式引入状态模型（否则 import 语句直接语法错）。
+
+        #31 收线后旧八组页面已删除（它当年用 ``<script type="module">`` 直
+        接引入状态模型）。现在的唯一消费方是域页脚本——它自己就是 ES 模块，
+        靠 ``from './config_state_model.js'`` 引入。所以这条契约从「页面 HTML
+        里有 ``type="module"``」改成「域页脚本 import 状态模型」：断言的
+        **意图**（页面消费同一份状态模型）没变，只是承载它的文件变了。
+        """
+        resp = await self.client.request(
+            "GET", "/xiaozhi/config/config_domain_page.js")
         self.assertEqual(resp.status, 200)
-        html = await resp.text()
-        self.assertIn('type="module"', html)
-        self.assertIn("./config_state_model.js", html)
+        self.assertIn("javascript", resp.headers["Content-Type"])
+        js = await resp.text()
+        self.assertIn("from './config_state_model.js'", js,
+                      "域页脚本必须 import 同一份状态模型（不是自己另写一套）")
+        # 状态模型本身仍以模块形式可交付（消费方 import 得到的前提）。
+        resp = await self.client.request(
+            "GET", "/xiaozhi/config/config_state_model.js")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("javascript", resp.headers["Content-Type"])
 
 
 if __name__ == "__main__":

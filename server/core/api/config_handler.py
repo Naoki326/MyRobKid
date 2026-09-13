@@ -4,10 +4,15 @@ config_handler.py — 轻量配置页后端（读 / 改 data/.config.yaml）
 路由（挂载在 8003 aiohttp，nginx 8080 以 /xiaozhi/config/ 反代）：
 
 页面（父 spec §8.1 的 slug 是**用户契约**，ADR-0012）：
-- GET  /xiaozhi/config/           旧八组配置页（本票 expand 阶段原样保留）
-- GET  /xiaozhi/config/<slug>/   域页（dialogue / system 有内容，其余为占位页）
+- GET  /xiaozhi/config/           **302** 到首域 dialogue（§4.1）——旧入口兑底，
+                                  不是规范形，所以是 302 而不是 301
+- GET  /xiaozhi/config/<slug>/   域页（五域全部上线）
 - GET  /xiaozhi/config/raw/      逃生口：整份原始配置，只读一页看完
 - 无尾斜杠形态 301 到规范形（**应用层发**，不依赖仓库外的 nginx 配置）
+
+旧八组配置页（``config/config_page.html``）已在 #31 收线时**退役删除**——
+它的全部能力已由五域页覆盖（§7 的 527 字段零丢失），
+包括从它迁到引擎域的「试连 LLM」（§6.2）。
 
 接口：
 - POST /xiaozhi/config/api/auth   兼容接口（直接放行）
@@ -36,8 +41,8 @@ from core.api.base_handler import BaseHandler
 from core.utils import device_registry
 
 # 页面外壳与字段归属表（父 spec §4.2 的「服务端共享模板」与 §7 的机械复算）。
-# 放在 server/config/ 而不是 core/api/：它们是页面渲染资产，与 config_page.html
-# 同居，改页面不用动 handler。
+# 放在 server/config/ 而不是 core/api/：它们是页面渲染资产，与页面骨架同居，
+# 改页面不用动 handler。
 from config import config_shell as shell
 from config import page_domains
 
@@ -344,29 +349,30 @@ class ConfigHandler(BaseHandler):
 
     # ---------------- 路由处理 ----------------
 
-    async def handle_page(self, request):
-        """旧八组配置页 HTML（自包含，外链两个 ES 模块）。
+    async def handle_config_root_default(self, request):
+        """``/xiaozhi/config/`` → **302** 到首域（对话与角色）（§4.1）。
 
-        旧页自带骨架与样式（它是 #31 收线前仍然在线的副本），但**危险分级
-        与统一确认层是壳级共享资产**（父 spec §6.5）：服务端在这里把
-        ``config_shell`` 的同一份 CSS/HTML/JS 注进占位符，两页共用一套
-        分级视觉与确认层——而不是在旧页里再写一份。
+        为什么是 302 而不是 301（方案 §4.1 原文：「``/xiaozhi/config/`` **302
+        到首域**（对话与角色居首）——旧链接/书签/手输不 404，nginx 与 8003
+        直连两条路都覆盖（302 由应用层发，不依赖 nginx）」）：
+
+        - 它是**旧入口的兑底**，不是新页面的规范形——根路径从来就不曾是一个
+          规范形 URL。301 会让浏览器把「对话与角色」当成根路径的永久身份
+          缓存下来，把一次入口跳转说成一条长期契约；
+        - 而域页的**尾斜杠** 301（``/xiaozhi/config/dialogue`` → 加斜杠）
+          有规范形身份，所以它用 301（§8.2）。两者情形不同，机制也不同，
+          不是笔误。
+
+        302 由应用层发：不依赖仓库外的 nginx（§8.5）。
         """
-        html_path = Path(self.project_dir) / "config" / "config_page.html"
-        if not html_path.exists():
-            return web.Response(text="config_page.html not found", status=404)
-        html = html_path.read_text(encoding="utf-8")
-        for name, value in (
-            ("__CONFIRM_CSS__", shell.CONFIRM_CSS),
-            ("__CONFIRM_JS__", shell.SHELL_CONFIRM_JS),
-            ("__CONFIRM__", shell.CONFIRM_HTML),
-        ):
-            html = html.replace(name, value)
-        return web.Response(
-            text=html,
-            content_type="text/html",
-            charset="utf-8",
-        )
+        target = shell.page_url(shell.FIRST_DOMAIN_SLUG)
+        if request.query_string:
+            target += "?" + request.query_string
+        return web.HTTPFound(location=target)
+
+    # ``handle_page`` 曾在 ``/xiaozhi/config/`` 渲染旧八组页面（1133 行
+    # ``config_page.html``）。#31 收线后旧页与其运行时面副本一并删除，
+    # 这里改发 302——**不再有任何代码路径渲染旧页**。
 
     async def handle_state_model(self, request):
         """页面状态模型（无 DOM 依赖的 ES 模块）。
@@ -397,9 +403,11 @@ class ConfigHandler(BaseHandler):
     async def handle_danger_model(self, request):
         """危险分级模型（无 DOM 依赖的 ES 模块，父 spec §6）。
 
-        与 ``config_state_model.js`` 同一机制：两份在线副本（新设备域页 /
-        旧八组页面）共用同一份分级判定与后果文案——分级只有一处实现，
-        两页的表现才不会分叉。"""
+        与 ``config_state_model.js`` 同一机制。``config_danger_model.js`` 是
+        分级判定与后果文案的**唯一实现**：新设备域页、引擎域页（搬来的
+        「试连 LLM」也走这份表）与两个库共用它。#31 收线前它曾同时喂两份
+        在线副本（旧八组页面 + 新域页）；旧页退役后这份资产本身不变，
+        消费方从两页变成唯一一套页面。"""
         js_path = Path(self.project_dir) / "config" / "config_danger_model.js"
         if not js_path.exists():
             return web.Response(text="config_danger_model.js not found", status=404)
@@ -522,8 +530,9 @@ class ConfigHandler(BaseHandler):
     def _render_escape_page(self, skeleton: str) -> web.Response:
         """逃生口只读页：一页看完**整份**原始配置（§4.3）。
 
-        与旧页面的「全部配置」是同一份数据、同一个读取路径（api/full 的掩码树），
-        但它是**独立页 + 侧栏底部的非域入口**，不是侧栏第六域。没有动作区 ——
+        与旧页面当年那个「全部配置」区是同一份数据、同一个读取路径（api/full
+        的掩码树）；#31 收线后旧页已删除，这里成为「整份原始配置」的唯一出口。
+        它是**独立页 + 侧栏底部的非域入口**，不是侧栏第六域。没有动作区 ——
         只读页没有可保存的对象（§4.2）。
         """
         body = (

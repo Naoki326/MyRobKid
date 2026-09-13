@@ -466,12 +466,16 @@ test('引擎域的三段路径仍按选中分（边界没有被放宽掉）', ()
   assert.equal(classifyDirty('TTS.MlxTTS.speed', { TTS: 'MlxTTS' }, ENGINE_CATEGORIES), 'active');
 });
 
-test('不传类目集合时逐字保持旧口径（旧页面调用形态，不得静默改行为）', () => {
+test('不传类目集合时逐字保持旧口径（兼容契约，不得静默改行为）', () => {
   // 引擎路径：仍按选中分。
   assert.equal(classifyDirty('LLM.DoubaoLLM.max_tokens', { LLM: 'ThirkingLLM' }), 'staged');
   assert.equal(classifyDirty('LLM.ThirkingLLM.max_tokens', { LLM: 'ThirkingLLM' }), 'active');
   // 非引擎路径：旧口径一律 staged；这里易错成 'active'（域页的新口径是
-  // 传了类目集合才生效的），旧页面不传参数就拿到新行为 = 静默回归。
+  // 传了类目集合才生效的），不传参数就拿到新行为 = 静默回归。
+  //
+  // #31 收线后，生产代码里已没有不传参的调用方（旧八组页面已删）——
+  // 这条守的是一条**有意的兼容契约**，不是活着的页面行为。保留它是为了
+  // 「签名将来收成单一 context 对象」时不把一个已声明的口径默默改掉。
   assert.equal(classifyDirty('prompt', {}), 'staged',
     '旧口径：短路径也当「当前不生效」');
   assert.equal(classifyDirty('log.log_level', {}), 'staged',
@@ -647,7 +651,8 @@ test('引擎卡上的密钥条目永不显示值（三态都要守住）', () =>
 
 test('引擎域的分组重算对类目集合敏感：非引擎路径不受选中影响', () => {
   // 引擎域页必须传类目集合；不传时 `selected_module` 之外的散字段会被旧口径
-  // 扫进 staged（那是旧页面的行为）。引擎域里散字段（tts_timeout）属 active。
+  // 扫进 staged（那是历史口径，见上面对应的兼容契约用例）。
+  // 引擎域里散字段（tts_timeout）属 active。
   const dirty = { tts_timeout: { kind: 'param', from: 15, to: 30 } };
   assert.equal(classifyDirty('tts_timeout', { TTS: 'MlxTTS' }, ENGINE_CATEGORIES),
     'active', '引擎全局参数不受某条引擎的选中影响');
@@ -747,7 +752,7 @@ test('不传工具域范围时逐字保持旧口径（引擎域页的调用形�
     '不传 tools 范围时不存在「插件未启用」的分组，散字段归 active');
   assert.equal(classifyDirty('Intent.function_call.functions', {}, ENGINE_CATEGORIES),
     'active');
-  // 旧页面口径（两个范围都不传）仍是逐字的老行为。
+  // 不传两个范围的旧口径仍是逐字的老行为（兼容契约，不是活着的页面）。
   assert.equal(classifyDirty('plugins.get_weather.api_key', {}), 'staged');
   assert.equal(classifyDirty('Intent.function_call.functions', {}), 'staged');
 });
