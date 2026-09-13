@@ -166,7 +166,12 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 }
 
 bool MqttProtocol::SendText(const std::string& text) {
+    // 与 WebsocketProtocol::SendText 同一个形状的静默早退（不设 error_、
+    // 不打日志）。MQTT 这条**不是** issue #32 的那个首要假设（那条指的是
+    // WebSocket 的 connected_），但两种传输各自静默丢掉消息时，串口上应当
+    // 给出同样的线索——设备走的哪条传输未必一眼看得出来。
     if (publish_topic_.empty()) {
+        ESP_LOGW(TAG, "SendText dropped (no publish topic)");
         return false;
     }
     if (!mqtt_->Publish(publish_topic_, text)) {

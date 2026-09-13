@@ -68,6 +68,17 @@ public:
     virtual void SendMcpMessage(const std::string& message);
 
 protected:
+    /*
+     * 发一条文本消息，并在发送失败时把**消息类型**记到串口（issue #32 的
+     * 诊断锚点）。
+     *
+     * 上面五个 sender 都是 void，`SendText` 的失败在此前无处可归——传输层
+     * 丢掉时不一定出声，调用方也拿不到返回值。于是「设备说发了、服务端没有」
+     * 这种情况在两侧都看不出原因。本函数不改变任何行为（不发重试、不改状态），
+     * 只补上「哪一类消息被丢了」这条线索，供与对端收到的类型对照。
+     */
+    void SendTextChecked(const std::string& message, const char* kind);
+
     std::function<void(const cJSON* root)> on_incoming_json_;
     std::function<void(std::unique_ptr<AudioStreamPacket> packet)> on_incoming_audio_;
     std::function<void()> on_audio_channel_opened_;

@@ -143,6 +143,10 @@ bool WebsocketProtocol::Start() {
 }
 
 bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
+    // 与 SendText 同一个静默早退，但**故意不加日志**：音频是每帧调用，一断
+    // 就是刷屏。复现 issue #32 时不要拿「音频也静默」当反证——先看 SendText
+    // 那几条（`Sending text:` / `SendText dropped (...)` / `Outgoing text
+    // dropped:`）。若需要音频侧的证据，请临时加，测完拆掉。
     if (websocket_ == nullptr || !websocket_->IsConnected()) {
         return false;
     }
@@ -175,7 +179,18 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
 }
 
 bool WebsocketProtocol::SendText(const std::string& text) {
-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+    // 这条早退从前是**静默**的：不设 error_、不打日志、不触发重连。于是
+    // 一次 TCP 断开就能把设备变成「出站消息悄无声息地丢掉」的哑巴（issue
+    // #32 的首要假设：主循环活着、本地动作照做，服务端却什么都没收到）。
+    //
+    // 保留 return false 不改行为（诊断锚点，不是修复）；但**必须**说清楚
+    // 是哪种原因——socket 已销毁与连接已断，是两条不同的排查方向。
+    if (websocket_ == nullptr) {
+        ESP_LOGW(TAG, "SendText dropped (no socket)");
+        return false;
+    }
+    if (!websocket_->IsConnected()) {
+        ESP_LOGW(TAG, "SendText dropped (disconnected)");
         return false;
     }
 
