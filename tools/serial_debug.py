@@ -53,18 +53,19 @@ def find_port() -> str:
 
 
 def open_port(port: str):
-    """打开串口但不复位（不碰 DTR/RTS）。"""
-    ser = serial.Serial()
-    ser.port = port
-    ser.baudrate = 115200
-    ser.timeout = 0.05
-    # 关键：打开前就禁止 DTR/RTS 动作
-    ser.dtr = False
-    ser.rts = False
-    ser.open()
-    ser.dtr = False
-    ser.rts = False
-    return ser
+    """打开串口但不复位（**一行都不碰** DTR/RTS）。
+
+    这里从前会写 ``ser.dtr = False; ser.rts = False``（open 前后各一次），
+    以为「主动拉低就是不动信号」——错了：那会产生一次从默认电平到指定电平
+    的**跳变**，ESP32 的 USB 转串口正是用 DTR/RTS 跳变做自动复位的，于是
+    每次开录都按了一次 RST。实测（2026-09）：这样开会记到
+    ``rst:0x15 (USB_UART_CHIP_RESET)``，而裸 open 不会。
+
+    对一个「跨复位记录完整时间线、为复现故障而写」的工具来说，这是最伤的
+    缺陷——它恰恰会把要观察的现场（卡死前的状态）毁在开录那一刻。所以与
+    ``serial_snapshot.py:70`` 同一纪律：只构造、只读、只关。
+    """
+    return serial.Serial(port, 115200, timeout=0.05)
 
 
 def hard_reset(port: str) -> bool:
