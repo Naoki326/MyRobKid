@@ -8,6 +8,11 @@
   - 起点超出源时长：交给 ffmpeg 自然产出空流（200 + audio/mpeg + 头部字节），
     本文件把该行为钉死为断言。
   - 非法起点（负数、非数字、非有限数）必须 400，不能是 200 空流。
+  - 上游打不开（404 / 拒连 / 防盗链读到 HTML）：必须在首字节窗口内给出 **502**
+    + JSON 错误，不能是 200 空流（设备收到 200 零数据只会干等 10s，还分不清
+    音源坏还是系统坏）。
+  - UA 策略：默认不发浏览器 UA（Calm Radio 这类见浏览器 UA 即 302 到网页），
+    仅调用方传 referer 时才附浏览器 UA（B 站 CDN 这类需要 UA+Referer 伪装）。
 
 运行：~/.hermes/hermes-agent/venv/bin/python -m unittest \
       plugins/music-mcp/tests/test_transcode_proxy.py -v
@@ -16,6 +21,7 @@
 import asyncio
 import http.server
 import io
+import json
 import math
 import os
 import re
@@ -26,6 +32,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -248,6 +255,220 @@ class TranscodeSeekContract(unittest.TestCase):
                 return await client.get(f"/stream?src={self.src_url}")
         r = asyncio.run(run())
         self.assertEqual(r.status_code, 400)
+
+
+class UpstreamFailureContract(unittest.TestCase):
+    """上游打不开时 /stream 必须快速失败（502 + JSON），不能是 200 空流。
+
+    实测 ffmpeg 退出码：404→8、拒连→195、防盗链读到 HTML→183；均在 <50ms 内
+    退出。起点超源时长则是 exit 0（合法空流，见 TranscodeSeekContract）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not have_ffmpeg():
+            raise unittest.SkipTest("ffmpeg 不可用")
+
+    def _fetch_src(self, src: str):
+        """只放行 SSRF 守卫，让请求真正到达 ffmpeg。"""
+        q = urllib.parse.quote(src, safe="")
+
+        async def run():
+            transport = httpx.ASGITransport(app=qqmusic_auth_server.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://proxy.test") as client:
+                return await client.get(f"/stream?src={q}")
+
+        with mock.patch.object(qqmusic_auth_server, "_src_host_is_safe", lambda u: True):
+            return asyncio.run(run())
+
+    def test_unreachable_upstream_returns_502(self):
+        """连接被拒（端口无监听）：502 + JSON 错误，不是 200 空流。"""
+        r = self._fetch_src("http://127.0.0.1:9/none.mp3")
+        self.assertEqual(r.status_code, 502, r.content[:400])
+        body = r.json()
+        self.assertIn("error", body)
+        self.assertIn("ffmpeg exited with code", body.get("detail", ""))
+
+    def test_upstream_404_returns_502(self):
+        """上游 404：502 + JSON 错误，且错误里说明是打不开而非空内容。"""
+        srv = _TempStaticServer()
+        try:
+            url = f"http://127.0.0.1:{srv.port}/missing.mp3"
+            r = self._fetch_src(url)
+        finally:
+            srv.close()
+        self.assertEqual(r.status_code, 502, r.content[:400])
+        body = r.json()
+        self.assertIn("error", body)
+        # 错误信息应带 ffmpeg 的 stderr 摘要（含 404 字样），不是笼统一句话。
+        self.assertIn("404", json.dumps(body, ensure_ascii=False))
+
+    def test_upstream_returns_html_not_audio_returns_502(self):
+        """上游返回网页（防盗链 302 到 HTML 的等价场景）：502，不是 200 空流。"""
+        srv = _TempStaticServer()
+        try:
+            url = f"http://127.0.0.1:{srv.port}/index.html"
+            r = self._fetch_src(url)
+        finally:
+            srv.close()
+        self.assertEqual(r.status_code, 502, r.content[:400])
+        self.assertIn("error", r.json())
+
+
+class UAStrategyContract(unittest.TestCase):
+    """UA 策略：默认不发浏览器 UA；只在调用方传 referer 时才发。
+
+    实测依据（curl/ffmpeg，2026-09-13）：
+      - Calm Radio（http://streams.calmradio.com:1228/）：无 UA → 200 音频流；
+        浏览器 UA → 302 index.html?sid=1 → ffmpeg 零产出。
+      - B 站 CDN（bilivideo）：无 UA → 403；仅 UA（无 Referer）→ 403；
+        UA + Referer → 200。
+    """
+
+    BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+
+    def _cmd(self, src="http://example.com/a.mp3", referer=None):
+        return qqmusic_auth_server._build_ffmpeg_cmd(src, referer, None, None)
+
+    def test_no_referer_sends_no_browser_ua(self):
+        """无 referer：命令行里不得出现 -headers，也不得出现浏览器 UA。"""
+        cmd = self._cmd(referer=None)
+        joined = " ".join(cmd)
+        self.assertNotIn("-headers", cmd, "无 referer 不应传 -headers（应用 ffmpeg 默认 UA）")
+        self.assertNotIn("User-Agent", joined, "无 referer 不应发浏览器 UA（会打挂 Calm Radio）")
+        self.assertNotIn("Mozilla/5.0", joined)
+
+    def test_referer_sends_browser_ua_and_referer(self):
+        """有 referer：同时发浏览器 UA 与 Referer（B 站 CDN 需要两者）。"""
+        cmd = self._cmd(referer="https://www.bilibili.com")
+        self.assertIn("-headers", cmd)
+        joined = " ".join(cmd)
+        self.assertIn("User-Agent", joined)
+        self.assertIn(self.BROWSER_UA, joined)
+        self.assertIn("Referer: https://www.bilibili.com", joined)
+
+    def test_build_headers_is_none_without_referer(self):
+        """_build_headers 无 referer 返回 None（调用方据此决定是否加 -headers）。"""
+        self.assertIsNone(qqmusic_auth_server._build_headers(None))
+        self.assertIsNone(qqmusic_auth_server._build_headers(""))
+        h = qqmusic_auth_server._build_headers("https://example.com")
+        self.assertIsNotNone(h)
+        self.assertIn("User-Agent", h)
+        self.assertIn("Referer: https://example.com", h)
+
+    def test_ua_policy_end_to_end_over_real_http(self):
+        """端到端：起本地假上游记录收到的请求头，验证代理真的按策略发/不发 UA。
+
+        这是行为断言（上游看到什么），不是拼接字符串的自证。
+        """
+        srv = _HeaderEchoServer()
+        try:
+            # 无 referer：上游不应看到 User-Agent 里的 Mozilla。
+            r = self._fetch(f"http://127.0.0.1:{srv.port}/tone.mp3")
+            self.assertEqual(r.status_code, 200, r.content[:300])
+            seen = srv.last_headers.get("user-agent", "")
+            self.assertNotIn("Mozilla", seen,
+                             f"无 referer 时不能发浏览器 UA，上游实收 {seen!r}")
+
+            # 有 referer：上游应看到浏览器 UA 与 Referer。
+            r = self._fetch(f"http://127.0.0.1:{srv.port}/tone.mp3",
+                            referer="https://www.bilibili.com")
+            self.assertEqual(r.status_code, 200, r.content[:300])
+            self.assertIn("Mozilla", srv.last_headers.get("user-agent", ""))
+            self.assertEqual(srv.last_headers.get("referer"), "https://www.bilibili.com")
+        finally:
+            srv.close()
+
+    def _fetch(self, src: str, referer: str | None = None):
+        q = urllib.parse.quote(src, safe="")
+        if referer:
+            q += "&referer=" + urllib.parse.quote(referer, safe="")
+
+        async def run():
+            transport = httpx.ASGITransport(app=qqmusic_auth_server.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://proxy.test") as client:
+                return await client.get(f"/stream?src={q}")
+
+        with mock.patch.object(qqmusic_auth_server, "_src_host_is_safe", lambda u: True):
+            return asyncio.run(run())
+
+
+class _TempStaticServer:
+    """临时静态 HTTP 服务：用于制造 404 与「返回 HTML」的上游。"""
+
+    def __init__(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="music-proxy-upstream-")
+        root = Path(self.tmp.name)
+        (root / "index.html").write_text(
+            "<!DOCTYPE html><html><body>anti-hotlink landing page</body></html>")
+
+        outer = self
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=str(root), **kw)
+
+            def log_message(self, *args):
+                pass
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self.srv = Server(("127.0.0.1", 0), Handler)
+        self.port = self.srv.server_address[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.tmp.cleanup()
+
+
+class _HeaderEchoServer:
+    """假上游：记录最近一次请求头，并返回一段真实 mp3（供 UA 端到端断言）。"""
+
+    def __init__(self):
+        self.last_headers: dict[str, str] = {}
+        self.tmp = tempfile.TemporaryDirectory(prefix="music-proxy-echo-")
+        self.audio = Path(self.tmp.name) / "tone.mp3"
+        subprocess.run(
+            [FFMPEG, "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=3", "-b:a", "32k", str(self.audio)],
+            check=True,
+        )
+        data = self.audio.read_bytes()
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):  # noqa: N802
+                outer.last_headers = {k.lower(): v for k, v in self.headers.items()}
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self.srv = Server(("127.0.0.1", 0), Handler)
+        self.port = self.srv.server_address[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.tmp.cleanup()
 
 
 if __name__ == "__main__":

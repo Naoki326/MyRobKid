@@ -123,6 +123,94 @@ def _fmt_seconds(seconds: float) -> str:
     return f"{seconds:.6f}".rstrip("0").rstrip(".")
 
 
+def _build_headers(referer: str | None) -> str | None:
+    """构造 ffmpeg -headers 值；返回 None 表示不传 -headers（用 ffmpeg 默认 UA）。
+
+      UA 策略（不要退回「硬编码浏览器 UA」，那会打挂 Calm Radio）：
+      - 默认**不发** User-Agent，让 ffmpeg 用自己的默认 UA。实测 Calm Radio
+        （http://streams.calmradio.com:1228/）对浏览器 UA 做防盗链：
+        无 UA → 200 音频流；带浏览器 UA → 302 到 index.html?sid=1 → ffmpeg
+        读 HTML 报 400/Invalid data，零产出。
+      - 仅在调用方显式传了 referer 时才附浏览器 UA：B 站 CDN（bilivideo）
+        只认「浏览器 UA + Referer」组合——实测无 UA 与仅有 UA（无 Referer）
+        都是 403，UA+Referer 才是 200。这类源本就要求伪装，附上 UA 是对的。
+      - 调用方要为自己的源负责：带 referer 的源必须真的需要 UA 伪装。
+    """
+    if not referer:
+        return None
+    return (
+        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"
+        f"Referer: {referer}\r\n"
+    )
+
+
+def _build_ffmpeg_cmd(src: str, referer: str | None,
+                      start_s: float | None, trim_s: float | None) -> list[str]:
+    """拼装 ffmpeg 转码命令（纯函数，方便测试断言 UA 策略）。"""
+    cmd = [
+        "/opt/homebrew/bin/ffmpeg", "-loglevel", "error",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+    ]
+    # 起点定位必须用输入定位（-ss 置于 -i 之前）：实测同一首歌全量转码 2.08s、
+    # 从 60s 定位 1.09s，产出时长与「总时长 − 60」偏差 0.0s；输出定位会先解码
+    # 丢弃，既慢又没有这个精度。起点超出源时长时交给 ffmpeg 自然产出空流。
+    # （契约测试：plugins/music-mcp/tests/test_transcode_proxy.py）
+    if start_s is not None:
+        cmd += ["-ss", _fmt_seconds(start_s)]
+    headers = _build_headers(referer)
+    if headers is not None:
+        cmd += ["-headers", headers]
+    cmd += ["-i", src,
+            # 设备（zhengchen-minicam）codec 输出 24kHz：直出 24k 单声道，
+            # 免掉设备端 44.1k→24k 软件重采样（CPU 大头），解码量也减半；
+            # 24k 单声道 64kbps 已接近透明，还省一半网络吞吐。
+            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "24000", "-b:a", "64k"]
+    if trim_s is not None:
+        # 裁剪时长（输出侧 -t）：自动化验收能在数秒内完成，不必下载整首剩余部分。
+        cmd += ["-t", _fmt_seconds(trim_s)]
+    cmd += ["-f", "mp3", "pipe:1"]
+    return cmd
+
+
+# 首字节等待窗口：ffmpeg 正常源约 15ms 出首字节，各类硬失败（404/拒连/读到 HTML）
+# 约 30-50ms 即以非零码退出；取 4s 给慢上游留足余量，仍远早于设备侧
+# kStartWaitTimeoutMs = 10000 的 10s 超时，代理能抢在设备放弃前给出结论。
+_FIRST_BYTE_TIMEOUT_S = 4.0
+
+
+def _ffmpeg_failure_reason(proc) -> str | None:
+    """判定 ffmpeg 是否「失败」。返回 None 表示成功或合法空流（保持 200）。
+
+      判据：**进程退出码**。
+      - 上游连不上/404/读到 HTML：ffmpeg 以非零码退出（实测 404→8、
+        302 防盗链→183、连接拒绝→195），stdout 零字节 → 判失败 → 502。
+      - 起点超出源时长：源有效、只是那段没内容，ffmpeg **退出码 0** 并
+        正常写出 mp3 头（实测 237 字节）→ 保持 200 空流（既有契约）。
+      - ffmpeg 仍在运行（慢上游）：不算失败，交给流继续。
+
+      这里刻意不以「零字节」判失败——合法空流也是零/极少字节；退出码才是
+      区分「源有效但无内容」与「源根本打不开」的可靠信号。stderr 已用于诊断
+      日志（见调用点），退出码用于判定。
+    """
+    if proc.returncode is None or proc.returncode == 0:
+        return None
+    return f"ffmpeg exited with code {proc.returncode}"
+
+
+async def _read_stderr(proc) -> str:
+    """尽力读取 ffmpeg stderr 作为诊断摘要；失败不抛出。
+
+    仅在进程已退出或被 kill 后调用（否则空 pipe 上等待会挂住）。
+    """
+    try:
+        if proc.stderr is None:
+            return ""
+        data = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+        return (data or b"").decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
 @app.get("/stream")
 async def transcode_stream(
     src: str = Query(...),
@@ -139,48 +227,64 @@ async def transcode_stream(
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    cmd = [
-        "/opt/homebrew/bin/ffmpeg", "-loglevel", "error",
-        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-    ]
-    headers = f"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"
-    if referer:
-        # B 站等 CDN 有 Referer 防盗链
-        headers += f"Referer: {referer}\r\n"
-    # 起点定位必须用输入定位（-ss 置于 -i 之前）：实测同一首歌全量转码 2.08s、
-    # 从 60s 定位 1.09s，产出时长与「总时长 − 60」偏差 0.0s；输出定位会先解码
-    # 丢弃，既慢又没有这个精度。起点超出源时长时交给 ffmpeg 自然产出空流。
-    # （契约测试：plugins/music-mcp/tests/test_transcode_proxy.py）
-    if start_s is not None:
-        cmd += ["-ss", _fmt_seconds(start_s)]
-    cmd += ["-headers", headers, "-i", src,
-            # 设备（zhengchen-minicam）codec 输出 24kHz：直出 24k 单声道，
-            # 免掉设备端 44.1k→24k 软件重采样（CPU 大头），解码量也减半；
-            # 24k 单声道 64kbps 已接近透明，还省一半网络吞吐。
-            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "24000", "-b:a", "64k"]
-    if trim_s is not None:
-        # 裁剪时长（输出侧 -t）：自动化验收能在数秒内完成，不必下载整首剩余部分。
-        cmd += ["-t", _fmt_seconds(trim_s)]
-    cmd += ["-f", "mp3", "pipe:1"]
+    cmd = _build_ffmpeg_cmd(src, referer, start_s, trim_s)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        # stderr 用 PIPE 抓取：失败时要把它作为诊断信息回报（不再是静默空流）。
+        stderr=asyncio.subprocess.PIPE,
     )
+
+    async def _kill():
+        if proc.returncode is None:
+            proc.kill()
+
+    # 先等首字节（带超时），据此区分「能出声」与「根本打不开」：
+    # 设备收到 200 零数据只会干等 10s 超时且分不清音源坏还是系统坏，
+    # 代理必须先给出明确结论。
+    first_chunk = b""
+    try:
+        first_chunk = await asyncio.wait_for(
+            proc.stdout.read(16 * 1024), timeout=_FIRST_BYTE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        await _kill()
+        stderr = await _read_stderr(proc)
+        return JSONResponse(
+            {"error": "上游在首字节窗口内无音频产出",
+             "detail": stderr or f"no data within {_FIRST_BYTE_TIMEOUT_S:g}s"},
+            status_code=502,
+        )
+
+    if not first_chunk:
+        # 已到达 EOF：等退出码落定再判定（响应头尚未发出，来得及改 502）。
+        await proc.wait()
+        reason = _ffmpeg_failure_reason(proc)
+        if reason is not None:
+            stderr = await _read_stderr(proc)
+            print(f"[stream] 502 {reason}: {stderr[:500]}", flush=True)
+            return JSONResponse(
+                {"error": "上游音频流无法打开", "detail": reason,
+                 "ffmpeg_stderr": stderr[-1000:]},
+                status_code=502,
+            )
+        # 合法空流（如起点超源时长）：保持既有 200 + audio 契约。
 
     async def gen():
         try:
+            if first_chunk:
+                yield first_chunk
             while True:
                 chunk = await proc.stdout.read(16 * 1024)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            if proc.returncode is None:
-                proc.kill()
+            await _kill()
+            await _read_stderr(proc)  # 排空 stderr 管道，避免 ffmpeg 阻塞在写 stderr
 
     return StreamingResponse(gen(), media_type="audio/mpeg")
+
 
 # ── 二维码会话（单用户，进程内存） ─────────────────────────────────
 _lock = asyncio.Lock()
