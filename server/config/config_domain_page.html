@@ -70,8 +70,8 @@ details.group.asdetails>div{padding:0 24px 18px}
 .runtime-actions input[type=text]{flex:1;min-width:180px}
 .runtime-list{padding:4px 0}
 .runtime-form{display:flex;flex-direction:column;gap:10px;max-width:520px}
-/* 危险视觉占位（§7 移交注记 4）：分级规则（三级 + 统一确认层）是 #30 的事，
-   这里只把「这是危险动作」这件事显出来，不改任何行为。 */
+/* 字段级危险标注（§7 移交注记 4）：它与**操作**的三级分级（§6.2，见
+   共享外壳的确认层）是两根轴——这里只把「这是危险动作」显出来。 */
 .danger-note{margin-top:8px;color:var(--err);font-size:12px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);border-radius:8px;padding:8px 12px;line-height:1.5}
 .row.danger-row .label{color:var(--err)}
 </style>
@@ -91,9 +91,15 @@ __TOPBAR__
 __SAVEBAR__
 <div id="dirtyPanel"></div>
 <div id="toast"></div>
+__CONFIRM__
 
 <!-- 域表：服务端注入（page_domains.py 的 JSON 形态），页面不硬编码字段归属 -->
 <script id="domain-schema" type="application/json">__SCHEMA_JSON__</script>
+<!--
+  危险分级模型（无 DOM 依赖的纯模块，node 缝跑）。两份在线副本
+  （设备域页 / 旧八组页面）共用同一份分级判定与后果文案。
+-->
+<script type="module" src="/xiaozhi/config/config_danger_model.js"></script>
 <!--
   路径写**绝对**前缀，不用 ``./config_domain_page.js``：
   规范 URL 是 ``/xiaozhi/config/<slug>/``（目录形式），相对路径会解析成

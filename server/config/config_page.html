@@ -131,6 +131,11 @@ details>div{padding:12px 14px}
   .topbar{padding:0 16px}
   .status{display:none}
 }
+/* ---- 共享外壳注入：危险分级与统一页内确认层（父 spec §6.4/§6.5）----
+   旧八组页面是自包含 HTML，但确认层是**壳级共享资产**（§6.5「共享外壳的一件
+   组件」）——服务端在 handle_page 里把同一份 CSS/JS/HTML 注进来，两页不各写
+   一遍。分级判定与后果文案来自共用的 config_danger_model.js（ES 模块）。 */
+__CONFIRM_CSS__
 </style>
 </head>
 <body>
@@ -155,13 +160,19 @@ details>div{padding:12px 14px}
 <!-- 保存操作栏 -->
 <div class="savebar show" id="saveBar">
   <button class="btn primary" id="saveBtn" onclick="saveAll()" disabled>💾 保存修改</button>
-  <button class="btn danger" onclick="restartServer()">♻️ 重启服务生效</button>
+  <button class="btn warn" data-danger-op="restart_server" data-danger-level="warning"
+    onclick="restartServer()">⚠ ♻️ 重启服务</button>
   <span class="info" id="saveInfo">暂无未保存修改</span>
 </div>
 <!-- 脏标记明细：按生效性分两组（父 spec §5.4），随选中实时重算 -->
 <div id="dirtyPanel" style="position:fixed;bottom:64px;left:220px;right:0;padding:0 32px 8px;font-size:12px;z-index:49"></div>
 
 <div id="toast"></div>
+<!-- 统一页内确认层（共享外壳的一件组件，§6.5） -->
+__CONFIRM__
+<!-- 危险分级模型（两份在线副本共用的唯一实现，父 spec §6） -->
+<script type="module" src="/xiaozhi/config/config_danger_model.js"></script>
+<script>__CONFIRM_JS__</script>
 
 <!-- type="module"：页面状态模型是外部 ES 模块（config_state_model.js，无 DOM 依赖，
      用 node:test 单跑）。模块作用域默认严格模式，函数声明仍是全局可用的
@@ -207,6 +218,12 @@ import {
   groupDirty, initialState, isSensitiveKey, placeholderText,
   setSecretInput,
 } from './config_state_model.js';
+// 危险分级（#30，父 spec §6）：**两份在线副本共用的唯一实现**。旧页与新设备域
+// 页调同一份纯函数算级别与后果文案，确认层由壳注入（同一件组件）。
+import {
+  LEVEL_VISUALS, confirmButtonText, levelOf, needsVersionTyping,
+  operationConsequences,
+} from './config_danger_model.js';
 
 /* 服务端给的存在信号：路径 → {configured}。密钥三态的唯一判据来源，
    绝不用正则猜掩码形态（那是两个同源显示 bug 的根因）。 */
@@ -384,12 +401,20 @@ function switchGroup(id){
   if (id==='ota') refreshOta();
 }
 
-/* ---------- 设备与固件（OTA） ---------- */
+/* ---------- 设备与固件（OTA） ----------
+ * 危险分级（#30，父 spec §6）在这一节落地。三个操作按 §6.2 落位表归级：
+ *   重启设备（动态：固件库有更新版本 → 危险）/ 上传固件（危险）/ 删除固件
+ *   （危险 + 输入固件版本号）。分级判定与后果文案来自共用的
+ *   config_danger_model.js，确认层是壳注入的那一件——**旧页与新设备域页
+ *   不各写一套**。§6.4 点名的三处严重度倒置在这里修复。
+ */
+const RUNTIME = { devices: [], firmwares: [] };
+
 function buildOta(){
   return `
   <div class="group">
     <h2>在线设备 <span class="badge" id="otaDevCount">…</span></h2>
-    <div class="desc">当前通过 WebSocket 连接到本服务器的设备。点击「重启并检查更新」，设备重启后会自动向服务器检查 OTA：若固件库中有更新版本则自动下载刷入。<br>设备空闲时会断开连接，若列表为空，请先唤醒设备（说唤醒词或按对话键）。</div>
+    <div class="desc">当前通过 WebSocket 连接到本服务器的设备。点击「重启并检查更新」，设备重启后会自动向服务器检查 OTA：若固件库中有更新版本则自动下载刷入——<b>库里确实有更高版本时，这个按钮会变成红色（危险级）</b>，因为那时它就是触发升级的扳机。<br>设备空闲时会断开连接，若列表为空，请先唤醒设备（说唤醒词或按对话键）。</div>
     <div id="otaDevices" style="padding:6px 0">加载中…</div>
     <div style="display:flex;gap:10px;margin-top:12px">
       <button class="btn" onclick="refreshOta()">🔄 刷新</button>
@@ -401,19 +426,58 @@ function buildOta(){
     <div id="otaFirmwares" style="padding:6px 0">加载中…</div>
     <div style="display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap">
       <input type="file" id="otaFile" accept=".bin" style="max-width:320px">
-      <button class="btn primary" id="otaUploadBtn" onclick="uploadFirmware()">⬆ 上传固件</button>
+      <button class="btn danger" id="otaUploadBtn" data-danger-op="upload_firmware" data-danger-level="danger"
+        title="危险：放进固件库 = 武装未来所有开机自检（ADR-0002）"
+        onclick="uploadFirmware()">⛔ ⬆ 上传固件</button>
     </div>
   </div>`;
 }
+
+/** 统一页内确认层（§6.5）：分级判定 + 后果文案在这里，视觉渲染在壳里。 */
+function confirmDanger(operation, context, opts){
+  const o = opts || {};
+  const level = levelOf(operation, context);
+  return window.xzhConfirm({
+    level,
+    title: o.title || '确认操作',
+    consequences: operationConsequences(operation, context),
+    confirmText: confirmButtonText(operation, context),
+    typeToConfirm: needsVersionTyping(operation) ? {
+      label: '输入固件版本号以确认',
+      value: (context.firmware && context.firmware.version) || '',
+      hint: '版本号在固件库列表里——这一步是故意的：删除不可逆，且不是正路运维（§6.3）。',
+    } : null,
+  });
+}
+
+function repaintDeviceRebootButtons(){
+  document.querySelectorAll('[data-danger-op="reboot_device"]').forEach(btn => {
+    const id = btn.dataset.deviceId || '';
+    const device = RUNTIME.devices.find(d => d.device_id === id) || { device_id: id };
+    const lvl = levelOf('reboot_device', { firmwares: RUNTIME.firmwares, device });
+    const vis = LEVEL_VISUALS[lvl];
+    btn.className = 'btn' + (vis.buttonClass ? ' ' + vis.buttonClass : '');
+    btn.dataset.dangerLevel = lvl;
+    btn.title = vis.icon
+      ? vis.label + '：' + operationConsequences('reboot_device',
+          { firmwares: RUNTIME.firmwares, device }).join(' ') : '';
+  });
+}
+
 async function refreshOta(){
   if (!$('otaDevices')) return;
-  try {
-    const [dev, fw] = await Promise.all([
-      api('/xiaozhi/config/api/devices'),
-      api('/xiaozhi/config/api/firmware'),
-    ]);
-    $('otaDevCount').textContent = dev.devices.length + ' 台';
-    $('otaDevices').innerHTML = dev.devices.length ? dev.devices.map(d=>`
+  const [dev, fw] = await Promise.all([
+    api('/xiaozhi/config/api/devices').then(d => ({ok:true, data:d}), e => ({ok:false, error:e.message})),
+    api('/xiaozhi/config/api/firmware').then(d => ({ok:true, data:d}), e => ({ok:false, error:e.message})),
+  ]);
+  if (dev.ok){
+    const devices = dev.data.devices || [];
+    RUNTIME.devices = devices;
+    $('otaDevCount').textContent = devices.length + ' 台';
+    $('otaDevices').innerHTML = devices.length ? devices.map(d => {
+      const lvl = levelOf('reboot_device', { firmwares: RUNTIME.firmwares, device: d });
+      const vis = LEVEL_VISUALS[lvl];
+      return `
       <div class="row">
         <div class="meta">
           <div class="label">${esc(d.device_id)}</div>
@@ -421,29 +485,45 @@ async function refreshOta(){
         </div>
         <div class="ctrl" style="display:flex;gap:10px;align-items:center">
           <span style="color:var(--ok);font-size:12px">● 在线</span>
-          <button class="btn danger" onclick="rebootDevice('${esc(d.device_id)}')"> ⟳ 重启并检查更新</button>
+          <button class="btn${vis.buttonClass ? ' ' + vis.buttonClass : ''}"
+            data-danger-op="reboot_device" data-danger-level="${esc(lvl)}"
+            data-device-id="${esc(d.device_id)}"
+            onclick="rebootDevice('${esc(d.device_id)}')">${vis.icon ? vis.icon + ' ' : ''}⟳ 重启并检查更新</button>
         </div>
-      </div>`).join('')
+      </div>`;
+    }).join('')
       : '<div style="color:var(--dim);padding:18px 0;font-size:13px">暂无在线设备 —— 设备空闲时会断开连接，唤醒后即会出现在这里</div>';
-    $('otaFwCount').textContent = fw.firmwares.length + ' 个';
-    $('otaFirmwares').innerHTML = fw.firmwares.length ? fw.firmwares.map(f=>`
+  } else {
+    $('otaDevices').innerHTML = `<div style="color:var(--err)">加载失败: ${esc(dev.error)}</div>`;
+  }
+  if (fw.ok){
+    const firmwares = fw.data.firmwares || [];
+    RUNTIME.firmwares = firmwares;
+    $('otaFwCount').textContent = firmwares.length + ' 个';
+    $('otaFirmwares').innerHTML = firmwares.length ? firmwares.map(f => `
       <div class="row">
         <div class="meta">
           <div class="label">${esc(f.model||'?')} <span style="color:var(--accent)">v${esc(f.version||'?')}</span></div>
           <div class="hint">${esc(f.filename)} · ${(f.size/1048576).toFixed(2)} MB · ${new Date(f.mtime*1000).toLocaleString()}</div>
         </div>
         <div class="ctrl" style="display:flex;gap:10px;align-items:center">
-          <button class="btn" onclick="deleteFirmware('${esc(f.filename)}')">🗑 删除</button>
+          <button class="btn danger" data-danger-op="delete_firmware" data-danger-level="danger"
+            onclick="deleteFirmware('${esc(f.filename)}')">⛔ 🗑 删除</button>
         </div>
       </div>`).join('')
       : '<div style="color:var(--dim);padding:18px 0;font-size:13px">固件库为空</div>';
-  } catch(e){
-    $('otaDevices').innerHTML = `<div style="color:var(--err)">加载失败: ${esc(e.message)}</div>`;
-    $('otaFirmwares').innerHTML = '';
+    // 固件列表更新后设备行的级别可能变了 —— 两处都重算才不会自相矛盾。
+    if (dev.ok) repaintDeviceRebootButtons();
+  } else {
+    $('otaFirmwares').innerHTML = `<div style="color:var(--err)">加载失败: ${esc(fw.error)}</div>`;
   }
 }
+
 async function rebootDevice(deviceId){
-  if (!confirm(`确定重启设备 ${deviceId}？\n设备重启后若固件库有更新版本将自动升级。`)) return;
+  const device = RUNTIME.devices.find(d => d.device_id === deviceId) || { device_id: deviceId };
+  const ok = await confirmDanger('reboot_device', { firmwares: RUNTIME.firmwares, device },
+    { title: `重启设备 ${deviceId}` });
+  if (!ok) return;
   try {
     const r = await fetch(`/xiaozhi/ota/reboot?device_id=${encodeURIComponent(deviceId)}`, {method:'POST'});
     const d = await r.json();
@@ -454,11 +534,20 @@ async function rebootDevice(deviceId){
     toast('重启失败: '+e.message, 'err');
   }
 }
+
 async function uploadFirmware(){
   const inp = $('otaFile');
   if (!inp.files.length){ toast('请先选择 .bin 固件文件', 'err'); return; }
+  const file = inp.files[0];
+  // 目标固件版本从文件名推（后端命名契约：型号_版本.bin）。
+  const m = /^(.+)_([^_]+)\.bin$/.exec(file.name);
+  const pendingFirmware = { filename: file.name, model: m ? m[1] : '', version: m ? m[2] : '' };
+  const ok = await confirmDanger('upload_firmware',
+    { devices: RUNTIME.devices, firmwares: RUNTIME.firmwares, pendingFirmware },
+    { title: `上传固件 ${file.name}` });
+  if (!ok) return;
   const fd = new FormData();
-  fd.append('file', inp.files[0]);
+  fd.append('file', file);
   const btn = $('otaUploadBtn'); btn.disabled = true; btn.textContent = '⬆ 上传中…';
   try {
     const r = await fetch('/xiaozhi/config/api/firmware/upload', {method:'POST', body: fd});
@@ -470,11 +559,15 @@ async function uploadFirmware(){
   } catch(e){
     toast('上传失败: '+e.message, 'err');
   } finally {
-    btn.disabled = false; btn.textContent = '⬆ 上传固件';
+    btn.disabled = false; btn.textContent = '⛔ ⬆ 上传固件';
   }
 }
+
 async function deleteFirmware(filename){
-  if (!confirm(`确定删除固件 ${filename}？`)) return;
+  const firmware = RUNTIME.firmwares.find(f => f.filename === filename) || { filename };
+  const ok = await confirmDanger('delete_firmware',
+    { firmware, firmwares: RUNTIME.firmwares }, { title: `删除固件 ${filename}` });
+  if (!ok) return;
   try {
     await api('/xiaozhi/config/api/firmware/delete', {method:'POST', body: JSON.stringify({filename})});
     toast('已删除 '+filename, 'ok');
@@ -754,7 +847,7 @@ function buildGroupBody(gid){
       <div class="group"><h2>🧠 LLM 参数（${esc(sm.LLM)}）</h2>
         ${engFields(S.LLM?.[sm.LLM], 'LLM.'+sm.LLM)}
         <div class="row">
-          <div class="meta"><div class="label">连通性测试</div><div class="hint">用当前页面上的参数（含未保存的改动）真发一次请求，量出首句延迟——设备听到第一句话大致就是这个量级。</div></div>
+          <div class="meta"><div class="label">连通性测试</div><div class="hint">用当前页面上的参数（含未保存的改动）真发一次请求，量出首句延迟——设备听到第一句话大致就是这个量级。<br><b>副作用点名</b>：这一步会真的外呼一次模型（消耗少量配额），因此<b>无需确认</b>——点按钮本身就是意图表达（§6.2 常规级）。</div></div>
           <div class="ctrl">
             <button class="btn primary" id="llmTestBtn" onclick="testLLM()">🧪 测试这个模型</button>
             <div id="llmTestResult" class="testresult"></div>
@@ -814,7 +907,7 @@ function buildGroupBody(gid){
           </div>
           <input type="text" id="scPass" placeholder="Wi-Fi 密码" style="padding:8px 10px;border:1px solid var(--border,#ddd);border-radius:6px;background:var(--input-bg,#fff);color:inherit">
           <div style="display:flex;gap:8px;align-items:center">
-            <button class="btn primary" id="scBtn" onclick="sendSmartConfig()">📡 开始广播</button>
+            <button class="btn warn" id="scBtn" data-danger-op="smartconfig" data-danger-level="warning" onclick="sendSmartConfig()">⚠ 📡 开始广播</button>
             <span id="scStatus" style="font-size:13px;opacity:.75"></span>
           </div>
         </div>
@@ -866,6 +959,9 @@ async function sendSmartConfig(){
   const password = document.getElementById('scPass').value;
   const st = document.getElementById('scStatus');
   if (!ssid) { st.textContent = 'SSID 不能为空'; return; }
+  // 警示级（§6.2）：物理世界有副作用，但重新广播一次即可覆盖。
+  const okc = await confirmDanger('smartconfig', {}, { title: '开始 SmartConfig 广播' });
+  if (!okc) return;
   localStorage.setItem('scWifi', JSON.stringify({ssid, pass: password}));
   const btn = document.getElementById('scBtn');
   btn.disabled = true;
@@ -994,7 +1090,9 @@ async function saveAll(){
   } catch(e){ toast('保存失败: '+e.message, 'err'); }
 }
 async function restartServer(){
-  if (!confirm('确认重启服务？所有设备连接会断开，约 10-30 秒恢复。')) return;
+  // 警示级（§6.2 / §6.4 修严重度倒置：红 → 琥珀）：自愈操作，单击确认。
+  const ok = await confirmDanger('restart_server', {}, { title: '重启服务' });
+  if (!ok) return;
   try {
     await api('/xiaozhi/config/api/restart', {method:'POST', body:'{}'});
     toast('重启指令已发出，服务恢复中…', 'ok');
@@ -1015,6 +1113,8 @@ Object.assign(window, {
   switchGroup, saveAll, restartServer, refreshOta, rebootDevice,
   uploadFirmware, deleteFirmware, testLLM, sendSmartConfig, autofillWifi,
   addItem, delItem, toggleFunc, addFunc,
+  // 确认层与分级重画（调试/审计口径与页面同一入口）。
+  confirmDanger, repaintDeviceRebootButtons, RUNTIME,
 });
 
 /* 首次进入 */

@@ -320,8 +320,12 @@ class DevicesDomainContract(AioHTTPTestCase):
                          "/xiaozhi/config/api/smartconfig",
                          "/xiaozhi/config/api/local-wifi"):
             self.assertIn(api_path, js, f"运行时面必须调用既有接口 {api_path}")
-        # 危险动作的既有 confirm 行为保留（分级改造是 #30）。
-        self.assertRegex(js, r"confirm\(", "重启/删除的二次确认本票保留原样")
+        # 危险动作的确认机制已在 #30 改为统一页内确认层（§6.5），原生
+        # ``window.confirm`` 不得再出现。
+        self.assertNotIn("window.confirm(", js,
+                         "危险操作不得用原生 confirm（#30 改为页内确认层）")
+        self.assertIn("confirmDanger(", js,
+                      "重启/上传/删除必须走统一页内确认层")
 
     async def test_the_runtime_endpoints_behind_the_panels_are_alive(self):
         """面板背后的接口真能用（不是「页面里调了个 404」）。"""

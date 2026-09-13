@@ -64,6 +64,41 @@ def page_url(slug: str) -> str:
     return f"/xiaozhi/config/{slug}/"
 
 
+#: 危险分级与统一确认层的 **CSS**（§6.4 / §6.5）——单独一段，因为它是两份
+#: 在线副本共用的资产：新域页骨架拿的是 ``SHELL_CSS``（已含本段），
+#: 旧八组页面自带一张样式表，所以单独拿这一段。
+#:
+#: 只有 ``.btn.warn`` 与 ``#xzhConfirm`` 两族选择器——分级的三载体里，颜色
+#: 是这一段负责的；图标与文案由 ``SHELL_CONFIRM_JS`` 与按钮文字负责。
+CONFIRM_CSS = """
+/* 危险分级的三载体之一：颜色（§6.4）。警示 = 琥珀/橙，危险 = 红实底。
+   图标与文案两个载体由确认层与按钮文字各自带（不许只靠颜色）。 */
+.btn.warn{background:linear-gradient(135deg,#fbbf24,#f59e0b);color:#3b2606;border:none}
+.btn.warn:hover{box-shadow:0 4px 16px rgba(251,191,36,.35)}
+
+/* ---- 统一页内确认层（§6.5「共享外壳的一件组件」）----
+   原生 confirm() 无法分级编码、无法承载输入框与动态后果（§6.5）——
+   这层壳是三级分级的视觉载体，也是两份在线副本共用的唯一实现。 */
+#xzhConfirm{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;background:rgba(4,7,14,.68);backdrop-filter:blur(3px)}
+#xzhConfirm.show{display:flex}
+#xzhConfirm .box{width:min(560px,92vw);max-height:86vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px 24px;box-shadow:0 24px 64px rgba(0,0,0,.55)}
+#xzhConfirm .hd{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:700;margin-bottom:10px}
+#xzhConfirm .hd .ic{font-size:18px;line-height:1}
+#xzhConfirm .lvl{font-size:11px;font-weight:700;padding:2px 10px;border-radius:12px;border:1px solid var(--line);color:var(--dim)}
+#xzhConfirm .body{font-size:13px;line-height:1.7;color:var(--text)}
+#xzhConfirm .body ul{margin:8px 0 0 18px}
+#xzhConfirm .body li{margin-bottom:6px}
+#xzhConfirm .body b{color:#fff}
+#xzhConfirm .hint{margin-top:10px;font-size:12px;color:var(--dim)}
+#xzhConfirm .typebox{margin-top:14px;display:flex;flex-direction:column;gap:6px}
+#xzhConfirm .typebox label{font-size:12px;color:var(--dim)}
+#xzhConfirm .acts{margin-top:20px;display:flex;gap:10px;justify-content:flex-end}
+#xzhConfirm.warn .box{border-color:rgba(251,191,36,.55)}
+#xzhConfirm.warn .hd{color:var(--warn)}
+#xzhConfirm.danger .box{border-color:rgba(248,113,113,.6)}
+#xzhConfirm.danger .hd{color:var(--err)}
+"""
+
 #: 壳的样式（CSS 变量即壳 tokens，§4.2）。摄像头页局部覆盖为暗色，各页不重定义
 #: 骨架 —— 所以壳样式单独一段，由页面骨架（config_domain_page.html）里的
 #: ``__SHELL_CSS__`` 占位符注入所有页面。
@@ -190,7 +225,7 @@ details>div{padding:12px 14px}
   .row .meta{width:100%}
   .topbar{padding:0 16px}
 }
-"""
+""" + CONFIRM_CSS
 
 
 def render_sidebar(active: str = "") -> str:
@@ -292,6 +327,125 @@ def render_placeholder(domain: dict) -> str:
         "</div></section>"
     )
 
+
+#: 确认层的 HTML 壳（§6.5 的「共享外壳的一件组件」）。
+#:
+#: 为什么在壳里而不是各页各写一份：§6.5 明文「统一页内确认层（共享外壳的一件
+#: 组件）」。两份在线副本（新设备域 / 旧八组页面）共用这一个容器与这一份
+#: 渲染逻辑，分级的视觉编码才不会分叉。
+#:
+#: 容器常驻 DOM（空着），内容在打开时填——页面里没有第二份「确认层」。
+CONFIRM_HTML = (
+    '<div id="xzhConfirm" role="dialog" aria-modal="true">'
+    '<div class="box"><div class="hd"><span class="ic"></span>'
+    '<span class="tt"></span><span class="lvl"></span></div>'
+    '<div class="body"></div>'
+    '<div class="typebox" hidden><label class="typelabel"></label>'
+    '<input type="text" class="typeinput" autocomplete="off">'
+    '<div class="typehint hint"></div></div>'
+    '<div class="acts"><button type="button" class="btn cancel">取消</button>'
+    '<button type="button" class="btn ok">确定</button></div>'
+    '</div></div>'
+)
+
+#: 确认层的客户端脚本（分级渲染 + 打字摩擦），随壳注入每一页。
+#:
+#: 它只做一件事：**把分级声明渲染成一个可回车/可取消的层**。分级判定不在这里
+#: ——那是 config_danger_model.js（纯模块、node 缝跑）的职责，本脚本只消费
+#: 它给的结果（level / 后果清单 / 是否要打字 / 打字对象）。
+#:
+#: ``window.xzhConfirm(opts)`` 返回 Promise<boolean>：
+#:   { level, title, consequences:[...], confirmText, hint,
+#:     typeToConfirm: {label, value, hint} | null }
+SHELL_CONFIRM_JS = """
+(() => {
+  const get = () => document.getElementById('xzhConfirm');
+
+  // 分级 → 视觉三载体（颜色 + 图标 + 文案）。与 config_danger_model.js 的
+  // LEVEL_VISUALS 同源；这里是壳内的**消费侧**副本，缺模块时仍能自洽渲染。
+  const VISUAL = {
+    warning: { cls: 'warn', icon: '\u26a0', label: '\u8b66\u793a', okCls: 'btn warn' },
+    danger: { cls: 'danger', icon: '\u26d4', label: '\u5371\u9669', okCls: 'btn danger' },
+    normal: { cls: '', icon: '', label: '\u5e38\u89c4', okCls: 'btn primary' },
+  };
+
+  let closer = null;
+
+  function close(result) {
+    const box = get();
+    if (!box) return;
+    box.classList.remove('show', 'warn', 'danger');
+    const fn = closer;
+    closer = null;
+    if (fn) fn(result);
+  }
+
+  window.__xzhConfirmClose = close;
+
+  window.xzhConfirm = function (opts) {
+    const o = opts || {};
+    const box = get();
+    if (!box) return Promise.resolve(window.confirm(o.title || '\u786e\u8ba4\u64cd\u4f5c\uff1f'));
+    const v = VISUAL[o.level] || VISUAL.warning;
+    box.className = 'show ' + v.cls;
+    box.querySelector('.hd .ic').textContent = v.icon;
+    box.querySelector('.hd .tt').textContent = o.title || '';
+    box.querySelector('.hd .lvl').textContent = v.label;
+    const body = box.querySelector('.body');
+    const lines = Array.isArray(o.consequences) ? o.consequences : [];
+    // 后果文案里的 ``**x**`` 是强调标记（模型侧是纯文本，node 缝里可读）。
+    // 这里只做**一种**极小的转换（粗体），并把 ``<`` 转义掉——后果文案是
+    // 我们自己写的，但渲染路径是 innerHTML，转义是便宜且必要的兼底。
+    const fmt = (s) => String(s).replace(/[<>]/g, (c) => c === '<' ? '&lt;' : '&gt;')
+      .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+    body.innerHTML = lines.length
+      ? '<ul>' + lines.map((l) => `<li>${fmt(l)}</li>`).join('') + '</ul>'
+      : '';
+    const hint = box.querySelector('.acts').previousElementSibling;
+    // 注意：``.acts`` 的前一个兄弟是 ``.typebox``（它始终在 DOM 里），
+    // 不是一段独立的 hint 元素——所以这里**不能**对它写 ``textContent``
+    // （那会把 typebox 的 label/input/hint 一并冲掉）。打字摩擦的提示排在
+    // ``.typehint`` 上（见下）。
+    const ok = box.querySelector('.acts .ok');
+    ok.className = v.okCls;
+    ok.textContent = v.icon ? (v.icon + ' ' + (o.confirmText || '\u786e\u5b9a')) : (o.confirmText || '\u786e\u5b9a');
+    const cancel = box.querySelector('.acts .cancel');
+    cancel.className = 'btn cancel';
+
+    // ---- 打字摩擦（§6.3：只有删除固件有）----
+    const typebox = box.querySelector('.typebox');
+    const input = box.querySelector('.typeinput');
+    const tc = o.typeToConfirm || null;
+    input.value = '';
+    if (tc) {
+      typebox.hidden = false;
+      box.querySelector('.typelabel').textContent = tc.label || '\u8f93\u5165\u786e\u8ba4\u6587\u672c';
+      box.querySelector('.typehint').innerHTML = tc.hint || '';
+      ok.disabled = true;
+      input.oninput = () => { ok.disabled = input.value.trim() !== String(tc.value); };
+      setTimeout(() => input.focus(), 0);
+    } else {
+      typebox.hidden = true;
+      input.oninput = null;
+      ok.disabled = false;
+      setTimeout(() => ok.focus(), 0);
+    }
+    if (hint && !tc) hint.hidden = true;
+    else if (hint) hint.hidden = false;
+
+    return new Promise((resolve) => {
+      closer = resolve;
+      ok.onclick = () => close(true);
+      cancel.onclick = () => close(false);
+      box.onclick = (ev) => { if (ev.target === box) close(false); };
+      box.onkeydown = (ev) => {
+        if (ev.key === 'Escape') { ev.preventDefault(); close(false); }
+        if (ev.key === 'Enter' && !ok.disabled) { ev.preventDefault(); close(true); }
+      };
+    });
+  };
+})();
+"""
 
 #: 壳脚本：跨页脏状态（§4.6）。只做两件事，两件都是「不做就不成立」的那种。
 #:

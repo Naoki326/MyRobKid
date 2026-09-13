@@ -90,7 +90,8 @@ class DomainTopologyContract(AioHTTPTestCase):
         # 存根只能证明「路由存在」，证不了「页面真的能加载」。
         (project / "config").mkdir()
         for name in ("config_page.html", "config_state_model.js",
-                     "config_domain_page.html", "config_domain_page.js"):
+                     "config_domain_page.html", "config_domain_page.js",
+                     "config_danger_model.js"):
             (project / "config" / name).write_text(
                 (SERVER_ROOT / "config" / name).read_text(encoding="utf-8"),
                 encoding="utf-8")
@@ -106,6 +107,8 @@ class DomainTopologyContract(AioHTTPTestCase):
                     self.handler.handle_state_model),
             web.get("/xiaozhi/config/config_domain_page.js",
                     self.handler.handle_domain_page_script),
+            web.get("/xiaozhi/config/config_danger_model.js",
+                    self.handler.handle_danger_model),
             web.get("/xiaozhi/config/api/full", self.handler.handle_full),
         ])
         return app
@@ -342,17 +345,22 @@ class DomainTopologyContract(AioHTTPTestCase):
         ``./x.js`` = ``/xiaozhi/config/<slug>/x.js``。写对了写得好看不重要，
         解得回才重要——解不回就是页面永远停在「正在加载配置…」。
         这里用 ``urljoin`` 亲手算一遍，不靠读代码看出来的。
+
+        域页现在引入**两个**模块（页面脚本 + 危险分级模型，#30）；两者都要求
+        解回 ``/xiaozhi/config/`` 下的绝对路径并取得到——而**页面脚本那条**
+        必须就是 ``config_domain_page.js``（它是域页的编辑逻辑，不许被换掉）。
         """
         canonical = "/xiaozhi/config/dialogue/"
         html = await (await self._get(canonical)).text()
         srcs = re.findall(r'<script[^>]*\ssrc="([^"]+)"', html)
         self.assertTrue(srcs, "域页必须引入模块脚本")
+        self.assertIn("/xiaozhi/config/config_domain_page.js", srcs,
+                      "域页的页面脚本必须是 config_domain_page.js")
         for src in srcs:
             resolved = urljoin(canonical, src)
             self.assertTrue(
-                resolved.endswith("/xiaozhi/config/config_domain_page.js"),
-                f"模块路径 {src} 在规范 URL 下解成了 {resolved}（应当是 "
-                "/xiaozhi/config/config_domain_page.js）")
+                resolved.startswith("/xiaozhi/config/") and "/../" not in resolved,
+                f"模块路径 {src} 在规范 URL 下解成了 {resolved}")
             resp = await self._get(resolved)
             self.assertEqual(resp.status, 200, f"解出来的路径 {resolved} 取不到")
 

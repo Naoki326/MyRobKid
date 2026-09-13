@@ -335,12 +335,25 @@ class ConfigHandler(BaseHandler):
     # ---------------- 路由处理 ----------------
 
     async def handle_page(self, request):
-        """配置页 HTML（自包含，仅外链一个 ES 模块 config_state_model.js）。"""
+        """旧八组配置页 HTML（自包含，外链两个 ES 模块）。
+
+        旧页自带骨架与样式（它是 #31 收线前仍然在线的副本），但**危险分级
+        与统一确认层是壳级共享资产**（父 spec §6.5）：服务端在这里把
+        ``config_shell`` 的同一份 CSS/HTML/JS 注进占位符，两页共用一套
+        分级视觉与确认层——而不是在旧页里再写一份。
+        """
         html_path = Path(self.project_dir) / "config" / "config_page.html"
         if not html_path.exists():
             return web.Response(text="config_page.html not found", status=404)
+        html = html_path.read_text(encoding="utf-8")
+        for name, value in (
+            ("__CONFIRM_CSS__", shell.CONFIRM_CSS),
+            ("__CONFIRM_JS__", shell.SHELL_CONFIRM_JS),
+            ("__CONFIRM__", shell.CONFIRM_HTML),
+        ):
+            html = html.replace(name, value)
         return web.Response(
-            text=html_path.read_text(encoding="utf-8"),
+            text=html,
             content_type="text/html",
             charset="utf-8",
         )
@@ -365,6 +378,21 @@ class ConfigHandler(BaseHandler):
         js_path = Path(self.project_dir) / "config" / "config_domain_page.js"
         if not js_path.exists():
             return web.Response(text="config_domain_page.js not found", status=404)
+        return web.Response(
+            text=js_path.read_text(encoding="utf-8"),
+            content_type="text/javascript",
+            charset="utf-8",
+        )
+
+    async def handle_danger_model(self, request):
+        """危险分级模型（无 DOM 依赖的 ES 模块，父 spec §6）。
+
+        与 ``config_state_model.js`` 同一机制：两份在线副本（新设备域页 /
+        旧八组页面）共用同一份分级判定与后果文案——分级只有一处实现，
+        两页的表现才不会分叉。"""
+        js_path = Path(self.project_dir) / "config" / "config_danger_model.js"
+        if not js_path.exists():
+            return web.Response(text="config_danger_model.js not found", status=404)
         return web.Response(
             text=js_path.read_text(encoding="utf-8"),
             content_type="text/javascript",
@@ -449,7 +477,11 @@ class ConfigHandler(BaseHandler):
             actions = (
                 '<button class="btn primary" id="saveBtn" '
                 'onclick="xzhSave()" disabled>💾 保存修改</button>'
-                '<button class="btn danger" onclick="xzhRestart()">♻️ 重启服务生效</button>'
+                # 重启服务 = 警示级（§6.2 / §6.4 修严重度倒置）：琥珀 + ⚠，
+                # 不是红色实底。它是自愈操作（断连 10-30s 后拉起），原先把
+                # 红色给了它是三处严重度倒置之一。
+                '<button class="btn warn" data-danger-op="restart_server" '
+                'data-danger-level="warning" onclick="xzhRestart()">⚠ ♻️ 重启服务</button>'
             )
             savebar = (
                 '<div class="savebar"><span class="info" id="saveInfo">'
@@ -530,7 +562,8 @@ class ConfigHandler(BaseHandler):
             ("__PAGE_DESC__", kw.get("page_desc", "")),
             ("__SCHEMA_JSON__", schema_json),
             ("__SAVEBAR__", kw.get("savebar", "")),
-            ("__SHELL_JS__", shell.SHELL_JS),
+            ("__CONFIRM__", shell.CONFIRM_HTML),
+            ("__SHELL_JS__", shell.SHELL_JS + shell.SHELL_CONFIRM_JS),
             ("__PAGE_STYLE__", kw.get("page_style", "")),
             ("__PAGE_JS__", kw.get("page_script", "")),
             ("__BODY__", kw.get("body", "")),

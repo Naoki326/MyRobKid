@@ -120,6 +120,11 @@ class SimpleHttpServer:
                             "/xiaozhi/config/config_domain_page.js",
                             self.config_handler.handle_domain_page_script,
                         ),
+                        # 危险分级模型（父 spec §6）：两份在线副本共用的唯一实现
+                        web.get(
+                            "/xiaozhi/config/config_danger_model.js",
+                            self.config_handler.handle_danger_model,
+                        ),
                         web.post(
                             "/xiaozhi/config/api/auth",
                             self.config_handler.handle_auth,
