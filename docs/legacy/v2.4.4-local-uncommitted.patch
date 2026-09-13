@@ -1,0 +1,1257 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff51e5c..79297bc 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,5 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.4.2")
++set(PROJECT_VER "2.4.4")
+ project(xiaozhi)
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index cfba316..7c2d2ef 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -2,6 +2,7 @@
+ set(SOURCES "audio/audio_codec.cc"
+             "audio/audio_debugger.cc"
+             "audio/audio_service.cc"
++            "audio/music_player.cc"
+             "audio/demuxer/ogg_demuxer.cc"
+             "notify/notify_player.cc"
+             "audio/codecs/no_audio_codec.cc"
+@@ -760,7 +761,7 @@ elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_MINICAM)
+     set(BOARD_DIR "zhengchen/minicam")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
+     set(BUILTIN_ICON_FONT font_material_symbols_16_4)
+-    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_32)
++    set(DEFAULT_EMOJI_COLLECTION otto-gif)
+ elseif(CONFIG_BOARD_TYPE_SPOTPEAR_ESP32_S3_1_54_MUMA)
+     set(BOARD_DIR "spotpear/sp-esp32-s3-1.54-muma")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index ddd7aaf..64bb02f 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -974,6 +974,28 @@ config USE_AUDIO_DEBUGGER
+     help
+         Enable audio debugger, send audio data through UDP to the host machine
+ 
++choice TTS_PLAYBACK_STRATEGY
++    prompt "TTS playback strategy"
++    default TTS_PLAYBACK_STREAMING_BUFFERED
++    help
++        How incoming TTS audio from the server is played back.
++
++config TTS_PLAYBACK_STREAMING_BUFFERED
++    bool "Streaming with a large jitter buffer"
++    help
++        Play TTS as it arrives. The decode queue is enlarged to absorb
++        server/network jitter, keeping the first-sound latency low.
++        Increase MAX_DECODE_PACKETS_IN_QUEUE (audio_service.h) to tune it.
++
++config TTS_PLAYBACK_FULL_PREBUFFER
++    bool "Buffer the entire reply before playback"
++    help
++        Collect the whole TTS response first and only start playing after the
++        server finishes it (tts stop). No mid-reply glitches even when the
++        server generates audio slower than real time, at the cost of a longer
++        initial wait. Uses up to ~64KB of buffering for the reply.
++endchoice
++
+ menu "WiFi Configuration Method"
+     help
+         WiFi Configuration Method Selection
+diff --git a/main/application.cc b/main/application.cc
+index d5f28b0..dffb733 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -20,7 +20,16 @@
+ 
+ #define TAG "Application"
+ 
+-Application::Application() : notify_player_(audio_service_) {
++// TTS playback strategy (see TTS_PLAYBACK_STRATEGY in Kconfig):
++// - false: stream as it arrives, with a large jitter buffer (default)
++// - true: buffer the whole reply and play it after tts stop
++#if CONFIG_TTS_PLAYBACK_FULL_PREBUFFER
++static constexpr bool kTtsPrebufferEnabled = true;
++#else
++static constexpr bool kTtsPrebufferEnabled = false;
++#endif
++
++Application::Application() : notify_player_(audio_service_), music_player_(audio_service_) {
+     event_group_ = xEventGroupCreate();
+ 
+ #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
+@@ -479,6 +488,11 @@ void Application::CheckNewVersion() {
+         retry_count = 0;
+         retry_delay = 10;  // Reset retry delay
+ 
++        // 应用服务端下发的设备配置（如 power_save_timeout）
++        if (ota_->HasDeviceConfig()) {
++            board.ApplyDeviceConfig();
++        }
++
+         if (ota_->HasNewVersion()) {
+             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
+                 return;  // This line will never be reached after reboot
+@@ -541,6 +555,25 @@ void Application::InitializeProtocol() {
+     });
+ 
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
++        bool buffered = false;
++        bool overflow = false;
++        {
++            std::lock_guard<std::mutex> lock(tts_buffer_mutex_);
++            if (tts_buffering_) {
++                tts_buffer_bytes_ += packet->payload.size();
++                tts_buffer_.push_back(std::move(packet));
++                buffered = true;
++                overflow = tts_buffer_bytes_ >= kTtsPreloadMaxBytes;
++            }
++        }
++        if (buffered) {
++            if (overflow) {
++                // Extremely long reply: enqueue what we have and stream the
++                // rest directly, same as the original behavior.
++                FlushTtsBuffer();
++            }
++            return;
++        }
+         if (GetDeviceState() == kDeviceStateSpeaking) {
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+@@ -558,6 +591,7 @@ void Application::InitializeProtocol() {
+ 
+     protocol_->OnAudioChannelClosed([this, &board]() {
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
++        ResetTtsBuffer();
+         Schedule([this]() {
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+@@ -611,11 +645,23 @@ void Application::InitializeProtocol() {
+                 return;
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
++                {
++                    // Drop any leftover audio. Buffer the response only when
++                    // the full-prebuffer strategy is selected; otherwise
++                    // packets stream straight to the decode queue.
++                    std::lock_guard<std::mutex> lock(tts_buffer_mutex_);
++                    tts_buffer_.clear();
++                    tts_buffer_bytes_ = 0;
++                    tts_buffering_ = kTtsPrebufferEnabled;
++                }
+                 Schedule([this]() {
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+             } else if (strcmp(state->valuestring, "stop") == 0) {
++                // Flush the buffered audio before the state change so that
++                // playback starts with the complete response.
++                FlushTtsBuffer();
+                 Schedule([this]() {
+                     if (GetDeviceState() == kDeviceStateSpeaking) {
+                         if (listening_mode_ == kListeningModeManualStop) {
+@@ -888,6 +934,10 @@ void Application::HandleWakeWordDetectedEvent() {
+     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+ 
+     if (state == kDeviceStateIdle) {
++        // A wake-up interrupts background music so the user can talk.
++        if (IsMusicPlaying()) {
++            StopMusic();
++        }
+         BeginWakeWordInvoke(wake_word);
+     } else if (state == kDeviceStateNotifying) {
+         StopNotification();
+@@ -1153,11 +1203,45 @@ void Application::Schedule(std::function<void()>&& callback) {
+ void Application::AbortSpeaking(AbortReason reason) {
+     ESP_LOGI(TAG, "Abort speaking");
+     aborted_ = true;
++    ResetTtsBuffer();
+     if (protocol_) {
+         protocol_->SendAbortSpeaking(reason);
+     }
+ }
+ 
++void Application::ResetTtsBuffer() {
++    std::lock_guard<std::mutex> lock(tts_buffer_mutex_);
++    tts_buffering_ = false;
++    if (!tts_buffer_.empty()) {
++        ESP_LOGI(TAG, "Discarding %u buffered TTS packets", (unsigned)tts_buffer_.size());
++    }
++    tts_buffer_.clear();
++    tts_buffer_bytes_ = 0;
++}
++
++void Application::FlushTtsBuffer() {
++    std::deque<std::unique_ptr<AudioStreamPacket>> packets;
++    {
++        std::lock_guard<std::mutex> lock(tts_buffer_mutex_);
++        tts_buffering_ = false;
++        packets.swap(tts_buffer_);
++        tts_buffer_bytes_ = 0;
++    }
++    if (packets.empty()) {
++        return;
++    }
++    size_t bytes = 0;
++    uint32_t duration_ms = 0;
++    for (const auto& packet : packets) {
++        bytes += packet->payload.size();
++        duration_ms += packet->frame_duration > 0 ? packet->frame_duration : OPUS_FRAME_DURATION_MS;
++    }
++    const size_t total = packets.size();
++    size_t pushed = audio_service_.PushPacketsToDecodeQueue(packets);
++    ESP_LOGI(TAG, "Playing buffered TTS: %u/%u packets (%u bytes, ~%u ms)",
++             (unsigned)pushed, (unsigned)total, (unsigned)bytes, (unsigned)duration_ms);
++}
++
+ void Application::SetListeningMode(ListeningMode mode) {
+     listening_mode_ = mode;
+     SetDeviceState(kDeviceStateListening);
+diff --git a/main/application.h b/main/application.h
+index f2b9a00..3c32664 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -20,6 +20,7 @@
+ #include "device_state.h"
+ #include "device_state_machine.h"
+ #include "notify/notify_player.h"
++#include "audio/music_player.h"
+ 
+ // Main event bits
+ #define MAIN_EVENT_SCHEDULE             (1 << 0)
+@@ -118,6 +119,10 @@ public:
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
+     AudioService& GetAudioService() { return audio_service_; }
++    // Background music streaming from an HTTP(S) audio URL (mp3 / ogg-opus).
++    bool PlayMusic(const std::string& url) { return music_player_.Play(url); }
++    void StopMusic() { music_player_.Stop(); }
++    bool IsMusicPlaying() const { return music_player_.IsPlaying(); }
+     
+     /**
+      * Reset protocol resources (thread-safe)
+@@ -141,6 +146,7 @@ private:
+     std::string last_error_message_;
+     AudioService audio_service_;
+     NotifyPlayer notify_player_;
++    MusicPlayer music_player_;
+     uint32_t notification_playback_id_ = 0;
+     std::unique_ptr<Ota> ota_;
+ 
+@@ -154,6 +160,17 @@ private:
+     int clock_ticks_ = 0;
+     TaskHandle_t activation_task_handle_ = nullptr;
+ 
++    // TTS pre-buffering: collect incoming TTS audio packets and only start
++    // playing after the server finishes the whole response (tts stop). This
++    // avoids choppy playback when the server generates or delivers audio
++    // slower than real time. Longer replies fall back to streaming once the
++    // buffer reaches kTtsPreloadMaxBytes.
++    static constexpr size_t kTtsPreloadMaxBytes = 64 * 1024;
++    std::mutex tts_buffer_mutex_;
++    std::deque<std::unique_ptr<AudioStreamPacket>> tts_buffer_;
++    size_t tts_buffer_bytes_ = 0;
++    bool tts_buffering_ = false;
++
+ 
+     // Event handlers
+     void HandleStateChangedEvent();
+@@ -183,6 +200,10 @@ private:
+     void ShowActivationCode(const std::string& code, const std::string& message);
+     void SetListeningMode(ListeningMode mode);
+     ListeningMode GetDefaultListeningMode() const;
++
++    // TTS pre-buffering helpers (tts_buffer_mutex_ guarded)
++    void ResetTtsBuffer();  // Drop buffered audio and disable buffering
++    void FlushTtsBuffer();  // Disable buffering and enqueue held audio for playback
+     
+     // State change handler called by state machine
+     void OnStateChanged(DeviceState old_state, DeviceState new_state);
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 4bc6020..a71e702 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -591,9 +591,11 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
+             audio_queue_cv_.wait(lock, [this, generation]() {
+                 return service_stopped_.load() ||
+                        generation != playback_generation_ ||
+-                       audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
++                       audio_decode_queue_.size() < DECODE_PACKETS_LOW_WATERMARK;
+             });
+-        } else {
++        } else if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_HARD_LIMIT) {
++            // Only drop when an excessive amount of audio is already queued;
++            // bursts below the hard limit are absorbed to avoid glitches.
+             return false;
+         }
+     }
+@@ -606,6 +608,50 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
+     return true;
+ }
+ 
++bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, uint32_t timeout_ms) {
++    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++    if (audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
++        if (!audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
++                return service_stopped_.load() ||
++                       audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
++            })) {
++            return false;  // Timed out: the output path is stuck.
++        }
++    }
++    if (service_stopped_.load()) {
++        return false;
++    }
++    auto task = std::make_unique<AudioTask>();
++    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
++    task->pcm = std::move(pcm);
++    playback_drained_notified_ = false;
++    audio_playback_queue_.push_back(std::move(task));
++    audio_queue_cv_.notify_all();
++    return true;
++}
++
++size_t AudioService::PushPacketsToDecodeQueue(std::deque<std::unique_ptr<AudioStreamPacket>>& packets) {
++    size_t pushed = 0;
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        if (!service_stopped_.load()) {
++            for (auto& packet : packets) {
++                if (packet == nullptr) {
++                    continue;
++                }
++                audio_decode_queue_.push_back(std::move(packet));
++                pushed++;
++            }
++            if (pushed > 0) {
++                playback_drained_notified_ = false;
++                audio_queue_cv_.notify_all();
++            }
++        }
++    }
++    packets.clear();
++    return pushed;
++}
++
+ std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
+     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+     if (audio_send_queue_.empty()) {
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index fb07fb9..53a84a4 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -37,10 +37,23 @@
+  */
+ 
+ #define OPUS_FRAME_DURATION_MS 60
+-#define MAX_ENCODE_TASKS_IN_QUEUE 2
++// Uplink buffers: absorb network jitter so the server receives continuous
++// audio. When they overflow the OLDEST frame is dropped (stale realtime
++// audio is useless). If they are too shallow, the gaps make the server-side
++// VAD stop listening while the user is still talking.
++#define MAX_ENCODE_TASKS_IN_QUEUE (480 / OPUS_FRAME_DURATION_MS)
+ #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+-#define MAX_DECODE_PACKETS_IN_QUEUE (1200 / OPUS_FRAME_DURATION_MS)
+-#define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
++// Amount of opus audio buffered while streaming TTS from the server.
++// Larger values absorb more server/network jitter without stuttering.
++#define MAX_DECODE_PACKETS_IN_QUEUE (6000 / OPUS_FRAME_DURATION_MS)
++// Low watermark used by blocking pushes (sound effects / notifications):
++// they wait until the queue drains below this, keeping them responsive.
++#define DECODE_PACKETS_LOW_WATERMARK (1200 / OPUS_FRAME_DURATION_MS)
++#define MAX_SEND_PACKETS_IN_QUEUE (4800 / OPUS_FRAME_DURATION_MS)
++// Hard limit for the decode queue: packets are only dropped once this much
++// audio is already queued (e.g. playback stalled). Bursts below the hard
++// limit are absorbed instead of being dropped, which used to cause glitches.
++#define MAX_DECODE_PACKETS_HARD_LIMIT (24000 / OPUS_FRAME_DURATION_MS)
+ #define AUDIO_TESTING_MAX_DURATION_MS 10000
+ #define MAX_TIMESTAMPS_IN_QUEUE 3
+ 
+@@ -135,6 +148,13 @@ public:
+     void SetCallbacks(AudioServiceCallbacks& callbacks);
+ 
+     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
++    // Push raw PCM into the playback queue (used by local music streaming).
++    // Applies backpressure while the queue is full. Returns false on timeout
++    // or when the audio service is stopping.
++    bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, uint32_t timeout_ms);
++    // Enqueue a batch of pre-buffered packets at once, bypassing the soft
++    // decode queue limit. Returns the number of packets actually enqueued.
++    size_t PushPacketsToDecodeQueue(std::deque<std::unique_ptr<AudioStreamPacket>>& packets);
+     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
+     void PlaySound(const std::string_view& sound);
+     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+diff --git a/main/audio/codecs/es8388_audio_codec.cc b/main/audio/codecs/es8388_audio_codec.cc
+index c1db3c9..c517122 100644
+--- a/main/audio/codecs/es8388_audio_codec.cc
++++ b/main/audio/codecs/es8388_audio_codec.cc
+@@ -1,6 +1,8 @@
+ #include "es8388_audio_codec.h"
+ 
+ #include <esp_log.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
+ 
+ #define TAG "Es8388AudioCodec"
+ 
+@@ -67,6 +69,9 @@ Es8388AudioCodec::Es8388AudioCodec(void* i2c_master_handle, i2c_port_t i2c_port,
+     assert(input_dev_ != NULL);
+     esp_codec_set_disable_when_closed(output_dev_, false);
+     esp_codec_set_disable_when_closed(input_dev_, false);
++    // 上电立即静音 DAC：无 PA 使能引脚可关功放，ES8388 上电瞬态会直通喇叭产生爆音。
++    // 首次真正放音（EnableOutput(true)）时会等待稳定后解除静音。
++    esp_codec_dev_set_out_mute(output_dev_, true);
+     ESP_LOGI(TAG, "Es8388AudioCodec initialized");
+ }
+ 
+@@ -196,6 +201,8 @@ void Es8388AudioCodec::EnableOutput(bool enable) {
+             ctrl_if_->write_reg(ctrl_if_, reg, 1, &reg_val, 1);
+         }
+ 
++        // 等待 DAC 上电稳定与 I2S 零数据填充后再解除静音，避免开机/首音爆音
++        vTaskDelay(pdMS_TO_TICKS(150));
+         ESP_ERROR_CHECK(esp_codec_dev_set_out_mute(output_dev_, false));
+         if (pa_pin_ != GPIO_NUM_NC) {
+             gpio_set_level(pa_pin_, 1);
+diff --git a/main/audio/music_player.cc b/main/audio/music_player.cc
+new file mode 100644
+index 0000000..2d32ffb
+--- /dev/null
++++ b/main/audio/music_player.cc
+@@ -0,0 +1,366 @@
++#include "music_player.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <memory>
++#include <vector>
++
++#include <esp_log.h>
++
++#include "audio_codec.h"
++#include "board.h"
++#include "http.h"
++#include "ogg_demuxer.h"
++#include "esp_audio_dec.h"
++#include "esp_ae_rate_cvt.h"
++
++namespace {
++constexpr int kHttpTimeoutMs = 5000;
++constexpr size_t kHttpReadBufferSize = 4096;
++// Input ring for the MP3 decoder: holds one HTTP chunk plus leftovers.
++constexpr size_t kMp3InputBufferSize = 16 * 1024;
++constexpr uint32_t kPushPcmTimeoutMs = 1000;
++// Upper bound for Stop(): must exceed the HTTP read timeout.
++constexpr uint32_t kStopWaitTimeoutMs = 6000;
++constexpr uint32_t kMusicTaskStackSize = 10240;
++constexpr UBaseType_t kMusicTaskPriority = 2;
++const char* TAG = "MusicPlayer";
++
++#define MUSIC_RATE_CVT_CFG(_src_rate, _dest_rate)           \
++    (esp_ae_rate_cvt_cfg_t)                                 \
++    {                                                       \
++        .src_rate        = (uint32_t)(_src_rate),           \
++        .dest_rate       = (uint32_t)(_dest_rate),          \
++        .channel         = 1,                               \
++        .bits_per_sample = ESP_AUDIO_BIT16,                 \
++        .complexity      = 2,                               \
++        .perf_type       = ESP_AE_RATE_CVT_PERF_TYPE_SPEED, \
++    }
++
++bool IsSupportedUrl(const std::string& url) {
++    return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
++}
++
++bool EndsWithIgnoreCase(const std::string& text, const std::string& suffix) {
++    if (text.size() < suffix.size()) {
++        return false;
++    }
++    return strncasecmp(text.c_str() + text.size() - suffix.size(), suffix.c_str(), suffix.size()) == 0;
++}
++
++}  // namespace
++
++MusicPlayer::MusicPlayer(AudioService& audio_service) : audio_service_(audio_service) {}
++
++MusicPlayer::~MusicPlayer() {
++    Stop();
++}
++
++bool MusicPlayer::Play(std::string url) {
++    if (!IsSupportedUrl(url)) {
++        ESP_LOGE(TAG, "Unsupported URL: %s", url.c_str());
++        return false;
++    }
++
++    Stop();
++
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        url_ = url;
++        worker_running_ = true;
++    }
++    playing_.store(true);
++    stop_requested_.store(false);
++
++    BaseType_t created = xTaskCreate(WorkerEntry, "music_http", kMusicTaskStackSize, this,
++                                     kMusicTaskPriority, &task_handle_);
++    if (created != pdPASS) {
++        ESP_LOGE(TAG, "Failed to create music worker task");
++        playing_.store(false);
++        std::lock_guard<std::mutex> lock(mutex_);
++        worker_running_ = false;
++        task_handle_ = nullptr;
++        return false;
++    }
++    return true;
++}
++
++void MusicPlayer::Stop() {
++    stop_requested_.store(true);
++    playing_.store(false);
++    {
++        std::unique_lock<std::mutex> lock(mutex_);
++        if (!worker_running_) {
++            return;
++        }
++        // The worker checks stop_requested_ after every HTTP read and decode
++        // step. The wait bound only matters when it is stuck inside a read.
++        stop_cv_.wait_for(lock, std::chrono::milliseconds(kStopWaitTimeoutMs),
++                          [this]() { return !worker_running_; });
++    }
++}
++
++void MusicPlayer::WorkerEntry(void* arg) {
++    auto* player = static_cast<MusicPlayer*>(arg);
++    std::string url;
++    {
++        std::lock_guard<std::mutex> lock(player->mutex_);
++        url = player->url_;
++    }
++    player->WorkerTask(std::string(url));
++    vTaskDelete(nullptr);
++}
++
++void MusicPlayer::WorkerTask(std::string url) {
++    bool success = false;
++    auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
++    if (http) {
++        http->SetTimeout(kHttpTimeoutMs);
++        http->SetHeader("Accept", "audio/mpeg, audio/ogg, application/ogg");
++        http->SetHeader("Accept-Encoding", "identity");
++        http->SetHeader("User-Agent", "XiaoZhi-MusicPlayer/1.0");
++        const bool opened = http->Open("GET", url);
++        if (opened) {
++            const int status = http->GetStatusCode();
++            if (status >= 200 && status < 300 && !stop_requested_.load()) {
++                // Drop anything still queued from the previous session (e.g.
++                // lingering TTS) so the music starts from a clean pipeline.
++                audio_service_.ResetDecoder();
++
++                std::string content_type = http->GetResponseHeader("Content-Type");
++                std::transform(content_type.begin(), content_type.end(), content_type.begin(),
++                               [](unsigned char c) { return static_cast<char>(::tolower(c)); });
++
++                const bool is_mp3 = content_type.find("audio/mpeg") != std::string::npos ||
++                                    content_type.find("audio/mp3") != std::string::npos ||
++                                    EndsWithIgnoreCase(url, ".mp3");
++                success = is_mp3 ? StreamMp3(http.get()) : StreamOgg(http.get());
++            } else {
++                ESP_LOGE(TAG, "Music HTTP request returned status %d", status);
++            }
++        } else {
++            ESP_LOGE(TAG, "Failed to open music HTTP request: %d", http->GetLastError());
++        }
++        http->Close();
++        http.reset();
++    } else {
++        ESP_LOGE(TAG, "Failed to create HTTP client");
++    }
++
++    ESP_LOGI(TAG, "Music worker finished (%s): %s", success ? "completed" : "interrupted",
++             url.c_str());
++
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        worker_running_ = false;
++        task_handle_ = nullptr;
++    }
++    playing_.store(false);
++    stop_cv_.notify_all();
++}
++
++bool MusicPlayer::StreamOgg(Http* http) {
++    // OGG/Opus streams reuse the notification pipeline: demux to Opus
++    // packets and push them into the decode queue with backpressure.
++    auto demuxer = std::make_unique<OggDemuxer>();
++    bool packet_error = false;
++    demuxer->OnPacket([this, &packet_error](const uint8_t* data, int sample_rate,
++                                            int frame_duration_ms, size_t size) {
++        if (packet_error || stop_requested_.load()) {
++            packet_error = true;
++            return;
++        }
++        auto packet = std::make_unique<AudioStreamPacket>();
++        packet->sample_rate = sample_rate;
++        packet->frame_duration = frame_duration_ms;
++        packet->payload.assign(data, data + size);
++        if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), true)) {
++            packet_error = true;
++        }
++    });
++    demuxer->Reset();
++
++    std::vector<uint8_t> buffer(kHttpReadBufferSize);
++    while (!packet_error && !stop_requested_.load()) {
++        int size = http->Read(reinterpret_cast<char*>(buffer.data()), buffer.size());
++        if (size < 0) {
++            ESP_LOGE(TAG, "Music HTTP read failed: %d", http->GetLastError());
++            return false;
++        }
++        if (size == 0) {
++            bool complete = demuxer->Finish();
++            if (!complete) {
++                ESP_LOGW(TAG, "Music Ogg stream ended mid-frame");
++            }
++            return complete;
++        }
++        demuxer->Process(buffer.data(), size);
++        if (demuxer->HasError()) {
++            packet_error = true;
++        }
++    }
++    return false;
++}
++
++bool MusicPlayer::StreamMp3(Http* http) {
++    esp_audio_dec_handle_t decoder = nullptr;
++    esp_audio_dec_cfg_t dec_cfg = {
++        .type = ESP_AUDIO_TYPE_MP3,
++        .cfg = nullptr,
++        .cfg_sz = 0,
++    };
++    esp_audio_err_t ret = esp_audio_dec_open(&dec_cfg, &decoder);
++    if (ret != ESP_AUDIO_ERR_OK) {
++        ESP_LOGE(TAG, "Failed to open MP3 decoder: %d", ret);
++        return false;
++    }
++
++    // Decoder input (PSRAM) and output buffers. The output grows on demand
++    // when the decoder reports ESP_AUDIO_ERR_BUFF_NOT_ENOUGH.
++    uint8_t* input = static_cast<uint8_t*>(heap_caps_calloc(1, kMp3InputBufferSize, MALLOC_CAP_SPIRAM));
++    std::vector<uint8_t> output(8192);
++    bool success = false;
++    if (input == nullptr) {
++        ESP_LOGE(TAG, "Failed to allocate MP3 input buffer");
++        esp_audio_dec_close(decoder);
++        return false;
++    }
++
++    esp_ae_rate_cvt_handle_t resampler = nullptr;
++    int resampler_src_rate = 0;
++    const int codec_rate = Board::GetInstance().GetAudioCodec()->output_sample_rate();
++    size_t have = 0;
++
++    while (!stop_requested_.load()) {
++        if (have < kMp3InputBufferSize) {
++            int size = http->Read(reinterpret_cast<char*>(input + have), kMp3InputBufferSize - have);
++            if (size < 0) {
++                ESP_LOGE(TAG, "Music HTTP read failed: %d", http->GetLastError());
++                break;
++            }
++            if (size == 0) {
++                success = true;  // Stream finished cleanly.
++                break;
++            }
++            have += size;
++        }
++
++        esp_audio_dec_in_raw_t raw = {
++            .buffer = input,
++            .len = static_cast<uint32_t>(have),
++            .consumed = 0,
++            .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
++        };
++        bool decode_error = false;
++        while (raw.len > 0 && !stop_requested_.load()) {
++            esp_audio_dec_out_frame_t out_frame = {
++                .buffer = output.data(),
++                .len = static_cast<uint32_t>(output.size()),
++                .needed_size = 0,
++                .decoded_size = 0,
++            };
++            ret = esp_audio_dec_process(decoder, &raw, &out_frame);
++            if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
++                output.resize(out_frame.needed_size);
++                continue;  // Retry with the grown buffer, do not advance raw.
++            }
++            if (ret != ESP_AUDIO_ERR_OK || out_frame.decoded_size == 0) {
++                // Skip a malformed frame instead of aborting the stream.
++                const uint32_t consumed = raw.consumed > 0 ? raw.consumed : 1;
++                raw.buffer += consumed;
++                raw.len -= std::min(consumed, raw.len);
++                decode_error = true;
++                continue;
++            }
++
++            esp_audio_dec_info_t info = {};
++            esp_audio_dec_get_info(decoder, &info);
++
++            // Downmix to mono (int16 interleaved).
++            const int channels = std::max(1, static_cast<int>(info.channel));
++            const size_t samples_per_channel = out_frame.decoded_size / (sizeof(int16_t) * channels);
++            std::vector<int16_t> mono(samples_per_channel);
++            const auto* frame = reinterpret_cast<const int16_t*>(out_frame.buffer);
++            if (channels == 1) {
++                std::memcpy(mono.data(), frame, samples_per_channel * sizeof(int16_t));
++            } else {
++                for (size_t i = 0; i < samples_per_channel; ++i) {
++                    int32_t acc = 0;
++                    for (int ch = 0; ch < channels; ++ch) {
++                        acc += frame[i * channels + ch];
++                    }
++                    mono[i] = static_cast<int16_t>(acc / channels);
++                }
++            }
++
++            // (Re)open the resampler when the source rate changes.
++            if (resampler == nullptr || resampler_src_rate != static_cast<int>(info.sample_rate)) {
++                if (resampler != nullptr) {
++                    esp_ae_rate_cvt_close(resampler);
++                    resampler = nullptr;
++                }
++                if (static_cast<int>(info.sample_rate) != codec_rate) {
++                    esp_ae_rate_cvt_cfg_t cfg = MUSIC_RATE_CVT_CFG(info.sample_rate, codec_rate);
++                    if (esp_ae_rate_cvt_open(&cfg, &resampler) != ESP_AE_ERR_OK) {
++                        ESP_LOGE(TAG, "Failed to open resampler %lu -> %d",
++                                 static_cast<unsigned long>(info.sample_rate), codec_rate);
++                        resampler = nullptr;
++                    }
++                    resampler_src_rate = static_cast<int>(info.sample_rate);
++                } else {
++                    resampler_src_rate = static_cast<int>(info.sample_rate);
++                }
++            }
++
++            std::vector<int16_t> out_pcm;
++            if (resampler != nullptr) {
++                uint32_t max_out = 0;
++                esp_ae_rate_cvt_get_max_out_sample_num(resampler, mono.size(), &max_out);
++                out_pcm.resize(max_out);
++                uint32_t actual = max_out;
++                if (esp_ae_rate_cvt_process(resampler,
++                                            reinterpret_cast<esp_ae_sample_t*>(mono.data()),
++                                            mono.size(),
++                                            reinterpret_cast<esp_ae_sample_t*>(out_pcm.data()),
++                                            &actual) != ESP_AE_ERR_OK ||
++                    actual == 0) {
++                    raw.buffer += raw.consumed;
++                    raw.len -= std::min(raw.consumed, raw.len);
++                    continue;
++                }
++                out_pcm.resize(actual);
++            } else {
++                out_pcm = std::move(mono);
++            }
++
++            if (!audio_service_.PushPcmToPlaybackQueue(std::move(out_pcm), kPushPcmTimeoutMs)) {
++                ESP_LOGW(TAG, "Playback queue push timed out or service stopped");
++                stop_requested_.store(true);
++                break;
++            }
++
++            raw.buffer += raw.consumed;
++            raw.len -= std::min(raw.consumed, raw.len);
++        }
++        (void)decode_error;
++
++        // Compact unconsumed input to the front of the buffer.
++        have = raw.len;
++        if (have > 0 && raw.buffer != input) {
++            std::memmove(input, raw.buffer, have);
++        }
++        // Guard against an undecodable stream filling the buffer forever.
++        if (have == kMp3InputBufferSize && decode_error) {
++            ESP_LOGE(TAG, "MP3 stream cannot be decoded, aborting");
++            break;
++        }
++    }
++
++    if (resampler != nullptr) {
++        esp_ae_rate_cvt_close(resampler);
++    }
++    heap_caps_free(input);
++    esp_audio_dec_close(decoder);
++    return success;
++}
+diff --git a/main/audio/music_player.h b/main/audio/music_player.h
+new file mode 100644
+index 0000000..9592d9a
+--- /dev/null
++++ b/main/audio/music_player.h
+@@ -0,0 +1,60 @@
++#ifndef MUSIC_PLAYER_H_
++#define MUSIC_PLAYER_H_
++
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <string>
++
++#include "audio_service.h"
++
++/*
++ * MusicPlayer streams background music from an HTTP(S) URL into the audio
++ * output pipeline, alongside (and independently of) the voice session.
++ *
++ * Supported formats:
++ *   - OGG/Opus streams (same format as server notifications): packets are
++ *     demuxed and pushed into the decode queue, reusing the Opus path.
++ *   - MP3 streams: decoded in software via esp_audio_codec, downmixed to
++ *     mono, resampled to the codec output rate, and pushed as raw PCM.
++ *
++ * Playback is mutually exclusive with speech by design: starting music
++ * resets the playback queues, and a wake word stops the music.
++ */
++class MusicPlayer {
++public:
++    explicit MusicPlayer(AudioService& audio_service);
++    ~MusicPlayer();
++
++    // Starts streaming `url`. Any previous stream is stopped first.
++    // Returns true when the worker task was started.
++    bool Play(std::string url);
++
++    // Stops the current stream and waits (bounded) for the worker to exit.
++    void Stop();
++
++    bool IsPlaying() const { return playing_.load(); }
++    const std::string& current_url() const { return url_; }
++
++private:
++    static void WorkerEntry(void* arg);
++    void WorkerTask(std::string url);
++
++    bool StreamOgg(class Http* http);
++    bool StreamMp3(class Http* http);
++
++    AudioService& audio_service_;
++
++    mutable std::mutex mutex_;
++    std::condition_variable stop_cv_;
++    std::atomic<bool> playing_{false};
++    std::atomic<bool> stop_requested_{false};
++    bool worker_running_ = false;
++    TaskHandle_t task_handle_ = nullptr;
++    std::string url_;
++};
++
++#endif  // MUSIC_PLAYER_H_
+diff --git a/main/boards/common/board.h b/main/boards/common/board.h
+index 19d3f2f..7cd5d36 100644
+--- a/main/boards/common/board.h
++++ b/main/boards/common/board.h
+@@ -80,6 +80,8 @@ public:
+     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
+     virtual std::string GetSystemInfoJson();
+     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
++    // 服务端下发的设备配置更新后调用（OTA 检查响应携带 device_config 时）
++    virtual void ApplyDeviceConfig() {}
+     virtual std::string GetBoardJson() = 0;
+     virtual std::string GetDeviceStatusJson() = 0;
+ };
+diff --git a/main/boards/common/power_save_timer.cc b/main/boards/common/power_save_timer.cc
+index 522e64c..c7c7f9a 100644
+--- a/main/boards/common/power_save_timer.cc
++++ b/main/boards/common/power_save_timer.cc
+@@ -47,6 +47,19 @@ void PowerSaveTimer::SetEnabled(bool enabled) {
+     }
+ }
+ 
++void PowerSaveTimer::SetSleepTimeout(int seconds) {
++    if (seconds == seconds_to_sleep_) {
++        return;
++    }
++    seconds_to_sleep_ = seconds;
++    ticks_ = 0;
++    ESP_LOGI(TAG, "Sleep timeout set to %d seconds", seconds);
++    if (seconds <= 0 && in_sleep_mode_) {
++        // 禁用自动省电：若已在省电模式则唤醒屏幕
++        WakeUp();
++    }
++}
++
+ void PowerSaveTimer::OnEnterSleepMode(std::function<void()> callback) {
+     on_enter_sleep_mode_ = callback;
+ }
+@@ -67,7 +80,7 @@ void PowerSaveTimer::PowerSaveCheck() {
+     }
+ 
+     ticks_++;
+-    if (seconds_to_sleep_ != -1 && ticks_ >= seconds_to_sleep_) {
++    if (seconds_to_sleep_ > 0 && ticks_ >= seconds_to_sleep_) {
+         if (!in_sleep_mode_) {
+             ESP_LOGI(TAG, "Enabling power save mode");
+             in_sleep_mode_ = true;
+diff --git a/main/boards/common/power_save_timer.h b/main/boards/common/power_save_timer.h
+index 4c95671..e337e51 100644
+--- a/main/boards/common/power_save_timer.h
++++ b/main/boards/common/power_save_timer.h
+@@ -11,6 +11,9 @@ public:
+     ~PowerSaveTimer();
+ 
+     void SetEnabled(bool enabled);
++    // 设置空闲多少秒后进入省电模式；<= 0 表示禁用自动省电（屏幕常亮）
++    void SetSleepTimeout(int seconds);
++    int GetSleepTimeout() const { return seconds_to_sleep_; }
+     void OnEnterSleepMode(std::function<void()> callback);
+     void OnExitSleepMode(std::function<void()> callback);
+     void OnShutdownRequest(std::function<void()> callback);
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index cac71dd..85d7d58 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -347,6 +347,8 @@ std::string WifiBoard::GetDeviceStatusJson() {
+     if (auto codec = board.GetAudioCodec()) {
+         cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
+     }
++    auto& app = Application::GetInstance();
++    cJSON_AddBoolToObject(audio_speaker, "playing_music", app.IsMusicPlaying());
+     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
+ 
+     // Screen
+diff --git a/main/boards/zhengchen/minicam/config.json b/main/boards/zhengchen/minicam/config.json
+index 1a5e453..cc184b9 100644
+--- a/main/boards/zhengchen/minicam/config.json
++++ b/main/boards/zhengchen/minicam/config.json
+@@ -7,7 +7,9 @@
+             "name": "zhengchen-minicam",
+             "sdkconfig_append": [
+                 "CONFIG_USE_DEVICE_AEC=y",
+-                "CONFIG_OTA_URL=\"http://chenMac-mini.local:8080/xiaozhi/ota/\""
++                "CONFIG_OTA_URL=\"http://192.168.18.172:8080/xiaozhi/ota/\"",
++                "CONFIG_EMOTE_DEF_BG_COLOR=0xC2B280",
++                "CONFIG_EMOTE_DEF_FONT_COLOR=0x000000"
+             ]
+         }
+     ]
+diff --git a/main/boards/zhengchen/minicam/zhengchen_minicam.cc b/main/boards/zhengchen/minicam/zhengchen_minicam.cc
+index bc70c18..2b684ca 100644
+--- a/main/boards/zhengchen/minicam/zhengchen_minicam.cc
++++ b/main/boards/zhengchen/minicam/zhengchen_minicam.cc
+@@ -6,6 +6,8 @@
+ #include "button.h"
+ #include "config.h"
+ #include "mcp_server.h"
++#include "power_save_timer.h"
++#include "settings.h"
+ #include "led/single_led.h"
+ #include "esp32_camera.h"
+ #include "zhengchen_minicam_lcd_display.h"
+@@ -40,6 +42,7 @@ private:
+     Button volume_up_button_;
+     Button volume_down_button_;
+     Esp32Camera* camera_;
++    PowerSaveTimer* power_save_timer_;
+     httpd_handle_t camera_http_server_ = nullptr;
+     i2c_master_bus_handle_t codec_i2c_bus_;
+     adc_oneshot_unit_handle_t adc_handle_;
+@@ -99,6 +102,9 @@ private:
+     }
+ 
+     void EnterSettingsMenu() {
++        if (power_save_timer_ != nullptr) {
++            power_save_timer_->WakeUp();
++        }
+         auto* display = GetMinicamDisplay();
+         if (display == nullptr) {
+             return;
+@@ -108,6 +114,9 @@ private:
+     }
+ 
+     void ToggleSettingsMenu() {
++        if (power_save_timer_ != nullptr) {
++            power_save_timer_->WakeUp();
++        }
+         auto* display = GetMinicamDisplay();
+         if (display == nullptr) {
+             return;
+@@ -185,6 +194,9 @@ private:
+ 
+         switch (new_state) {
+         case AdcVolumeKeyState::VolumeDown: {
++            if (power_save_timer_ != nullptr) {
++                power_save_timer_->WakeUp();
++            }
+             auto* display = GetMinicamDisplay();
+             if (display != nullptr && display->IsSettingsMenuVisible()) {
+                 display->SelectNextMenuItem();
+@@ -194,6 +206,9 @@ private:
+             break;
+         }
+         case AdcVolumeKeyState::VolumeUp: {
++            if (power_save_timer_ != nullptr) {
++                power_save_timer_->WakeUp();
++            }
+             auto* display = GetMinicamDisplay();
+             if (display != nullptr && display->IsSettingsMenuVisible()) {
+                 display->SelectPreviousMenuItem();
+@@ -210,6 +225,7 @@ private:
+     }
+ 
+     void UpdateBatteryState(int battery_raw, int battery_voltage, int ref_raw, int ref_voltage) {
++        const bool was_charging = is_charging_;
+         battery_sample_raw_ = battery_raw;
+         battery_sample_voltage_mv_ = battery_voltage;
+         battery_ref_raw_ = ref_raw;
+@@ -232,6 +248,11 @@ private:
+         ref_voltage = ref_voltage_sum / static_cast<int>(battery_sample_count_);
+ 
+         is_charging_ = ref_raw > 2300;
++        if (was_charging != is_charging_ && power_save_timer_ != nullptr) {
++            // 使用电池供电且未禁用自动息屏时启用省电，充电时保持常亮
++            power_save_timer_->SetEnabled(
++                power_save_timer_->GetSleepTimeout() > 0 && !is_charging_);
++        }
+ 
+         float battery_voltage_v = 0.0f;
+         if (is_charging_) {
+@@ -444,8 +465,44 @@ private:
+                                     DISPLAY_SWAP_XY);
+     }
+ 
++    void ApplyPowerSaveTimeout(int seconds) {
++        // 持久化到 NVS，重启后仍生效
++        Settings settings("power", true);
++        settings.SetInt("sleep_timeout_s", seconds);
++        if (power_save_timer_ != nullptr) {
++            power_save_timer_->SetSleepTimeout(seconds);
++            // <= 0 表示禁用自动息屏；充电时始终不自动息屏
++            power_save_timer_->SetEnabled(seconds > 0 && !is_charging_);
++        }
++    }
++
++    void InitializePowerSaveTimer() {
++        // 空闲多少秒后自动总屏：可由服务端 device_config 或语音（MCP）修改，存 NVS
++        Settings settings("power", false);
++        int sleep_timeout = settings.GetInt("sleep_timeout_s", 60);
++        // cpu_max_freq = -1：不降频、不进 light sleep、不关闭唤醒词检测，
++        // 仅在空闲时关闭背光，唤醒词（"小智小智"）触发后由 SetPowerSaveLevel 唤醒屏幕。
++        power_save_timer_ = new PowerSaveTimer(-1, sleep_timeout, -1);
++        power_save_timer_->OnEnterSleepMode([this]() {
++            GetDisplay()->SetPowerSaveMode(true);
++            if (auto* backlight = GetBacklight()) {
++                backlight->SetBrightness(1);
++            }
++        });
++        power_save_timer_->OnExitSleepMode([this]() {
++            GetDisplay()->SetPowerSaveMode(false);
++            if (auto* backlight = GetBacklight()) {
++                backlight->RestoreBrightness();
++            }
++        });
++        power_save_timer_->SetEnabled(true);
++    }
++
+     void InitializeButtons() {
+         boot_button_.OnClick([this]() {
++            if (power_save_timer_ != nullptr) {
++                power_save_timer_->WakeUp();
++            }
+             auto* display = GetMinicamDisplay();
+             if (display != nullptr && display->IsSettingsMenuVisible()) {
+                 display->ActivateSelectedMenuItem();
+@@ -457,6 +514,9 @@ private:
+         });
+ 
+         boot_button_.OnDoubleClick([this]() {
++            if (power_save_timer_ != nullptr) {
++                power_save_timer_->WakeUp();
++            }
+             ToggleSettingsMenu();
+         });
+     }
+@@ -589,18 +649,21 @@ private:
+             });
+         }
+ 
+-        // 添加摄像头拍照工具
+-        mcp_server.AddTool("self.camera.capture",
+-            "Capture a photo with the camera and display it",
+-            PropertyList(),
++        // 拍照/视觉分析使用全局 self.camera.take_photo 工具（拍照 + 屏幕预览 + 上传服务端 vision 分析），
++        // 不再注册只拍照不分析的 capture 工具，避免 AI 选错工具后误以为没有分析能力。
++
++        // 设置自动息屏空闲时长（秒）；0 表示屏幕常亮
++        mcp_server.AddTool("self.power_save.set_timeout",
++            "Set the idle timeout in seconds before the screen turns off to save power. "
++            "0 disables auto power save (screen always on). Default is 60 seconds.",
++            PropertyList({
++                Property("seconds", kPropertyTypeInteger, 0, 86400)
++            }),
+             [this](const PropertyList& properties) {
+-                if (camera_ && camera_->Capture()) {
+-                    ESP_LOGI(TAG, "Camera capture successful");
+-                    return true;
+-                } else {
+-                    ESP_LOGE(TAG, "Camera capture failed");
+-                    return false;
+-                }
++                int seconds = properties["seconds"].value<int>();
++                ApplyPowerSaveTimeout(seconds);
++                ESP_LOGI(TAG, "Power save timeout set to %d seconds via MCP", seconds);
++                return true;
+             });
+     }
+ 
+@@ -610,6 +673,7 @@ public:
+           volume_up_button_(VOLUME_UP_BUTTON_GPIO),
+           volume_down_button_(VOLUME_DOWN_BUTTON_GPIO),
+           camera_(nullptr),
++          power_save_timer_(nullptr),
+           adc_handle_(nullptr),
+           adc_cali_handle_(nullptr),
+           adc_task_handle_(nullptr),
+@@ -625,6 +689,7 @@ public:
+             GetBacklight()->RestoreBrightness();
+         }
+         InitializeButtons();
++        InitializePowerSaveTimer();
+         InitializeCamera();
+         InitializeTools();
+     }
+@@ -662,6 +727,8 @@ public:
+         if (auto codec = GetAudioCodec()) {
+             cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
+         }
++        auto& app = Application::GetInstance();
++        cJSON_AddBoolToObject(audio_speaker, "playing_music", app.IsMusicPlaying());
+         cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
+ 
+         auto screen = cJSON_CreateObject();
+@@ -698,6 +765,23 @@ public:
+         return true;
+     }
+ 
++    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
++        // 唤醒词/聊天等场景切换到 PERFORMANCE 时，唤醒屏幕（恢复背光）
++        if (level != PowerSaveLevel::LOW_POWER && power_save_timer_ != nullptr) {
++            power_save_timer_->WakeUp();
++        }
++        WifiBoard::SetPowerSaveLevel(level);
++    }
++
++    virtual void ApplyDeviceConfig() override {
++        // 服务端 OTA 检查响应下发了 device_config（已写入 NVS），在此应用
++        Settings settings("power", false);
++        int sleep_timeout = settings.GetInt("sleep_timeout_s", 60);
++        if (power_save_timer_ != nullptr) {
++            ApplyPowerSaveTimeout(sleep_timeout);
++        }
++    }
++
+     virtual Camera* GetCamera() override {
+         return camera_;
+     }
+diff --git a/main/display/lcd_display.cc b/main/display/lcd_display.cc
+index 9fdf0b9..6706620 100644
+--- a/main/display/lcd_display.cc
++++ b/main/display/lcd_display.cc
+@@ -32,7 +32,8 @@ void LcdDisplay::InitializeLcdThemes() {
+ 
+     // light theme
+     auto light_theme = new LvglTheme("light");
+-    light_theme->set_background_color(lv_color_hex(0xFFFFFF));
++    // 暗黄背景（计算器 LCD 风，与 Otto 表情浑然一体）
++    light_theme->set_background_color(lv_color_hex(0xC2B280));
+     light_theme->set_text_color(lv_color_hex(0x000000));
+     light_theme->set_chat_background_color(lv_color_hex(0xE0E0E0));
+     light_theme->set_user_bubble_color(lv_color_hex(0x00FF00));
+diff --git a/main/mcp_server.cc b/main/mcp_server.cc
+index a8b7624..5106ff0 100644
+--- a/main/mcp_server.cc
++++ b/main/mcp_server.cc
+@@ -62,6 +62,31 @@ void McpServer::AddCommonTools() {
+             codec->SetOutputVolume(properties["volume"].value<int>());
+             return true;
+         });
++
++    AddTool("self.audio_speaker.play_music",
++        "Play music or an internet radio station from an HTTP(S) URL. The URL must be a direct audio stream URL "
++        "(an mp3 file/stream or an ogg/opus stream), not a web page. Typical sources are internet radio station "
++        "stream addresses. Music keeps playing after the conversation ends until it is stopped or the user wakes "
++        "the device up again. If the user asks for music but no stream URL is known, ask the user for a stream URL "
++        "instead of guessing one.",
++        PropertyList({
++            Property("url", kPropertyTypeString)
++        }),
++        [](const PropertyList& properties) -> ReturnValue {
++            auto url = properties["url"].value<std::string>();
++            if (url.empty()) {
++                return false;
++            }
++            return Application::GetInstance().PlayMusic(url);
++        });
++
++    AddTool("self.audio_speaker.stop_music",
++        "Stop the music or radio stream that is currently playing on the device.",
++        PropertyList(),
++        [](const PropertyList& properties) -> ReturnValue {
++            Application::GetInstance().StopMusic();
++            return true;
++        });
+     
+     auto backlight = board.GetBacklight();
+     if (backlight) {
+diff --git a/main/ota.cc b/main/ota.cc
+index bcc0dc5..8d7e975 100644
+--- a/main/ota.cc
++++ b/main/ota.cc
+@@ -240,6 +240,18 @@ esp_err_t Ota::CheckVersion() {
+         ESP_LOGW(TAG, "No firmware section found!");
+     }
+ 
++    // 服务端下发的设备配置（可选）：{"device_config":{"power_save_timeout":60}}
++    cJSON *device_config = cJSON_GetObjectItem(root, "device_config");
++    if (cJSON_IsObject(device_config)) {
++        cJSON *ps_timeout = cJSON_GetObjectItem(device_config, "power_save_timeout");
++        if (cJSON_IsNumber(ps_timeout) && ps_timeout->valueint > 0 && ps_timeout->valueint <= 86400) {
++            Settings settings("power", true);
++            settings.SetInt("sleep_timeout_s", ps_timeout->valueint);
++            has_device_config_ = true;
++            ESP_LOGI(TAG, "Device config: power_save_timeout=%d", ps_timeout->valueint);
++        }
++    }
++
+     cJSON_Delete(root);
+     return ESP_OK;
+ }
+diff --git a/main/ota.h b/main/ota.h
+index 1e5d687..2ebe702 100644
+--- a/main/ota.h
++++ b/main/ota.h
+@@ -20,6 +20,7 @@ public:
+     bool HasWebsocketConfig() { return has_websocket_config_; }
+     bool HasActivationCode() { return has_activation_code_; }
+     bool HasServerTime() { return has_server_time_; }
++    bool HasDeviceConfig() { return has_device_config_; }
+     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
+     static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
+     void MarkCurrentVersionValid();
+@@ -38,6 +39,7 @@ private:
+     bool has_mqtt_config_ = false;
+     bool has_websocket_config_ = false;
+     bool has_server_time_ = false;
++    bool has_device_config_ = false;
+     bool has_activation_code_ = false;
+     bool has_serial_number_ = false;
+     bool has_activation_challenge_ = false;

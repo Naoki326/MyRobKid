@@ -1,0 +1,2054 @@
+From db64aac8a97c1a2d36aa686780221c338e56e000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=B3=E4=BA=AC=E8=8F=81?=
+ <chenjingjing@chenMac-mini.local>
+Date: Sat, 22 Aug 2026 15:10:43 +0800
+Subject: [PATCH 1/2] feat: add zhengchen-minicam board support (local
+ customization)
+
+---
+ main/CMakeLists.txt                           |   5 +
+ main/Kconfig.projbuild                        |   3 +
+ main/boards/zhengchen/minicam/config.h        |  90 +++
+ main/boards/zhengchen/minicam/config.json     |  13 +
+ .../zhengchen/minicam/zhengchen_minicam.cc    | 641 ++++++++++++++++++
+ .../minicam/zhengchen_minicam_lcd_display.cc  | 596 ++++++++++++++++
+ .../minicam/zhengchen_minicam_lcd_display.h   |  68 ++
+ 7 files changed, 1416 insertions(+)
+ create mode 100644 main/boards/zhengchen/minicam/config.h
+ create mode 100644 main/boards/zhengchen/minicam/config.json
+ create mode 100644 main/boards/zhengchen/minicam/zhengchen_minicam.cc
+ create mode 100644 main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc
+ create mode 100644 main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.h
+
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index dc14fdb..d901fd1 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -756,6 +756,11 @@ elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_CAM_ML307)
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
+     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
+     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
++elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_MINICAM)
++    set(BOARD_DIR "zhengchen/minicam")
++    set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
++    set(BUILTIN_ICON_FONT font_material_symbols_16_4)
++    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_32)
+ elseif(CONFIG_BOARD_TYPE_SPOTPEAR_ESP32_S3_1_54_MUMA)
+     set(BOARD_DIR "spotpear/sp-esp32-s3-1.54-muma")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_16_4)
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index c0de794..ddd7aaf 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -615,6 +615,9 @@ choice BOARD_TYPE
+     config BOARD_TYPE_ZHENGCHEN_CAM
+         bool "Zhengchen AI Camera Wi-Fi (征辰科技)"
+         depends on IDF_TARGET_ESP32S3
++    config BOARD_TYPE_ZHENGCHEN_MINICAM
++        bool "Zhengchen MiniCam (征辰科技)"
++        depends on IDF_TARGET_ESP32S3
+ endchoice
+ 
+ choice XIAOZHI_NETWORK_TYPE
+diff --git a/main/boards/zhengchen/minicam/config.h b/main/boards/zhengchen/minicam/config.h
+new file mode 100644
+index 0000000..ad3301d
+--- /dev/null
++++ b/main/boards/zhengchen/minicam/config.h
+@@ -0,0 +1,90 @@
++#ifndef _BOARD_CONFIG_H_
++#define _BOARD_CONFIG_H_
++
++#include <driver/gpio.h>
++
++#define AUDIO_INPUT_REFERENCE       true
++
++#define AUDIO_INPUT_SAMPLE_RATE  24000
++#define AUDIO_OUTPUT_SAMPLE_RATE 24000
++
++#define AUDIO_I2S_GPIO_MCLK GPIO_NUM_38
++#define AUDIO_I2S_GPIO_WS GPIO_NUM_13
++#define AUDIO_I2S_GPIO_BCLK GPIO_NUM_14
++#define AUDIO_I2S_GPIO_DIN  GPIO_NUM_12
++#define AUDIO_I2S_GPIO_DOUT GPIO_NUM_45
++
++#define AUDIO_CODEC_PA_PIN       GPIO_NUM_NC
++#define AUDIO_CODEC_I2C_SCL_PIN  GPIO_NUM_2
++#define AUDIO_CODEC_I2C_SDA_PIN  GPIO_NUM_1
++#define AUDIO_CODEC_ES8388_ADDR ES8388_CODEC_DEFAULT_ADDR
++
++
++#define BUILTIN_LED_GPIO        GPIO_NUM_48
++#define STATE_OUTPUT_GPIO       GPIO_NUM_47
++#define BOOT_BUTTON_GPIO        GPIO_NUM_11
++#define TOUCH_BUTTON_GPIO       GPIO_NUM_NC
++#define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_NC
++#define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
++
++#define BATTERY_ADC_CHANNEL      ADC_CHANNEL_2  // GPIO3
++#define BATTERY_REF_ADC_CHANNEL  ADC_CHANNEL_3  // GPIO4
++#define VOLUME_KEY_ADC_CHANNEL   ADC_CHANNEL_8  // GPIO9
++#define VOLUME_DOWN_KEY_MIN_MV   0
++#define VOLUME_DOWN_KEY_MAX_MV   700
++#define VOLUME_UP_KEY_MIN_MV     900
++#define VOLUME_UP_KEY_MAX_MV     3000
++#define BATTERY_REF_VOLTAGE_MV   1270
++#define CHARGER_DETECT_RATIO     1.3f
++#define BATTERY_FULL_VOLTAGE_MV  4200
++
++//Camera Config
++#define CAMERA_PIN_D0      GPIO_NUM_7
++#define CAMERA_PIN_D1      GPIO_NUM_43
++#define CAMERA_PIN_D2      GPIO_NUM_5
++#define CAMERA_PIN_D3      GPIO_NUM_6
++#define CAMERA_PIN_D4      GPIO_NUM_8
++#define CAMERA_PIN_D5      GPIO_NUM_44
++#define CAMERA_PIN_D6      GPIO_NUM_10
++#define CAMERA_PIN_D7      GPIO_NUM_15
++#define CAMERA_PIN_XCLK    GPIO_NUM_17
++#define CAMERA_PIN_PCLK    GPIO_NUM_16
++#define CAMERA_PIN_VSYNC   GPIO_NUM_21
++#define CAMERA_PIN_HREF    GPIO_NUM_18
++#define CAMERA_PIN_SIOD    GPIO_NUM_1     // SDA = I2C Data (共用音频 I2C 总线)
++#define CAMERA_PIN_SIOC    GPIO_NUM_2     // SCL = I2C Clock (共用音频 I2C 总线)
++#define CAMERA_PIN_PWDN    GPIO_NUM_NC
++#define CAMERA_PIN_RESET   GPIO_NUM_NC
++#define XCLK_FREQ_HZ       24000000
++
++
++#define DISPLAY_BACKLIGHT_PIN GPIO_NUM_42
++#define DISPLAY_MOSI_PIN      GPIO_NUM_41
++#define DISPLAY_CLK_PIN       GPIO_NUM_46
++#define DISPLAY_DC_PIN        GPIO_NUM_39
++#define DISPLAY_RST_PIN       GPIO_NUM_NC
++#define DISPLAY_CS_PIN        GPIO_NUM_40
++
++
++// LCD ST7789 Config
++#define LCD_TYPE_ST7789_SERIAL
++#define DISPLAY_WIDTH   240
++#define DISPLAY_HEIGHT  320
++#define DISPLAY_MIRROR_X false
++#define DISPLAY_MIRROR_Y false
++#define DISPLAY_SWAP_XY false
++
++#define DISPLAY_WIDTH_1  320
++#define DISPLAY_HEIGHT_1 240
++#define DISPLAY_MIRROR_X_1 true
++#define DISPLAY_MIRROR_Y_1 false
++#define DISPLAY_SWAP_XY_1 true
++
++#define DISPLAY_INVERT_COLOR    true
++#define DISPLAY_RGB_ORDER  LCD_RGB_ELEMENT_ORDER_RGB
++#define DISPLAY_OFFSET_X  0
++#define DISPLAY_OFFSET_Y  0
++#define DISPLAY_BACKLIGHT_OUTPUT_INVERT true
++#define DISPLAY_SPI_MODE 0
++
++#endif // _BOARD_CONFIG_H_
+diff --git a/main/boards/zhengchen/minicam/config.json b/main/boards/zhengchen/minicam/config.json
+new file mode 100644
+index 0000000..e59ab91
+--- /dev/null
++++ b/main/boards/zhengchen/minicam/config.json
+@@ -0,0 +1,13 @@
++{
++    "manufacturer": "zhengchen",
++    "type": "zhengchen-minicam",
++    "target": "esp32s3",
++    "builds": [
++        {
++            "name": "zhengchen-minicam",
++            "sdkconfig_append": [
++                "CONFIG_USE_DEVICE_AEC=y"
++            ]
++        }
++    ]
++}
+diff --git a/main/boards/zhengchen/minicam/zhengchen_minicam.cc b/main/boards/zhengchen/minicam/zhengchen_minicam.cc
+new file mode 100644
+index 0000000..c8ccaf2
+--- /dev/null
++++ b/main/boards/zhengchen/minicam/zhengchen_minicam.cc
+@@ -0,0 +1,641 @@
++#include "wifi_board.h"
++#include "codecs/es8388_audio_codec.h"
++#include "display/lcd_display.h"
++#include "system_reset.h"
++#include "application.h"
++#include "button.h"
++#include "config.h"
++#include "mcp_server.h"
++#include "led/single_led.h"
++#include "esp32_camera.h"
++#include "zhengchen_minicam_lcd_display.h"
++
++#include <esp_log.h>
++#include <driver/i2c_master.h>
++#include <driver/gpio.h>
++#include <wifi_manager.h>
++#include <esp_lcd_panel_vendor.h>
++#include <esp_lcd_panel_io.h>
++#include <esp_lcd_panel_ops.h>
++#include <driver/spi_common.h>
++#include <driver/i2c_master.h>
++#include <esp_adc/adc_oneshot.h>
++#include <esp_adc/adc_cali.h>
++#include <esp_adc/adc_cali_scheme.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <freertos/semphr.h>
++
++#define TAG "zhengchen_minicam"
++
++class zhengchen_minicam : public WifiBoard {
++private:
++    Button boot_button_;
++    Button volume_up_button_;
++    Button volume_down_button_;
++    Esp32Camera* camera_;
++    i2c_master_bus_handle_t codec_i2c_bus_;
++    adc_oneshot_unit_handle_t adc_handle_;
++    adc_cali_handle_t adc_cali_handle_;
++    TaskHandle_t adc_task_handle_;
++    TaskHandle_t volume_key_task_handle_;
++    SemaphoreHandle_t adc_mutex_;
++    Display* display_;
++    static constexpr size_t kBatteryAverageWindowSize = 8;
++    int battery_samples_mv_[kBatteryAverageWindowSize] = {0};
++    int battery_ref_samples_mv_[kBatteryAverageWindowSize] = {0};
++    size_t battery_sample_count_ = 0;
++    size_t battery_sample_index_ = 0;
++    int battery_voltage_mv_ = BATTERY_FULL_VOLTAGE_MV;
++    int battery_percent_ = 100;
++    int battery_sample_raw_ = 0;
++    int battery_ref_raw_ = 0;
++    int battery_sample_voltage_mv_ = 0;
++    int battery_ref_voltage_mv_ = BATTERY_REF_VOLTAGE_MV;
++    int volume_key_voltage_mv_ = 0;
++    bool is_charging_ = false;
++    int last_reported_battery_percent_ = -1;
++    bool last_reported_is_charging_ = false;
++    enum class AdcVolumeKeyState : uint8_t {
++        None,
++        VolumeDown,
++        VolumeUp,
++    };
++    AdcVolumeKeyState volume_key_state_ = AdcVolumeKeyState::None;
++    AdcVolumeKeyState volume_key_candidate_state_ = AdcVolumeKeyState::None;
++    uint8_t volume_key_stable_count_ = 0;
++    bool is_landscape_ = false;
++    int charging_samples_[3] = {0, 0, 0};
++    size_t charging_sample_count_ = 0;
++    size_t charging_sample_index_ = 0;
++
++    void UpdateStateOutput() {
++        const auto state = Application::GetInstance().GetDeviceState();
++        const int level = (state == kDeviceStateListening || state == kDeviceStateSpeaking) ? 0 : 1;
++        gpio_set_level(STATE_OUTPUT_GPIO, level);
++    }
++
++    void InitializeStateOutput() {
++        const gpio_config_t io_conf = {
++            .pin_bit_mask = 1ULL << STATE_OUTPUT_GPIO,
++            .mode = GPIO_MODE_OUTPUT,
++            .pull_up_en = GPIO_PULLUP_DISABLE,
++            .pull_down_en = GPIO_PULLDOWN_DISABLE,
++            .intr_type = GPIO_INTR_DISABLE,
++        };
++        ESP_ERROR_CHECK(gpio_config(&io_conf));
++        gpio_set_level(STATE_OUTPUT_GPIO, 1);
++    }
++
++    ZhengchenMinicamLcdDisplay* GetMinicamDisplay() {
++        return dynamic_cast<ZhengchenMinicamLcdDisplay*>(display_);
++    }
++
++    void EnterSettingsMenu() {
++        auto* display = GetMinicamDisplay();
++        if (display == nullptr) {
++            return;
++        }
++        display->ShowSettingsMenu();
++        display->ShowNotification("设置菜单");
++    }
++
++    void ToggleSettingsMenu() {
++        auto* display = GetMinicamDisplay();
++        if (display == nullptr) {
++            return;
++        }
++
++        if (display->IsSettingsMenuVisible()) {
++            display->HideSettingsMenu();
++            display->ShowNotification("关闭设置");
++        } else {
++            display->ShowSettingsMenu();
++            display->ShowNotification("设置菜单");
++        }
++    }
++
++    void AdjustVolume(int delta) {
++        auto* codec = GetAudioCodec();
++        if (codec == nullptr) {
++            return;
++        }
++
++        int volume = codec->output_volume() + delta;
++        if (volume < 0) {
++            volume = 0;
++        }
++        if (volume > 100) {
++            volume = 100;
++        }
++
++        codec->SetOutputVolume(volume);
++        GetDisplay()->ShowNotification(std::to_string(volume / 10));
++    }
++
++    void ToggleAec() {
++        auto& app = Application::GetInstance();
++        app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
++    }
++
++    void ToggleOrientation() {
++        auto* display = GetMinicamDisplay();
++        if (display == nullptr) {
++            return;
++        }
++        display->ToggleOrientation();
++        display->ShowNotification(display->IsLandscape() ? "横屏" : "竖屏");
++    }
++
++    void ReprovisionNetwork() {
++        EnterWifiConfigMode();
++    }
++
++    void HandleAdcVolumeKey(int voltage_mv) {
++        volume_key_voltage_mv_ = voltage_mv;
++
++        AdcVolumeKeyState new_state = AdcVolumeKeyState::None;
++        if (voltage_mv >= VOLUME_DOWN_KEY_MIN_MV && voltage_mv <= VOLUME_DOWN_KEY_MAX_MV) {
++            new_state = AdcVolumeKeyState::VolumeDown;
++        } else if (voltage_mv >= VOLUME_UP_KEY_MIN_MV && voltage_mv <= VOLUME_UP_KEY_MAX_MV) {
++            new_state = AdcVolumeKeyState::VolumeUp;
++        }
++
++        if (new_state != volume_key_candidate_state_) {
++            volume_key_candidate_state_ = new_state;
++            volume_key_stable_count_ = 1;
++            return;
++        }
++
++        if (volume_key_stable_count_ < 3) {
++            ++volume_key_stable_count_;
++            return;
++        }
++
++        if (new_state == volume_key_state_) {
++            return;
++        }
++
++        switch (new_state) {
++        case AdcVolumeKeyState::VolumeDown: {
++            auto* display = GetMinicamDisplay();
++            if (display != nullptr && display->IsSettingsMenuVisible()) {
++                display->SelectNextMenuItem();
++            } else {
++                AdjustVolume(-10);
++            }
++            break;
++        }
++        case AdcVolumeKeyState::VolumeUp: {
++            auto* display = GetMinicamDisplay();
++            if (display != nullptr && display->IsSettingsMenuVisible()) {
++                display->SelectPreviousMenuItem();
++            } else {
++                AdjustVolume(10);
++            }
++            break;
++        }
++        case AdcVolumeKeyState::None:
++            break;
++        }
++
++        volume_key_state_ = new_state;
++    }
++
++    void UpdateBatteryState(int battery_raw, int battery_voltage, int ref_raw, int ref_voltage) {
++        battery_sample_raw_ = battery_raw;
++        battery_sample_voltage_mv_ = battery_voltage;
++        battery_ref_raw_ = ref_raw;
++        battery_ref_voltage_mv_ = ref_voltage;
++
++        battery_samples_mv_[battery_sample_index_] = battery_voltage;
++        battery_ref_samples_mv_[battery_sample_index_] = ref_voltage;
++        battery_sample_index_ = (battery_sample_index_ + 1) % kBatteryAverageWindowSize;
++        if (battery_sample_count_ < kBatteryAverageWindowSize) {
++            ++battery_sample_count_;
++        }
++
++        int battery_voltage_sum = 0;
++        int ref_voltage_sum = 0;
++        for (size_t i = 0; i < battery_sample_count_; ++i) {
++            battery_voltage_sum += battery_samples_mv_[i];
++            ref_voltage_sum += battery_ref_samples_mv_[i];
++        }
++        battery_voltage = battery_voltage_sum / static_cast<int>(battery_sample_count_);
++        ref_voltage = ref_voltage_sum / static_cast<int>(battery_sample_count_);
++
++        is_charging_ = ref_raw > 2300;
++
++        float battery_voltage_v = 0.0f;
++        if (is_charging_) {
++            battery_voltage_v = static_cast<float>(battery_voltage) * 2.0f / 1000.0f;
++        } else {
++            if (ref_voltage <= 0) {
++                return;
++            }
++            battery_voltage_v = static_cast<float>(battery_voltage) * static_cast<float>(BATTERY_REF_VOLTAGE_MV) * 2.0f /
++                (static_cast<float>(ref_voltage) * 1000.0f);
++        }
++
++        battery_voltage_mv_ = static_cast<int>(battery_voltage_v * 1000.0f + 0.5f);
++
++        int percent = static_cast<int>(((battery_voltage_v - 3.4f) * 100.0f / 0.8f) + 0.5f);
++        if (percent < 0) {
++            percent = 0;
++        }
++        if (percent > 100) {
++            percent = 100;
++        }
++        battery_percent_ = percent;
++
++        if (display_ != nullptr && (battery_percent_ != last_reported_battery_percent_ || is_charging_ != last_reported_is_charging_)) {
++            last_reported_battery_percent_ = battery_percent_;
++            last_reported_is_charging_ = is_charging_;
++            Application::GetInstance().Schedule([this]() {
++                if (display_ != nullptr) {
++                    display_->UpdateStatusBar(true);
++                }
++            });
++        }
++    }
++
++    void InitializeI2c() {
++        i2c_master_bus_config_t i2c_bus_cfg = {
++            .i2c_port = I2C_NUM_0,
++            .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
++            .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
++            .clk_source = I2C_CLK_SRC_DEFAULT,
++            .glitch_ignore_cnt = 7,
++            .intr_priority = 0,
++            .trans_queue_depth = 0,
++            .flags = {
++                .enable_internal_pullup = 1,
++            },
++        };
++        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
++
++        // 扫描 I2C 总线上的设备
++        ESP_LOGI(TAG, "Scanning I2C bus...");
++        for (uint8_t addr = 0x08; addr < 0x78; addr++) {
++            i2c_device_config_t dev_cfg = {
++                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
++                .device_address = addr,
++                .scl_speed_hz = 100000,
++            };
++
++            i2c_master_dev_handle_t dev_handle;
++            if (i2c_master_bus_add_device(codec_i2c_bus_, &dev_cfg, &dev_handle) == ESP_OK) {
++                uint8_t data;
++                if (i2c_master_receive(dev_handle, &data, 1, 100) == ESP_OK) {
++                    ESP_LOGI(TAG, "Found I2C device at address 0x%02X", addr);
++                }
++                i2c_master_bus_rm_device(dev_handle);
++            }
++        }
++        ESP_LOGI(TAG, "I2C scan complete");
++    }
++
++    static void adc_read_task(void* arg) {
++        zhengchen_minicam* self = static_cast<zhengchen_minicam*>(arg);
++        int battery_raw = 0;
++        int battery_voltage = 0;
++        int ref_raw = 0;
++        int ref_voltage = 0;
++
++        while (1) {
++            self->UpdateStateOutput();
++            if (xSemaphoreTake(self->adc_mutex_, portMAX_DELAY) == pdTRUE) {
++                ESP_ERROR_CHECK(adc_oneshot_read(self->adc_handle_, BATTERY_ADC_CHANNEL, &battery_raw));
++                ESP_ERROR_CHECK(adc_oneshot_read(self->adc_handle_, BATTERY_REF_ADC_CHANNEL, &ref_raw));
++                xSemaphoreGive(self->adc_mutex_);
++            }
++
++            if (self->adc_cali_handle_) {
++                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(self->adc_cali_handle_, battery_raw, &battery_voltage));
++                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(self->adc_cali_handle_, ref_raw, &ref_voltage));
++                self->UpdateBatteryState(battery_raw, battery_voltage, ref_raw, ref_voltage);
++            }
++            vTaskDelay(pdMS_TO_TICKS(30));
++        }
++    }
++
++    static void volume_key_task(void* arg) {
++        zhengchen_minicam* self = static_cast<zhengchen_minicam*>(arg);
++        int volume_key_raw = 0;
++        int volume_key_voltage = 0;
++
++        while (1) {
++            if (xSemaphoreTake(self->adc_mutex_, portMAX_DELAY) == pdTRUE) {
++                ESP_ERROR_CHECK(adc_oneshot_read(self->adc_handle_, VOLUME_KEY_ADC_CHANNEL, &volume_key_raw));
++                xSemaphoreGive(self->adc_mutex_);
++            }
++
++            if (self->adc_cali_handle_) {
++                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(self->adc_cali_handle_, volume_key_raw, &volume_key_voltage));
++                self->HandleAdcVolumeKey(volume_key_voltage);
++            } else {
++                self->HandleAdcVolumeKey(0);
++            }
++            vTaskDelay(pdMS_TO_TICKS(20));
++        }
++    }
++
++    void InitializeADC() {
++        // 配置 ADC
++        adc_oneshot_unit_init_cfg_t init_config = {
++            .unit_id = ADC_UNIT_1,
++            .ulp_mode = ADC_ULP_MODE_DISABLE,
++        };
++        ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle_));
++
++        // 配置 ADC 通道
++        adc_oneshot_chan_cfg_t config = {
++            .atten = ADC_ATTEN_DB_12,
++            .bitwidth = ADC_BITWIDTH_DEFAULT,
++        };
++        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle_, BATTERY_ADC_CHANNEL, &config));
++        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle_, BATTERY_REF_ADC_CHANNEL, &config));
++        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle_, VOLUME_KEY_ADC_CHANNEL, &config));
++
++        // 尝试初始化校准 (ESP32-S3 使用 curve_fitting)
++        adc_cali_curve_fitting_config_t cali_config = {
++            .unit_id = ADC_UNIT_1,
++            .atten = ADC_ATTEN_DB_12,
++            .bitwidth = ADC_BITWIDTH_DEFAULT,
++        };
++        esp_err_t ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc_cali_handle_);
++        if (ret == ESP_OK) {
++            ESP_LOGI(TAG, "ADC calibration initialized");
++        } else {
++            ESP_LOGW(TAG, "ADC calibration not available");
++            adc_cali_handle_ = nullptr;
++        }
++
++        adc_mutex_ = xSemaphoreCreateMutex();
++        assert(adc_mutex_ != nullptr);
++
++        // 创建 ADC 读取任务
++        xTaskCreate(adc_read_task, "adc_read", 4096, this, 5, &adc_task_handle_);
++        xTaskCreatePinnedToCore(volume_key_task, "volume_key", 4096, this, 6, &volume_key_task_handle_, 1);
++        ESP_LOGI(TAG, "ADC monitoring task started for IO3/IO4 battery sampling");
++        ESP_LOGI(TAG, "Volume key task started on CPU1");
++    }
++
++    void InitializeSpi() {
++        spi_bus_config_t buscfg = {};
++        buscfg.mosi_io_num = DISPLAY_MOSI_PIN;
++        buscfg.miso_io_num = GPIO_NUM_NC;
++        buscfg.sclk_io_num = DISPLAY_CLK_PIN;
++        buscfg.quadwp_io_num = GPIO_NUM_NC;
++        buscfg.quadhd_io_num = GPIO_NUM_NC;
++        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
++        ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
++    }
++
++    void InitializeLcdDisplay() {
++        esp_lcd_panel_io_handle_t panel_io = nullptr;
++        esp_lcd_panel_handle_t panel = nullptr;
++
++        ESP_LOGD(TAG, "Install panel IO");
++        esp_lcd_panel_io_spi_config_t io_config = {};
++        io_config.cs_gpio_num = DISPLAY_CS_PIN;
++        io_config.dc_gpio_num = DISPLAY_DC_PIN;
++        io_config.spi_mode = DISPLAY_SPI_MODE;
++        io_config.pclk_hz = 40 * 1000 * 1000;
++        io_config.trans_queue_depth = 10;
++        io_config.lcd_cmd_bits = 8;
++        io_config.lcd_param_bits = 8;
++
++        if (esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io) != ESP_OK) {
++            ESP_LOGE(TAG, "Failed to create panel IO");
++            display_ = new NoDisplay();
++            return;
++        }
++
++        ESP_LOGD(TAG, "Install LCD driver");
++        esp_lcd_panel_dev_config_t panel_config = {};
++        panel_config.reset_gpio_num = DISPLAY_RST_PIN;
++        panel_config.rgb_ele_order = DISPLAY_RGB_ORDER;
++        panel_config.bits_per_pixel = 16;
++
++        if (esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel) != ESP_OK) {
++            ESP_LOGE(TAG, "Failed to create panel");
++            display_ = new NoDisplay();
++            return;
++        }
++
++        esp_lcd_panel_reset(panel);
++        esp_lcd_panel_init(panel);
++        esp_lcd_panel_invert_color(panel, DISPLAY_INVERT_COLOR);
++        esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
++        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
++
++        display_ = new ZhengchenMinicamLcdDisplay(panel_io, panel,
++                                    DISPLAY_WIDTH, DISPLAY_HEIGHT,
++                                    DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
++                                    DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y,
++                                    DISPLAY_SWAP_XY);
++    }
++
++    void InitializeButtons() {
++        boot_button_.OnClick([this]() {
++            auto* display = GetMinicamDisplay();
++            if (display != nullptr && display->IsSettingsMenuVisible()) {
++                display->ActivateSelectedMenuItem();
++                return;
++            }
++
++            auto& app = Application::GetInstance();
++            app.ToggleChatState();
++        });
++
++        boot_button_.OnDoubleClick([this]() {
++            ToggleSettingsMenu();
++        });
++    }
++
++    void InitializeCamera() {
++        ESP_LOGI(TAG, "Waiting for camera power stabilization...");
++        vTaskDelay(pdMS_TO_TICKS(2000));
++
++        ESP_LOGI(TAG, "Initializing camera...");
++
++        camera_config_t config = {};
++        config.ledc_channel = LEDC_CHANNEL_2;
++        config.ledc_timer   = LEDC_TIMER_2;
++        config.pin_d0       = CAMERA_PIN_D0;
++        config.pin_d1       = CAMERA_PIN_D1;
++        config.pin_d2       = CAMERA_PIN_D2;
++        config.pin_d3       = CAMERA_PIN_D3;
++        config.pin_d4       = CAMERA_PIN_D4;
++        config.pin_d5       = CAMERA_PIN_D5;
++        config.pin_d6       = CAMERA_PIN_D6;
++        config.pin_d7       = CAMERA_PIN_D7;
++        config.pin_xclk     = CAMERA_PIN_XCLK;
++        config.pin_pclk     = CAMERA_PIN_PCLK;
++        config.pin_vsync    = CAMERA_PIN_VSYNC;
++        config.pin_href     = CAMERA_PIN_HREF;
++        config.pin_sccb_sda = -1;
++        config.pin_sccb_scl = -1;
++        config.sccb_i2c_port= I2C_NUM_0;
++        config.pin_pwdn     = CAMERA_PIN_PWDN;
++        config.pin_reset    = CAMERA_PIN_RESET;
++        config.xclk_freq_hz = 20000000;
++        config.pixel_format = PIXFORMAT_RGB565;
++        config.frame_size   = FRAMESIZE_VGA;
++        config.jpeg_quality = 12;
++        config.fb_count     = 2;
++        config.fb_location  = CAMERA_FB_IN_PSRAM;
++        config.grab_mode    = CAMERA_GRAB_LATEST;
++
++        camera_ = new Esp32Camera(config);
++
++        sensor_t *s = esp_camera_sensor_get();
++        if (s) {
++            camera_sensor_info_t *info = esp_camera_sensor_get_info(&s->id);
++            const char *sensor_name = info ? info->name : "Unknown";
++            ESP_LOGI(TAG, "Camera initialized: %s, PID=0x%04x, VER=0x%02x", sensor_name, s->id.PID, s->id.VER);
++        } else {
++            ESP_LOGE(TAG, "Camera initialization failed - sensor not detected");
++        }
++    }
++
++    void InitializeTools() {
++        auto &mcp_server = McpServer::GetInstance();
++
++        auto* minicam_display = GetMinicamDisplay();
++        if (minicam_display != nullptr) {
++            minicam_display->SetAecHandlers(
++                []() -> bool {
++                    return Application::GetInstance().GetAecMode() != kAecOff;
++                },
++                [this]() {
++                    ToggleAec();
++                });
++            minicam_display->SetOrientationHandlers(
++                [minicam_display]() -> bool {
++                    return minicam_display->IsLandscape();
++                },
++                [this]() {
++                    ToggleOrientation();
++                });
++            minicam_display->SetReprovisionCallback([this]() {
++                ReprovisionNetwork();
++            });
++        }
++
++        // 添加摄像头拍照工具
++        mcp_server.AddTool("self.camera.capture",
++            "Capture a photo with the camera and display it",
++            PropertyList(),
++            [this](const PropertyList& properties) {
++                if (camera_ && camera_->Capture()) {
++                    ESP_LOGI(TAG, "Camera capture successful");
++                    return true;
++                } else {
++                    ESP_LOGE(TAG, "Camera capture failed");
++                    return false;
++                }
++            });
++    }
++
++public:
++    zhengchen_minicam()
++        : boot_button_(BOOT_BUTTON_GPIO),
++          volume_up_button_(VOLUME_UP_BUTTON_GPIO),
++          volume_down_button_(VOLUME_DOWN_BUTTON_GPIO),
++          camera_(nullptr),
++          adc_handle_(nullptr),
++          adc_cali_handle_(nullptr),
++          adc_task_handle_(nullptr),
++          volume_key_task_handle_(nullptr),
++          adc_mutex_(nullptr),
++          display_(nullptr) {
++        InitializeStateOutput();
++        InitializeI2c();
++        InitializeADC();
++        InitializeSpi();
++        InitializeLcdDisplay();
++        if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
++            GetBacklight()->RestoreBrightness();
++        }
++        InitializeButtons();
++        InitializeCamera();
++        InitializeTools();
++    }
++
++    virtual Led* GetLed() override {
++        static SingleLed led(BUILTIN_LED_GPIO);
++        return &led;
++    }
++
++    virtual Display* GetDisplay() override {
++        return display_;
++    }
++
++    virtual AudioCodec* GetAudioCodec() override {
++        static Es8388AudioCodec audio_codec(
++            codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE,
++            AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK,
++            AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
++            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8388_ADDR, AUDIO_INPUT_REFERENCE);
++        return &audio_codec;
++    }
++
++    virtual Backlight* GetBacklight() override {
++        if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
++            static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
++            return &backlight;
++        }
++        return nullptr;
++    }
++
++    virtual std::string GetDeviceStatusJson() override {
++        auto root = cJSON_CreateObject();
++
++        auto audio_speaker = cJSON_CreateObject();
++        if (auto codec = GetAudioCodec()) {
++            cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
++        }
++        cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
++
++        auto screen = cJSON_CreateObject();
++        if (auto backlight = GetBacklight()) {
++            cJSON_AddNumberToObject(screen, "brightness", backlight->brightness());
++        }
++        if (auto display = GetDisplay(); display && display->height() > 64) {
++            if (auto theme = display->GetTheme()) {
++                cJSON_AddStringToObject(screen, "theme", theme->name().c_str());
++            }
++        }
++        cJSON_AddItemToObject(root, "screen", screen);
++
++        auto network = cJSON_CreateObject();
++        auto& wifi = WifiManager::GetInstance();
++        cJSON_AddStringToObject(network, "type", "wifi");
++        cJSON_AddStringToObject(network, "ssid", wifi.GetSsid().c_str());
++        int rssi = wifi.GetRssi();
++        const char* signal = rssi >= -60 ? "strong" : (rssi >= -70 ? "medium" : "weak");
++        cJSON_AddStringToObject(network, "signal", signal);
++        cJSON_AddItemToObject(root, "network", network);
++
++        auto str = cJSON_PrintUnformatted(root);
++        std::string result(str);
++        cJSON_free(str);
++        cJSON_Delete(root);
++        return result;
++    }
++
++    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
++        level = battery_percent_;
++        charging = is_charging_;
++        discharging = !charging;
++        return true;
++    }
++
++    virtual Camera* GetCamera() override {
++        return camera_;
++    }
++};
++
++DECLARE_BOARD(zhengchen_minicam);
+diff --git a/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc b/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc
+new file mode 100644
+index 0000000..e57d95e
+--- /dev/null
++++ b/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc
+@@ -0,0 +1,596 @@
++#include "zhengchen_minicam_lcd_display.h"
++
++#include "config.h"
++#include "display/display.h"
++#include "lvgl_theme.h"
++#include "settings.h"
++
++#include <string>
++#include <algorithm>
++
++namespace {
++struct SettingsMenuMetrics {
++    lv_coord_t menu_margin;
++    lv_coord_t menu_pad_x;
++    lv_coord_t menu_pad_y;
++    lv_coord_t row_pad_x;
++    lv_coord_t row_pad_y;
++    lv_coord_t title_pad_bottom;
++    lv_coord_t line_space;
++    const char* title_text;
++};
++
++SettingsMenuMetrics GetSettingsMenuMetrics(bool is_landscape) {
++    if (is_landscape) {
++        return {
++            .menu_margin = 8,
++            .menu_pad_x = 8,
++            .menu_pad_y = 4,
++            .row_pad_x = 6,
++            .row_pad_y = 2,
++            .title_pad_bottom = 4,
++            .line_space = 0,
++            .title_text = "设置Settings",
++        };
++    }
++
++    return {
++        .menu_margin = 16,
++        .menu_pad_x = 10,
++        .menu_pad_y = 8,
++        .row_pad_x = 8,
++        .row_pad_y = 5,
++        .title_pad_bottom = 8,
++        .line_space = 2,
++        .title_text = "设置\nSettings",
++    };
++}
++}
++
++#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
++namespace {
++void ApplyFullscreenPreviewTransform(lv_obj_t* preview_image, const lv_image_dsc_t* img_dsc, bool is_landscape) {
++    lv_image_set_rotation(preview_image, is_landscape ? 900 : 0);
++    if (img_dsc->header.w <= 0 || img_dsc->header.h <= 0) {
++        return;
++    }
++
++    const int32_t max_width = LV_HOR_RES * 9 / 10;
++    const int32_t max_height = LV_VER_RES * 9 / 10;
++    const int32_t display_width = is_landscape ? img_dsc->header.h : img_dsc->header.w;
++    const int32_t display_height = is_landscape ? img_dsc->header.w : img_dsc->header.h;
++    const uint32_t scale_x = (static_cast<uint32_t>(max_width) * 256) / display_width;
++    const uint32_t scale_y = (static_cast<uint32_t>(max_height) * 256) / display_height;
++    lv_image_set_scale(preview_image, std::min(scale_x, scale_y));
++}
++}
++#endif
++
++void ZhengchenMinicamLcdDisplay::SetupUI() {
++    if (IsSetupUICalled()) {
++        return;
++    }
++
++    Settings settings(kSettingsNamespace);
++    is_landscape_ = settings.GetBool(kOrientationKey, false);
++    lv_display_set_rotation(display_, is_landscape_ ? LV_DISPLAY_ROTATION_90 : LV_DISPLAY_ROTATION_0);
++
++    SpiLcdDisplay::SetupUI();
++
++    DisplayLockGuard lock(this);
++    if (low_battery_popup_ != nullptr) {
++        lv_obj_remove_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_size(low_battery_popup_, 1, 1);
++        lv_obj_align(low_battery_popup_, LV_ALIGN_TOP_LEFT, -LV_HOR_RES, -LV_VER_RES);
++    }
++    CreateSettingsMenuLocked();
++    ApplyMenuThemeLocked();
++    RefreshSettingsMenuLocked();
++}
++
++void ZhengchenMinicamLcdDisplay::SetTheme(Theme* theme) {
++    SpiLcdDisplay::SetTheme(theme);
++
++    if (low_battery_popup_ != nullptr) {
++        DisplayLockGuard lock(this);
++        lv_obj_remove_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_size(low_battery_popup_, 1, 1);
++        lv_obj_align(low_battery_popup_, LV_ALIGN_TOP_LEFT, -LV_HOR_RES, -LV_VER_RES);
++    }
++
++    if (settings_menu_ == nullptr) {
++        return;
++    }
++
++    DisplayLockGuard lock(this);
++    ApplyMenuThemeLocked();
++    RefreshSettingsMenuLocked();
++}
++
++void ZhengchenMinicamLcdDisplay::UpdateStatusBar(bool update_all) {
++    auto* saved_low_battery_popup = low_battery_popup_;
++    auto* saved_low_battery_label = low_battery_label_;
++    low_battery_popup_ = nullptr;
++    low_battery_label_ = nullptr;
++
++    SpiLcdDisplay::UpdateStatusBar(update_all);
++
++    low_battery_popup_ = saved_low_battery_popup;
++    low_battery_label_ = saved_low_battery_label;
++
++    DisplayLockGuard lock(this);
++    if (low_battery_popup_ != nullptr) {
++        lv_obj_remove_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_size(low_battery_popup_, 1, 1);
++        lv_obj_align(low_battery_popup_, LV_ALIGN_TOP_LEFT, -LV_HOR_RES, -LV_VER_RES);
++    }
++}
++
++void ZhengchenMinicamLcdDisplay::ShowSettingsMenu() {
++    DisplayLockGuard lock(this);
++    if (settings_menu_ == nullptr) {
++        return;
++    }
++    lv_obj_remove_flag(settings_menu_, LV_OBJ_FLAG_HIDDEN);
++    RefreshSettingsMenuLocked();
++}
++
++void ZhengchenMinicamLcdDisplay::HideSettingsMenu() {
++    DisplayLockGuard lock(this);
++    if (settings_menu_ == nullptr) {
++        return;
++    }
++    lv_obj_add_flag(settings_menu_, LV_OBJ_FLAG_HIDDEN);
++}
++
++void ZhengchenMinicamLcdDisplay::ToggleSettingsMenu() {
++    if (IsSettingsMenuVisible()) {
++        HideSettingsMenu();
++    } else {
++        ShowSettingsMenu();
++    }
++}
++
++bool ZhengchenMinicamLcdDisplay::IsSettingsMenuVisible() const {
++    return settings_menu_ != nullptr && !lv_obj_has_flag(settings_menu_, LV_OBJ_FLAG_HIDDEN);
++}
++
++void ZhengchenMinicamLcdDisplay::SelectPreviousMenuItem() {
++    DisplayLockGuard lock(this);
++    if (settings_menu_ == nullptr) {
++        return;
++    }
++    SetSelectedIndex(selected_index_ - 1);
++    RefreshSettingsMenuLocked();
++}
++
++void ZhengchenMinicamLcdDisplay::SelectNextMenuItem() {
++    DisplayLockGuard lock(this);
++    if (settings_menu_ == nullptr) {
++        return;
++    }
++    SetSelectedIndex(selected_index_ + 1);
++    RefreshSettingsMenuLocked();
++}
++
++void ZhengchenMinicamLcdDisplay::ActivateSelectedMenuItem() {
++    switch (static_cast<MenuItem>(selected_index_)) {
++    case MenuItem::Aec:
++        if (aec_toggle_callback_) {
++            aec_toggle_callback_();
++        }
++        ShowNotification((std::string("AEC: ") + (aec_getter_ != nullptr && aec_getter_() ? "On" : "Off")).c_str());
++        break;
++    case MenuItem::Orientation:
++        if (orientation_toggle_callback_) {
++            orientation_toggle_callback_();
++        }
++        ShowNotification((std::string("Orientation: ") + (orientation_getter_ != nullptr && orientation_getter_() ? "Landscape" : "Portrait")).c_str());
++        break;
++    case MenuItem::Reprovision:
++        HideSettingsMenu();
++        if (reprovision_callback_) {
++            reprovision_callback_();
++        }
++        ShowNotification("重新配网 / Reprovision");
++        break;
++    case MenuItem::Count:
++        break;
++    }
++
++    DisplayLockGuard lock(this);
++    if (settings_menu_ != nullptr) {
++        RefreshSettingsMenuLocked();
++    }
++}
++
++void ZhengchenMinicamLcdDisplay::SetAecHandlers(std::function<bool()> getter, std::function<void()> toggle_callback) {
++    aec_getter_ = std::move(getter);
++    aec_toggle_callback_ = std::move(toggle_callback);
++}
++
++void ZhengchenMinicamLcdDisplay::SetOrientationHandlers(std::function<bool()> getter, std::function<void()> toggle_callback) {
++    orientation_getter_ = std::move(getter);
++    orientation_toggle_callback_ = std::move(toggle_callback);
++}
++
++void ZhengchenMinicamLcdDisplay::SetReprovisionCallback(std::function<void()> callback) {
++    reprovision_callback_ = std::move(callback);
++}
++
++bool ZhengchenMinicamLcdDisplay::IsLandscape() const {
++    return is_landscape_;
++}
++
++void ZhengchenMinicamLcdDisplay::ToggleOrientation() {
++    is_landscape_ = !is_landscape_;
++    Settings settings(kSettingsNamespace, true);
++    settings.SetBool(kOrientationKey, is_landscape_);
++
++    DisplayLockGuard lock(this);
++    esp_lcd_panel_swap_xy(panel_, is_landscape_ ? DISPLAY_SWAP_XY_1 : DISPLAY_SWAP_XY);
++    esp_lcd_panel_mirror(panel_,
++        is_landscape_ ? DISPLAY_MIRROR_X_1 : DISPLAY_MIRROR_X,
++        is_landscape_ ? DISPLAY_MIRROR_Y_1 : DISPLAY_MIRROR_Y);
++    lv_display_set_rotation(display_, is_landscape_ ? LV_DISPLAY_ROTATION_90 : LV_DISPLAY_ROTATION_0);
++
++    if (container_ != nullptr) {
++        lv_obj_set_size(container_, LV_HOR_RES, LV_VER_RES);
++    }
++    if (top_bar_ != nullptr) {
++        lv_obj_set_width(top_bar_, LV_HOR_RES);
++        lv_obj_align(top_bar_, LV_ALIGN_TOP_MID, 0, 0);
++        lv_obj_update_layout(top_bar_);
++    }
++    if (status_bar_ != nullptr) {
++        lv_obj_set_width(status_bar_, LV_HOR_RES);
++        lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);
++    }
++    if (notification_label_ != nullptr) {
++        lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
++        lv_obj_align(notification_label_, LV_ALIGN_CENTER, 0, 0);
++    }
++    if (status_label_ != nullptr) {
++        lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
++        lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
++    }
++    if (bottom_bar_ != nullptr) {
++        lv_obj_set_width(bottom_bar_, LV_HOR_RES);
++        lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
++    }
++    if (chat_message_label_ != nullptr) {
++        lv_obj_set_width(chat_message_label_, LV_HOR_RES - 8);
++        lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
++    }
++    if (content_ != nullptr) {
++        const lv_coord_t top_bar_height = top_bar_ != nullptr ? lv_obj_get_height(top_bar_) : 0;
++        const lv_coord_t status_bar_height = status_bar_ != nullptr ? lv_obj_get_height(status_bar_) : 0;
++        lv_obj_set_size(content_, LV_HOR_RES, LV_VER_RES - status_bar_height - top_bar_height);
++        if (status_bar_ != nullptr) {
++            lv_obj_align_to(content_, status_bar_, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
++        } else if (top_bar_ != nullptr) {
++            lv_obj_align_to(content_, top_bar_, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
++        } else {
++            lv_obj_align(content_, LV_ALIGN_TOP_MID, 0, 0);
++        }
++        lv_obj_update_layout(content_);
++    }
++    if (low_battery_popup_ != nullptr) {
++        lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, lv_obj_get_height(low_battery_popup_));
++        lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -4);
++    }
++#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
++    if (preview_image_ != nullptr) {
++        lv_obj_set_size(preview_image_, LV_HOR_RES, LV_VER_RES);
++        lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
++        if (preview_image_cached_ != nullptr) {
++            ApplyFullscreenPreviewTransform(preview_image_, preview_image_cached_->image_dsc(), is_landscape_);
++        }
++    }
++#endif
++
++    if (settings_menu_ != nullptr) {
++        ApplyMenuThemeLocked();
++        lv_obj_set_size(settings_menu_, LV_HOR_RES - 24, LV_VER_RES - 48);
++        lv_obj_align(settings_menu_, LV_ALIGN_CENTER, 0, 0);
++        lv_obj_update_layout(settings_menu_);
++        RefreshSettingsMenuLocked();
++        lv_obj_update_layout(settings_menu_);
++    }
++}
++
++
++void ZhengchenMinicamLcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
++#if CONFIG_USE_WECHAT_MESSAGE_STYLE
++    DisplayLockGuard lock(this);
++    if (content_ == nullptr) {
++        return;
++    }
++
++    if (image == nullptr) {
++        return;
++    }
++
++    auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
++    lv_obj_t* img_bubble = lv_obj_create(content_);
++    lv_obj_set_style_radius(img_bubble, 8, 0);
++    lv_obj_set_scrollbar_mode(img_bubble, LV_SCROLLBAR_MODE_OFF);
++    lv_obj_set_style_border_width(img_bubble, 0, 0);
++    lv_obj_set_style_pad_all(img_bubble, lvgl_theme->spacing(4), 0);
++    lv_obj_set_style_bg_color(img_bubble, lvgl_theme->assistant_bubble_color(), 0);
++    lv_obj_set_style_bg_opa(img_bubble, LV_OPA_70, 0);
++    lv_obj_set_user_data(img_bubble, (void*)"image");
++
++    lv_obj_t* preview_image = lv_image_create(img_bubble);
++
++    lv_coord_t content_width = lv_obj_get_content_width(content_);
++    lv_coord_t content_height = lv_obj_get_height(content_);
++    if (content_width <= 0) {
++        content_width = LV_HOR_RES;
++    }
++    if (content_height <= 0) {
++        content_height = LV_VER_RES;
++    }
++
++    lv_coord_t max_width = content_width * 90 / 100;
++    lv_coord_t max_height = content_height * 70 / 100;
++
++    auto img_dsc = image->image_dsc();
++    lv_coord_t img_width = img_dsc->header.w;
++    lv_coord_t img_height = img_dsc->header.h;
++    if (img_width == 0 || img_height == 0) {
++        img_width = max_width;
++        img_height = max_height;
++        ESP_LOGW("LcdDisplay", "Invalid image dimensions: %ld x %ld, using default dimensions: %ld x %ld", img_width, img_height, max_width, max_height);
++    }
++
++    lv_coord_t display_width = is_landscape_ ? img_height : img_width;
++    lv_coord_t display_height = is_landscape_ ? img_width : img_height;
++    lv_coord_t zoom_w = (max_width * 256) / display_width;
++    lv_coord_t zoom_h = (max_height * 256) / display_height;
++    lv_coord_t zoom = (zoom_w < zoom_h) ? zoom_w : zoom_h;
++    if (zoom > 256) {
++        zoom = 256;
++    }
++
++    lv_image_set_src(preview_image, img_dsc);
++    lv_image_set_rotation(preview_image, is_landscape_ ? 900 : 0);
++    lv_image_set_scale(preview_image, zoom);
++
++    LvglImage* raw_image = image.release();
++    lv_obj_add_event_cb(preview_image, [](lv_event_t* e) {
++        LvglImage* img = (LvglImage*)lv_event_get_user_data(e);
++        if (img != nullptr) {
++            delete img;
++        }
++    }, LV_EVENT_DELETE, (void*)raw_image);
++
++    lv_coord_t scaled_width = (display_width * zoom) / 256;
++    lv_coord_t scaled_height = (display_height * zoom) / 256;
++    lv_obj_set_width(img_bubble, scaled_width + 16);
++    lv_obj_set_height(img_bubble, scaled_height + 16);
++    lv_obj_set_style_flex_grow(img_bubble, 0, 0);
++    lv_obj_center(preview_image);
++    lv_obj_align(img_bubble, LV_ALIGN_LEFT_MID, 0, 0);
++    lv_obj_scroll_to_view_recursive(img_bubble, LV_ANIM_ON);
++#else
++    DisplayLockGuard lock(this);
++    if (preview_image_ == nullptr) {
++        ESP_LOGE("LcdDisplay", "Preview image is not initialized");
++        return;
++    }
++
++    if (image == nullptr) {
++        esp_timer_stop(preview_timer_);
++        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++        preview_image_cached_.reset();
++        if (gif_controller_) {
++            gif_controller_->Start();
++        }
++        return;
++    }
++
++    preview_image_cached_ = std::move(image);
++    auto img_dsc = preview_image_cached_->image_dsc();
++    lv_image_set_src(preview_image_, img_dsc);
++    ApplyFullscreenPreviewTransform(preview_image_, img_dsc, is_landscape_);
++    lv_obj_set_size(preview_image_, LV_HOR_RES, LV_VER_RES);
++    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
++
++    if (gif_controller_) {
++        gif_controller_->Stop();
++    }
++    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
++    esp_timer_stop(preview_timer_);
++    ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
++#endif
++}
++
++void ZhengchenMinicamLcdDisplay::CreateSettingsMenuLocked() {
++    if (settings_menu_ != nullptr) {
++        return;
++    }
++
++    auto* screen = lv_screen_active();
++    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
++    auto* text_font = lvgl_theme->text_font()->font();
++    auto metrics = GetSettingsMenuMetrics(is_landscape_);
++
++    settings_menu_ = lv_obj_create(screen);
++    lv_obj_set_size(settings_menu_, LV_HOR_RES - metrics.menu_margin, LV_VER_RES - metrics.menu_margin);
++    lv_obj_align(settings_menu_, LV_ALIGN_CENTER, 0, 0);
++    lv_obj_set_style_radius(settings_menu_, 12, 0);
++    lv_obj_set_style_border_width(settings_menu_, 2, 0);
++    lv_obj_set_style_pad_left(settings_menu_, metrics.menu_pad_x, 0);
++    lv_obj_set_style_pad_right(settings_menu_, metrics.menu_pad_x, 0);
++    lv_obj_set_style_pad_top(settings_menu_, metrics.menu_pad_y, 0);
++    lv_obj_set_style_pad_bottom(settings_menu_, metrics.menu_pad_y, 0);
++    lv_obj_set_scrollbar_mode(settings_menu_, LV_SCROLLBAR_MODE_AUTO);
++    lv_obj_set_scroll_dir(settings_menu_, LV_DIR_VER);
++    lv_obj_set_flex_flow(settings_menu_, LV_FLEX_FLOW_COLUMN);
++    lv_obj_set_flex_align(settings_menu_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
++
++    settings_title_label_ = lv_label_create(settings_menu_);
++    lv_label_set_text(settings_title_label_, metrics.title_text);
++    lv_obj_set_style_text_font(settings_title_label_, text_font, 0);
++    lv_obj_set_style_text_align(settings_title_label_, LV_TEXT_ALIGN_CENTER, 0);
++    lv_obj_set_style_text_line_space(settings_title_label_, metrics.line_space, 0);
++    lv_obj_set_width(settings_title_label_, LV_PCT(100));
++    lv_obj_set_style_pad_bottom(settings_title_label_, metrics.title_pad_bottom, 0);
++
++    for (size_t i = 0; i < menu_item_labels_.size(); ++i) {
++        auto* row = lv_obj_create(settings_menu_);
++        lv_obj_set_width(row, LV_PCT(100));
++        lv_obj_set_height(row, LV_SIZE_CONTENT);
++        lv_obj_set_style_pad_left(row, metrics.row_pad_x, 0);
++        lv_obj_set_style_pad_right(row, metrics.row_pad_x, 0);
++        lv_obj_set_style_pad_top(row, metrics.row_pad_y, 0);
++        lv_obj_set_style_pad_bottom(row, metrics.row_pad_y, 0);
++        lv_obj_set_style_border_width(row, 0, 0);
++        lv_obj_set_style_radius(row, 8, 0);
++        lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
++        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
++        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
++        menu_item_rows_[i] = row;
++
++        auto* label = lv_label_create(row);
++        lv_obj_set_width(label, LV_PCT(100));
++        lv_obj_set_style_text_font(label, text_font, 0);
++        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
++        lv_obj_set_style_text_line_space(label, metrics.line_space, 0);
++        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
++        menu_item_labels_[i] = label;
++    }
++
++    lv_obj_add_flag(settings_menu_, LV_OBJ_FLAG_HIDDEN);
++}
++
++void ZhengchenMinicamLcdDisplay::ApplyMenuThemeLocked() {
++    if (settings_menu_ == nullptr) {
++        return;
++    }
++
++    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
++    auto* text_font = lvgl_theme->text_font()->font();
++    auto metrics = GetSettingsMenuMetrics(is_landscape_);
++
++    auto bg_color = lvgl_theme->background_color();
++    auto text_color = lvgl_theme->text_color();
++    auto border_color = lvgl_theme->border_color();
++
++    lv_obj_set_style_bg_color(settings_menu_, bg_color, 0);
++    lv_obj_set_style_bg_opa(settings_menu_, LV_OPA_90, 0);
++    lv_obj_set_style_border_color(settings_menu_, border_color, 0);
++    lv_obj_set_size(settings_menu_, LV_HOR_RES - metrics.menu_margin, LV_VER_RES - metrics.menu_margin);
++    lv_obj_set_style_pad_left(settings_menu_, metrics.menu_pad_x, 0);
++    lv_obj_set_style_pad_right(settings_menu_, metrics.menu_pad_x, 0);
++    lv_obj_set_style_pad_top(settings_menu_, metrics.menu_pad_y, 0);
++    lv_obj_set_style_pad_bottom(settings_menu_, metrics.menu_pad_y, 0);
++
++    if (settings_title_label_ != nullptr) {
++        lv_obj_set_style_text_font(settings_title_label_, text_font, 0);
++        lv_label_set_text(settings_title_label_, metrics.title_text);
++        lv_obj_set_style_text_line_space(settings_title_label_, metrics.line_space, 0);
++        lv_obj_set_style_text_color(settings_title_label_, text_color, 0);
++        lv_obj_set_style_pad_bottom(settings_title_label_, metrics.title_pad_bottom, 0);
++    }
++
++    for (size_t i = 0; i < menu_item_rows_.size(); ++i) {
++        auto* row = menu_item_rows_[i];
++        auto* label = menu_item_labels_[i];
++        if (row == nullptr || label == nullptr) {
++            continue;
++        }
++        lv_obj_set_height(row, LV_SIZE_CONTENT);
++        lv_obj_set_style_text_font(label, text_font, 0);
++        lv_obj_set_style_text_line_space(label, metrics.line_space, 0);
++        lv_obj_set_style_text_color(label, text_color, 0);
++        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
++        lv_obj_set_style_pad_left(row, metrics.row_pad_x, 0);
++        lv_obj_set_style_pad_right(row, metrics.row_pad_x, 0);
++        lv_obj_set_style_pad_top(row, metrics.row_pad_y, 0);
++        lv_obj_set_style_pad_bottom(row, metrics.row_pad_y, 0);
++        lv_obj_set_style_radius(row, 8, 0);
++    }
++}
++
++void ZhengchenMinicamLcdDisplay::RefreshSettingsMenuLocked() {
++    if (settings_menu_ == nullptr) {
++        return;
++    }
++
++    auto* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
++    auto text_color = lvgl_theme->text_color();
++    auto bg_color = lvgl_theme->background_color();
++
++    if (settings_title_label_ != nullptr) {
++        lv_label_set_text(settings_title_label_, GetSettingsMenuMetrics(is_landscape_).title_text);
++    }
++
++    for (size_t i = 0; i < menu_item_labels_.size(); ++i) {
++        auto* row = menu_item_rows_[i];
++        auto* label = menu_item_labels_[i];
++        if (row == nullptr || label == nullptr) {
++            continue;
++        }
++
++        const bool selected = static_cast<int>(i) == selected_index_;
++        lv_label_set_text(label, GetMenuLabel(static_cast<MenuItem>(i)));
++        lv_obj_set_style_text_color(label, selected ? bg_color : text_color, 0);
++        lv_obj_set_style_bg_color(row, selected ? text_color : bg_color, 0);
++        lv_obj_set_style_bg_opa(row, selected ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
++    }
++}
++
++void ZhengchenMinicamLcdDisplay::SetSelectedIndex(int index) {
++    const int count = static_cast<int>(MenuItem::Count);
++    if (count <= 0) {
++        selected_index_ = 0;
++        return;
++    }
++
++    if (index < 0) {
++        selected_index_ = count - 1;
++    } else if (index >= count) {
++        selected_index_ = 0;
++    } else {
++        selected_index_ = index;
++    }
++}
++
++const char* ZhengchenMinicamLcdDisplay::GetAecLabel() const {
++    return aec_getter_ != nullptr && aec_getter_() ? "开启" : "关闭";
++}
++
++const char* ZhengchenMinicamLcdDisplay::GetOrientationLabel() const {
++    return orientation_getter_ != nullptr && orientation_getter_() ? "横屏" : "竖屏";
++}
++
++const char* ZhengchenMinicamLcdDisplay::GetMenuLabel(MenuItem item) const {
++    static std::string label;
++    switch (item) {
++    case MenuItem::Aec:
++        if (is_landscape_) {
++            label = std::string("语音打断:") + GetAecLabel() + "\nVoice interruption: " + (aec_getter_ != nullptr && aec_getter_() ? "On" : "Off");
++        } else {
++            label = std::string("语音打断 开关：") + GetAecLabel() + "\nVoice interruption: " + (aec_getter_ != nullptr && aec_getter_() ? "On" : "Off");
++        }
++        break;
++    case MenuItem::Orientation:
++        if (is_landscape_) {
++            label = std::string("方向:") + GetOrientationLabel() + "\nOri: " + (orientation_getter_ != nullptr && orientation_getter_() ? "Land" : "Port");
++        } else {
++            label = std::string("屏幕方向：") + GetOrientationLabel() + "\nOrientation: " + (orientation_getter_ != nullptr && orientation_getter_() ? "Landscape" : "Portrait");
++        }
++        break;
++    case MenuItem::Reprovision:
++        label = is_landscape_ ? "重新配网\nReprovision" : "重新配网\nReprovision";
++        break;
++    case MenuItem::Count:
++        label.clear();
++        break;
++    }
++    return label.c_str();
++}
+diff --git a/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.h b/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.h
+new file mode 100644
+index 0000000..cdda058
+--- /dev/null
++++ b/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.h
+@@ -0,0 +1,68 @@
++#ifndef ZHENGCHEN_MINICAM_LCD_DISPLAY_H
++#define ZHENGCHEN_MINICAM_LCD_DISPLAY_H
++
++#include "display/lcd_display.h"
++
++#include <array>
++#include <cstdint>
++#include <functional>
++
++class ZhengchenMinicamLcdDisplay : public SpiLcdDisplay {
++public:
++    using SpiLcdDisplay::SpiLcdDisplay;
++
++    void SetupUI() override;
++    void SetTheme(Theme* theme) override;
++    void UpdateStatusBar(bool update_all = false) override;
++
++    void ShowSettingsMenu();
++    void HideSettingsMenu();
++    void ToggleSettingsMenu();
++    bool IsSettingsMenuVisible() const;
++
++    void SelectPreviousMenuItem();
++    void SelectNextMenuItem();
++    void ActivateSelectedMenuItem();
++
++    void SetAecHandlers(std::function<bool()> getter, std::function<void()> toggle_callback);
++    void SetOrientationHandlers(std::function<bool()> getter, std::function<void()> toggle_callback);
++    void SetReprovisionCallback(std::function<void()> callback);
++    bool IsLandscape() const;
++    void ToggleOrientation();
++    void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
++
++private:
++    enum class MenuItem : uint8_t {
++        Aec = 0,
++        Orientation,
++        Reprovision,
++        Count,
++    };
++
++    static constexpr const char* kSettingsNamespace = "zc_minicam";
++    static constexpr const char* kOrientationKey = "lcd_landscape";
++
++    lv_obj_t* settings_menu_ = nullptr;
++    lv_obj_t* settings_title_label_ = nullptr;
++    std::array<lv_obj_t*, static_cast<size_t>(MenuItem::Count)> menu_item_rows_ = {};
++    std::array<lv_obj_t*, static_cast<size_t>(MenuItem::Count)> menu_item_labels_ = {};
++    int selected_index_ = 0;
++
++    std::function<bool()> aec_getter_;
++    std::function<void()> aec_toggle_callback_;
++    std::function<bool()> orientation_getter_;
++    std::function<void()> orientation_toggle_callback_;
++    std::function<void()> reprovision_callback_;
++    bool is_landscape_ = false;
++
++    void CreateSettingsMenuLocked();
++    void ApplyMenuThemeLocked();
++    void RefreshSettingsMenuLocked();
++    void SetSelectedIndex(int index);
++
++    const char* GetAecLabel() const;
++    const char* GetOrientationLabel() const;
++    const char* GetMenuLabel(MenuItem item) const;
++};
++
++#endif // ZHENGCHEN_MINICAM_LCD_DISPLAY_H
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 319e19d42e73f1e6af2bad0efdd13af56bb4ce67 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E9=99=B3=E4=BA=AC=E8=8F=81?=
+ <chenjingjing@chenMac-mini.local>
+Date: Sun, 23 Aug 2026 09:29:33 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?zhengchen-minicam:=20=E6=91=84=E5=83=8F?=
+ =?UTF-8?q?=E5=A4=B4=E7=9B=91=E6=8E=A7=20+=20SmartConfig=20=E9=85=8D?=
+ =?UTF-8?q?=E7=BD=91=E4=BC=98=E5=8C=96=20+=20mDNS=20=E7=9B=B4=E8=BF=9E?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 摄像头: HTTP 快照服务(8080端口 /camera/snapshot) + mDNS 广播
+  xiaozhi-XXXX.local，照片顺时针转90°(横屏使用方向正)
+- 摄像头线程安全: Capture/Explain/GetSnapshotJpeg 互斥锁保护
+- 配网状态机: 先 SmartConfig(纯监听60s避免SoftAP信道冲突)
+  超时后转 SoftAP 网页兜底, 连接成功后复位标志
+- OTA/WebSocket 主地址改 mDNS(chenMac-mini.local:8080 走 nginx),
+  花生壳域名作 backup_url 兜底
+- 默认音量 10, 默认横屏
+- 注意: managed_components/78__esp-wifi-connect 下 wifi_manager.cc
+  wifi_configuration_ap.cc 的改动被 .gitignore 忽略, 重拉组件会丢,
+  需手动同步(编译副本 /tmp/xiaozhi-src 内有备份)
+---
+ main/CMakeLists.txt                           |   2 +
+ main/audio/audio_codec.h                      |   2 +-
+ main/boards/common/esp32_camera.cc            | 137 +++++++++++++++++-
+ main/boards/common/esp32_camera.h             |  10 ++
+ main/boards/common/wifi_board.cc              |  44 +++++-
+ main/boards/common/wifi_board.h               |   8 +
+ main/boards/zhengchen/minicam/config.json     |   3 +-
+ .../zhengchen/minicam/zhengchen_minicam.cc    |  65 +++++++++
+ .../minicam/zhengchen_minicam_lcd_display.cc  |   2 +-
+ main/idf_component.yml                        |   1 +
+ main/protocols/websocket_protocol.cc          |  22 ++-
+ 11 files changed, 288 insertions(+), 8 deletions(-)
+
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index d901fd1..cfba316 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -1073,6 +1073,8 @@ idf_component_register(SRCS ${SOURCES}
+                         esp_pm
+                         esp_psram
+                         esp_netif
++                        esp_http_server
++                        mdns
+                         esp_eth
+                         esp_driver_gpio
+                         esp_driver_uart
+diff --git a/main/audio/audio_codec.h b/main/audio/audio_codec.h
+index a267dbb..a576bdd 100644
+--- a/main/audio/audio_codec.h
++++ b/main/audio/audio_codec.h
+@@ -61,7 +61,7 @@ protected:
+     int output_sample_rate_ = 0;
+     int input_channels_ = 1;
+     int output_channels_ = 1;
+-    int output_volume_ = 70;
++    int output_volume_ = 10;
+     float input_gain_ = 0.0;
+ 
+     virtual int Read(int16_t* dest, int samples) = 0;
+diff --git a/main/boards/common/esp32_camera.cc b/main/boards/common/esp32_camera.cc
+index 344f552..ea798c6 100644
+--- a/main/boards/common/esp32_camera.cc
++++ b/main/boards/common/esp32_camera.cc
+@@ -17,6 +17,24 @@
+ 
+ #define TAG "Esp32Camera"
+ 
++// 顺时针旋转 90°（RGB565，w×h → h×w），返回新缓冲（PSRAM，调用者释放）
++static uint16_t* RotateRgb56590Cw(const uint16_t* src, int w, int h) {
++    uint16_t* dst = (uint16_t*)heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (dst == nullptr) {
++        ESP_LOGE(TAG, "Rotate: no memory");
++        return nullptr;
++    }
++    // dst[x*h + (h-1-y)] = src[y*w + x]
++    for (int y = 0; y < h; y++) {
++        const uint16_t* row = src + (size_t)y * w;
++        const int dstCol = h - 1 - y;
++        for (int x = 0; x < w; x++) {
++            dst[(size_t)x * h + dstCol] = row[x];
++        }
++    }
++    return dst;
++}
++
+ #if CONFIG_XIAOZHI_CAMERA_MIRROR_CONFIGURED
+ #if CONFIG_XIAOZHI_CAMERA_HMIRROR
+ static constexpr bool kConfiguredHMirror = true;
+@@ -74,6 +92,7 @@ void Esp32Camera::SetExplainUrl(const std::string &url, const std::string &token
+ }
+ 
+ bool Esp32Camera::Capture() {
++    std::lock_guard<std::mutex> lock(camera_mutex_);
+     if (encoder_thread_.joinable()) {
+         encoder_thread_.join();
+     }
+@@ -170,6 +189,7 @@ bool Esp32Camera::SetSwapBytes(bool enabled) {
+ }
+ 
+ std::string Esp32Camera::Explain(const std::string &question) {
++    std::lock_guard<std::mutex> lock(camera_mutex_);
+     if (explain_url_.empty()) {
+         throw std::runtime_error("Image explain URL or token is not set");
+     }
+@@ -218,12 +238,21 @@ std::string Esp32Camera::Explain(const std::string &question) {
+         // Use encode buffer for RGB565, otherwise use original frame buffer
+         uint8_t *jpeg_src_buf = current_fb_->buf;
+         size_t jpeg_src_len = current_fb_->len;
++        uint16_t enc_w = w, enc_h = h;
++        uint16_t* rotated = nullptr;
+         if (current_fb_->format == PIXFORMAT_RGB565 && encode_buf_ != nullptr) {
+             jpeg_src_buf = encode_buf_;
+             jpeg_src_len = encode_buf_size_;
++            // 顺时针旋转 90°：设备横屏使用时照片为正方向
++            rotated = RotateRgb56590Cw((const uint16_t*)encode_buf_, w, h);
++            if (rotated != nullptr) {
++                jpeg_src_buf = (uint8_t*)rotated;
++                enc_w = h;
++                enc_h = w;
++            }
+         }
+ 
+-        bool ok = image_to_jpeg_cb(jpeg_src_buf, jpeg_src_len, w, h, enc_fmt, 80,
++        bool ok = image_to_jpeg_cb(jpeg_src_buf, jpeg_src_len, enc_w, enc_h, enc_fmt, 80,
+             [](void* arg, size_t index, const void* data, size_t len) -> size_t {
+                 auto jpeg_queue = static_cast<QueueHandle_t>(arg);
+                 JpegChunk chunk = {.data = nullptr, .len = len};
+@@ -246,6 +275,10 @@ std::string Esp32Camera::Explain(const std::string &question) {
+             JpegChunk chunk = {.data = nullptr, .len = 0};
+             xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
+         }
++        if (rotated != nullptr) {
++            heap_caps_free(rotated);
++            rotated = nullptr;
++        }
+         int64_t end_time = esp_timer_get_time();
+         ESP_LOGI(TAG, "JPEG encoding time: %ld ms", int((end_time - start_time) / 1000));
+     });
+@@ -337,3 +370,105 @@ std::string Esp32Camera::Explain(const std::string &question) {
+              current_fb_->width, current_fb_->height, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
+     return result;
+ }
++
++bool Esp32Camera::GetSnapshotJpeg(std::vector<uint8_t> &out) {
++    std::lock_guard<std::mutex> lock(camera_mutex_);
++    if (encoder_thread_.joinable()) {
++        encoder_thread_.join();
++    }
++    if (!streaming_on_) {
++        return false;
++    }
++
++    // 取最新帧（丢弃旧帧）
++    camera_fb_t *fb = nullptr;
++    for (int i = 0; i < 2; i++) {
++        if (fb) {
++            esp_camera_fb_return(fb);
++        }
++        fb = esp_camera_fb_get();
++        if (!fb) {
++            ESP_LOGE(TAG, "Snapshot capture failed");
++            return false;
++        }
++    }
++
++    bool ok = false;
++    out.clear();
++    if (fb->format == PIXFORMAT_JPEG) {
++        out.assign(fb->buf, fb->buf + fb->len);
++        ok = !out.empty();
++    } else {
++        // 与 Explain 一致：RGB565 需字节交换后编码
++        v4l2_pix_fmt_t enc_fmt;
++        switch (fb->format) {
++            case PIXFORMAT_RGB565: enc_fmt = V4L2_PIX_FMT_RGB565; break;
++            case PIXFORMAT_YUV422: enc_fmt = V4L2_PIX_FMT_YUYV; break;
++            case PIXFORMAT_YUV420: enc_fmt = V4L2_PIX_FMT_YUV420; break;
++            case PIXFORMAT_GRAYSCALE: enc_fmt = V4L2_PIX_FMT_GREY; break;
++            case PIXFORMAT_RGB888: enc_fmt = V4L2_PIX_FMT_RGB24; break;
++            default:
++                ESP_LOGE(TAG, "Snapshot unsupported format: %d", fb->format);
++                esp_camera_fb_return(fb);
++                return false;
++        }
++
++        size_t pixel_count = fb->width * fb->height;
++        size_t data_size = pixel_count * 2;
++        uint8_t *src = fb->buf;
++        uint8_t *swap_buf = nullptr;
++        uint16_t *rotated = nullptr;
++        uint16_t enc_w = fb->width, enc_h = fb->height;
++        if (fb->format == PIXFORMAT_RGB565) {
++            swap_buf = (uint8_t *)heap_caps_malloc(data_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++            if (swap_buf == nullptr) {
++                ESP_LOGE(TAG, "Snapshot: no memory for swap buffer");
++                esp_camera_fb_return(fb);
++                return false;
++            }
++            uint16_t *s = (uint16_t *)fb->buf;
++            uint16_t *d = (uint16_t *)swap_buf;
++            if (swap_bytes_enabled_) {
++                for (size_t i = 0; i < pixel_count; i++) d[i] = __builtin_bswap16(s[i]);
++            } else {
++                memcpy(swap_buf, fb->buf, data_size);
++            }
++            src = swap_buf;
++            // 顺时针旋转 90°：设备横屏使用时照片为正方向
++            rotated = RotateRgb56590Cw((const uint16_t*)swap_buf, fb->width, fb->height);
++            if (rotated != nullptr) {
++                src = (uint8_t*)rotated;
++                enc_w = fb->height;
++                enc_h = fb->width;
++            }
++        }
++
++        ok = image_to_jpeg_cb(src, fb->len, enc_w, enc_h, enc_fmt, 80,
++            [](void* arg, size_t index, const void* data, size_t len) -> size_t {
++                auto out = static_cast<std::vector<uint8_t>*>(arg);
++                if (data != nullptr && len > 0) {
++                    const uint8_t* p = static_cast<const uint8_t*>(data);
++                    out->insert(out->end(), p, p + len);
++                }
++                return len;
++            }, &out);
++
++        if (swap_buf) {
++            heap_caps_free(swap_buf);
++        }
++        if (rotated) {
++            heap_caps_free(rotated);
++        }
++    }
++
++    uint16_t fb_w = fb->width, fb_h = fb->height;
++    esp_camera_fb_return(fb);
++
++    if (!ok || out.empty()) {
++        ESP_LOGE(TAG, "Snapshot JPEG encode failed");
++        out.clear();
++        return false;
++    }
++    ESP_LOGI(TAG, "Snapshot: %dx%d jpeg=%zu bytes", fb_w, fb_h, out.size());
++    return true;
++}
+diff --git a/main/boards/common/esp32_camera.h b/main/boards/common/esp32_camera.h
+index e2fb071..31ecbc5 100644
+--- a/main/boards/common/esp32_camera.h
++++ b/main/boards/common/esp32_camera.h
+@@ -4,6 +4,7 @@
+ #include <lvgl.h>
+ #include <thread>
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include <freertos/FreeRTOS.h>
+@@ -30,6 +31,8 @@ private:
+     camera_fb_t *current_fb_ = nullptr;
+     uint8_t *encode_buf_ = nullptr;  // Buffer for JPEG encoding (with optional byte swap)
+     size_t encode_buf_size_ = 0;
++    // 保护摄像头帧缓冲并发访问（对话拍照 / HTTP 快照）
++    std::mutex camera_mutex_;
+ 
+ public:
+     Esp32Camera(const camera_config_t &config);
+@@ -41,4 +44,11 @@ public:
+     virtual bool SetVFlip(bool enabled) override;
+     virtual bool SetSwapBytes(bool enabled) override;
+     virtual std::string Explain(const std::string &question) override;
++
++    /**
++     * 拍一帧并编码为 JPEG（线程安全，供 HTTP 快照服务使用）
++     * @param out 输出 JPEG 数据
++     * @return 成功与否
++     */
++    bool GetSnapshotJpeg(std::vector<uint8_t> &out);
+ };
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index 5b3721d..cac71dd 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -26,6 +26,17 @@ static const char *TAG = "WifiBoard";
+ // Connection timeout in seconds
+ static constexpr int CONNECT_TIMEOUT_SEC = 60;
+ 
++// SmartConfig 监听超时（秒），超时后开启 SoftAP 兑底
++static constexpr int SMARTCONFIG_TIMEOUT_SEC = 60;
++
++void WifiBoard::OnSmartConfigTimeout() {
++    ESP_LOGW(TAG, "SmartConfig timeout, falling back to SoftAP web config");
++    // 停止 SmartConfig 监听（会发 ConfigModeExit 事件 → TryWifiConnect）
++    // SSID 仍为空时 TryWifiConnect 会重新进入 StartWifiConfigMode，
++    // 此时 smartconfig_attempted_ 已为 true，直接开 SoftAP 网页配网
++    WifiManager::GetInstance().StopConfigAp();
++}
++
+ WifiBoard::WifiBoard() {
+     // Create connection timeout timer
+     esp_timer_create_args_t timer_args = {
+@@ -36,6 +47,16 @@ WifiBoard::WifiBoard() {
+         .skip_unhandled_events = true
+     };
+     esp_timer_create(&timer_args, &connect_timer_);
++
++    // Create SmartConfig timeout timer
++    esp_timer_create_args_t sc_timer_args = {
++        .callback = [](void* arg) { static_cast<WifiBoard*>(arg)->OnSmartConfigTimeout(); },
++        .arg = this,
++        .dispatch_method = ESP_TIMER_TASK,
++        .name = "smartconfig_timer",
++        .skip_unhandled_events = true
++    };
++    esp_timer_create(&sc_timer_args, &smartconfig_timeout_timer_);
+ }
+ 
+ WifiBoard::~WifiBoard() {
+@@ -43,6 +64,10 @@ WifiBoard::~WifiBoard() {
+         esp_timer_stop(connect_timer_);
+         esp_timer_delete(connect_timer_);
+     }
++    if (smartconfig_timeout_timer_) {
++        esp_timer_stop(smartconfig_timeout_timer_);
++        esp_timer_delete(smartconfig_timeout_timer_);
++    }
+ }
+ 
+ std::string WifiBoard::GetBoardType() {
+@@ -119,6 +144,12 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
+         case NetworkEvent::Connected:
+             // Stop timeout timer
+             esp_timer_stop(connect_timer_);
++            // Stop SmartConfig timeout timer（已连上 Wi-Fi）
++            if (smartconfig_timeout_timer_) {
++                esp_timer_stop(smartconfig_timeout_timer_);
++            }
++            // 复位 SmartConfig 尝试标志：下次进配网模式重新给广播配网机会
++            smartconfig_attempted_ = false;
+ #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+             // make sure blufi resources has been released
+             Blufi::GetInstance().deinit();
+@@ -174,7 +205,18 @@ void WifiBoard::StartWifiConfigMode() {
+ #ifdef CONFIG_USE_HOTSPOT_WIFI_PROVISIONING
+     auto& wifi_manager = WifiManager::GetInstance();
+ 
+-    wifi_manager.StartConfigAp();
++    if (!smartconfig_attempted_) {
++        // 第一次进配网：先只跑 SmartConfig（不开 SoftAP，避免信道冲突），
++        // 60 秒超时后自动转 SoftAP 网页配网兑底
++        smartconfig_attempted_ = true;
++        wifi_manager.StartSmartConfig();
++        if (smartconfig_timeout_timer_) {
++            esp_timer_start_once(smartconfig_timeout_timer_, SMARTCONFIG_TIMEOUT_SEC * 1000000ULL);
++        }
++    } else {
++        // SmartConfig 已尝试过（超时），直接开 SoftAP 网页配网
++        wifi_manager.StartConfigAp();
++    }
+ 
+     // Show config prompt after a short delay
+     Application::GetInstance().Schedule([&wifi_manager]() {
+diff --git a/main/boards/common/wifi_board.h b/main/boards/common/wifi_board.h
+index 7ee973c..7e74170 100644
+--- a/main/boards/common/wifi_board.h
++++ b/main/boards/common/wifi_board.h
+@@ -9,6 +9,9 @@
+ class WifiBoard : public Board {
+ protected:
+     esp_timer_handle_t connect_timer_ = nullptr;
++    esp_timer_handle_t smartconfig_timeout_timer_ = nullptr;
++    // 本次开机是否已尝试过 SmartConfig（避免超时后循环；SoftAP 网页兑底只开一次）
++    bool smartconfig_attempted_ = false;
+     bool in_config_mode_ = false;
+     NetworkEventCallback network_event_callback_ = nullptr;
+ 
+@@ -36,6 +39,11 @@ protected:
+      */
+     static void OnWifiConnectTimeout(void* arg);
+ 
++    /**
++     * SmartConfig 监听超时回调：超时后开启 SoftAP 兑底
++     */
++    void OnSmartConfigTimeout();
++
+ public:
+     WifiBoard();
+     virtual ~WifiBoard();
+diff --git a/main/boards/zhengchen/minicam/config.json b/main/boards/zhengchen/minicam/config.json
+index e59ab91..1a5e453 100644
+--- a/main/boards/zhengchen/minicam/config.json
++++ b/main/boards/zhengchen/minicam/config.json
+@@ -6,7 +6,8 @@
+         {
+             "name": "zhengchen-minicam",
+             "sdkconfig_append": [
+-                "CONFIG_USE_DEVICE_AEC=y"
++                "CONFIG_USE_DEVICE_AEC=y",
++                "CONFIG_OTA_URL=\"http://chenMac-mini.local:8080/xiaozhi/ota/\""
+             ]
+         }
+     ]
+diff --git a/main/boards/zhengchen/minicam/zhengchen_minicam.cc b/main/boards/zhengchen/minicam/zhengchen_minicam.cc
+index c8ccaf2..bc70c18 100644
+--- a/main/boards/zhengchen/minicam/zhengchen_minicam.cc
++++ b/main/boards/zhengchen/minicam/zhengchen_minicam.cc
+@@ -25,6 +25,12 @@
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/task.h>
+ #include <freertos/semphr.h>
++#include <esp_http_server.h>
++#include <mdns.h>
++#include <esp_mac.h>
++#include <vector>
++#include <algorithm>
++#include "system_info.h"
+ 
+ #define TAG "zhengchen_minicam"
+ 
+@@ -34,6 +40,7 @@ private:
+     Button volume_up_button_;
+     Button volume_down_button_;
+     Esp32Camera* camera_;
++    httpd_handle_t camera_http_server_ = nullptr;
+     i2c_master_bus_handle_t codec_i2c_bus_;
+     adc_oneshot_unit_handle_t adc_handle_;
+     adc_cali_handle_t adc_cali_handle_;
+@@ -500,6 +507,64 @@ private:
+         }
+     }
+ 
++    // 摄像头 HTTP 快照服务 + mDNS（http://xiaozhi-XXXX.local:8080/camera/snapshot）
++    // 注意：必须在网络栈初始化之后调用（StartNetwork），否则 tcpip 未就绪会 assert
++    void InitializeCameraHttpServer() {
++        // mDNS：用 MAC 后 4 hex 作为主机名（与 DHCP hostname 一致）
++        std::string mac = SystemInfo::GetMacAddress();          // 3c:dc:75:fe:81:44
++        std::string suffix = mac.substr(mac.size() - 5);         // "81:44"
++        suffix.erase(std::remove(suffix.begin(), suffix.end(), ':'), suffix.end());  // "8144"
++        std::string hostname = "xiaozhi-" + suffix;
++
++        if (mdns_init() == ESP_OK) {
++            mdns_hostname_set(hostname.c_str());
++            mdns_instance_name_set("Xiaozhi Camera");
++            // 端口 8080，避开配网模式的 httpd（80）
++            mdns_service_add(NULL, "_http", "_tcp", 8080, NULL, 0);
++            ESP_LOGI(TAG, "Camera mDNS: http://%s.local:8080/camera/snapshot", hostname.c_str());
++        } else {
++            ESP_LOGW(TAG, "mdns_init failed, camera snapshot via IP only");
++        }
++
++        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
++        config.server_port = 8080;
++        config.max_uri_handlers = 2;
++        config.stack_size = 8192;
++        if (httpd_start(&camera_http_server_, &config) != ESP_OK) {
++            ESP_LOGW(TAG, "Camera httpd start failed");
++            camera_http_server_ = nullptr;
++            return;
++        }
++
++        httpd_uri_t snapshot = {
++            .uri = "/camera/snapshot",
++            .method = HTTP_GET,
++            .handler = [](httpd_req_t *req) -> esp_err_t {
++                auto* self = static_cast<zhengchen_minicam*>(req->user_ctx);
++                std::vector<uint8_t> jpeg;
++                if (self->camera_ && self->camera_->GetSnapshotJpeg(jpeg)) {
++                    httpd_resp_set_type(req, "image/jpeg");
++                    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++                    return httpd_resp_send(req, (const char*)jpeg.data(), jpeg.size());
++                }
++                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera capture failed");
++                return ESP_OK;
++            },
++            .user_ctx = this
++        };
++        httpd_register_uri_handler(camera_http_server_, &snapshot);
++        ESP_LOGI(TAG, "Camera snapshot server ready on port 8080");
++    }
++
++    void StartNetwork() override {
++        // 先初始化网络栈（esp_netif/tcpip）并开始 Wi-Fi 连接
++        WifiBoard::StartNetwork();
++        // 网络栈就绪后再启动摄像头 HTTP 服务 + mDNS
++        if (camera_ != nullptr) {
++            InitializeCameraHttpServer();
++        }
++    }
++
+     void InitializeTools() {
+         auto &mcp_server = McpServer::GetInstance();
+ 
+diff --git a/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc b/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc
+index e57d95e..3866d83 100644
+--- a/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc
++++ b/main/boards/zhengchen/minicam/zhengchen_minicam_lcd_display.cc
+@@ -72,7 +72,7 @@ void ZhengchenMinicamLcdDisplay::SetupUI() {
+     }
+ 
+     Settings settings(kSettingsNamespace);
+-    is_landscape_ = settings.GetBool(kOrientationKey, false);
++    is_landscape_ = settings.GetBool(kOrientationKey, true);  // 默认横屏
+     lv_display_set_rotation(display_, is_landscape_ ? LV_DISPLAY_ROTATION_90 : LV_DISPLAY_ROTATION_0);
+ 
+     SpiLcdDisplay::SetupUI();
+diff --git a/main/idf_component.yml b/main/idf_component.yml
+index b4c7c3e..33bd50f 100644
+--- a/main/idf_component.yml
++++ b/main/idf_component.yml
+@@ -1,5 +1,6 @@
+ ## IDF Component Manager Manifest File
+ dependencies:
++  espressif/mdns: ^1.7.0
+   waveshare/esp_lcd_sh8601: 1.0.2
+   espressif/esp_lcd_co5300: ^2.0.3
+   espressif/esp_lcd_ili9341: ^2.0.2
+diff --git a/main/protocols/websocket_protocol.cc b/main/protocols/websocket_protocol.cc
+index 9586c6d..07fe05a 100644
+--- a/main/protocols/websocket_protocol.cc
++++ b/main/protocols/websocket_protocol.cc
+@@ -79,6 +79,7 @@ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
+ bool WebsocketProtocol::OpenAudioChannel() {
+     Settings settings("websocket", false);
+     std::string url = settings.GetString("url");
++    std::string backup_url = settings.GetString("backup_url");
+     std::string token = settings.GetString("token");
+     int version = settings.GetInt("version");
+     if (version != 0) {
+@@ -167,9 +168,24 @@ bool WebsocketProtocol::OpenAudioChannel() {
+ 
+     ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
+     if (!websocket_->Connect(url.c_str())) {
+-        ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", websocket_->GetLastError());
+-        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+-        return false;
++        ESP_LOGE(TAG, "Failed to connect to websocket server %s, code=%d", url.c_str(), websocket_->GetLastError());
++        // 主地址（局域网 IP）连接失败，尝试备用地址（域名）
++        if (!backup_url.empty() && backup_url != url) {
++            ESP_LOGW(TAG, "Primary websocket %s failed, trying backup: %s", url.c_str(), backup_url.c_str());
++            websocket_->Close();
++            if (!websocket_->Connect(backup_url.c_str())) {
++                ESP_LOGE(TAG, "Failed to connect to backup websocket server, code=%d", websocket_->GetLastError());
++                SetError(Lang::Strings::SERVER_NOT_CONNECTED);
++                return false;
++            }
++            // 保存备用地址，下次直接用它
++            Settings ws_settings("websocket", true);
++            ws_settings.SetString("url", backup_url);
++            ESP_LOGI(TAG, "Switched to backup websocket: %s", backup_url.c_str());
++        } else {
++            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
++            return false;
++        }
+     }
+ 
+     // Send hello message to describe the client
+-- 
+2.50.1 (Apple Git-155)
+
